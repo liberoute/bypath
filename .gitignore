@@ -32,7 +32,6 @@ Desktop.ini
 *.dll
 *.so
 *.dylib
-*.test
 *.out
 vendor/
 

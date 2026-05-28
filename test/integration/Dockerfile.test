@@ -1,0 +1,40 @@
+# Integration test: builds both lite and full variants from scratch
+# and verifies they work correctly.
+#
+# Usage:
+#   docker build -f test/integration/Dockerfile.test -t bypath-test .
+#   docker run --rm bypath-test
+
+FROM golang:1.24-alpine AS base
+
+RUN apk add --no-cache git curl
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+# --- Lite Build ---
+FROM base AS build-lite
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-s -w -X github.com/liberoute/bypath/internal/build.Version=2.1.0-test -X github.com/liberoute/bypath/internal/build.Commit=test -X github.com/liberoute/bypath/internal/build.BuildDate=now" \
+    -o /bypath-lite ./cmd/bypath
+
+# --- Full Build ---
+FROM base AS build-full
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -tags full \
+    -ldflags="-s -w -X github.com/liberoute/bypath/internal/build.Version=2.1.0-test -X github.com/liberoute/bypath/internal/build.Commit=test -X github.com/liberoute/bypath/internal/build.BuildDate=now" \
+    -o /bypath-full ./cmd/bypath
+
+# --- Test Stage ---
+FROM alpine:3.20
+
+RUN apk add --no-cache bash curl jq
+
+COPY --from=build-lite /bypath-lite /usr/local/bin/bypath-lite
+COPY --from=build-full /bypath-full /usr/local/bin/bypath-full
+COPY test/integration/run-tests.sh /run-tests.sh
+RUN chmod +x /run-tests.sh
+
+ENTRYPOINT ["/run-tests.sh"]
