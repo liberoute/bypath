@@ -12,6 +12,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/liberoute/bypath/internal/updater"
 )
 
 var (
@@ -23,6 +24,7 @@ var (
 	errorMsgStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).PaddingLeft(4)
 	successStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).PaddingLeft(4)
 	outputStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("7")).PaddingLeft(4)
+	updateStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).PaddingLeft(4).Bold(true)
 )
 
 type item struct {
@@ -46,18 +48,19 @@ type actionDoneMsg struct {
 }
 
 type model struct {
-	page       page
-	items      []item
-	cursor     int
-	title      string
-	subtitle   string
-	group      string
-	output     string // output text shown on pageOutput
-	running    bool   // true while an action is executing
-	inputMode  bool   // true when waiting for user text input
-	inputBuf   string // text input buffer
-	inputLabel string // prompt label for input
+	page        page
+	items       []item
+	cursor      int
+	title       string
+	subtitle    string
+	group       string
+	output      string // output text shown on pageOutput
+	running     bool   // true while an action is executing
+	inputMode   bool   // true when waiting for user text input
+	inputBuf    string // text input buffer
+	inputLabel  string // prompt label for input
 	inputAction string // action to run after input
+	updateInfo  string // update notification (empty = no update)
 }
 
 type Menu struct{}
@@ -73,7 +76,7 @@ func (m *Menu) Run() {
 }
 
 func newMainPage() model {
-	return model{
+	m := model{
 		page:  pageMain,
 		title: "BYPATH",
 		items: []item{
@@ -87,6 +90,16 @@ func newMainPage() model {
 			{"👋", "Quit", "quit"},
 		},
 	}
+
+	// Background update check (non-blocking)
+	go func() {
+		result, err := updater.Check()
+		if err == nil && result.Available {
+			m.updateInfo = fmt.Sprintf("🆕 Update available: %s → %s", result.CurrentVersion, result.LatestVersion)
+		}
+	}()
+
+	return m
 }
 
 func newLinksPage(group string) model {
@@ -352,6 +365,13 @@ func (m model) View() string {
 	b.WriteString("\n")
 	b.WriteString(dimStyle.Render("   ↑↓ navigate • enter select • esc back • q quit"))
 	b.WriteString("\n")
+
+	// Show update notification at bottom
+	if m.updateInfo != "" {
+		b.WriteString("\n")
+		b.WriteString(updateStyle.Render(m.updateInfo))
+		b.WriteString("\n")
+	}
 
 	return b.String()
 }

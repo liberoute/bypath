@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -81,8 +82,8 @@ func Check() (*CheckResult, error) {
 		ReleaseNotes:   release.Body,
 	}
 
-	// Simple version comparison (works for semver)
-	if latestVersion != currentVersion && latestVersion > currentVersion {
+	// Semver comparison
+	if isNewer(latestVersion, currentVersion) {
 		result.Available = true
 
 		// Find matching asset for current OS/arch
@@ -99,6 +100,37 @@ func Check() (*CheckResult, error) {
 	}
 
 	return result, nil
+}
+
+// isNewer returns true if latest is a newer semver than current.
+func isNewer(latest, current string) bool {
+	// Strip -dev suffix for comparison
+	current = strings.Split(current, "-")[0]
+	latest = strings.Split(latest, "-")[0]
+
+	if latest == current {
+		return false
+	}
+
+	lParts := strings.Split(latest, ".")
+	cParts := strings.Split(current, ".")
+
+	for i := 0; i < 3; i++ {
+		var l, c int
+		if i < len(lParts) {
+			l, _ = strconv.Atoi(lParts[i])
+		}
+		if i < len(cParts) {
+			c, _ = strconv.Atoi(cParts[i])
+		}
+		if l > c {
+			return true
+		}
+		if l < c {
+			return false
+		}
+	}
+	return false
 }
 
 // CheckAndLog performs an update check and logs the result.

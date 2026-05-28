@@ -61,7 +61,10 @@ jobs:
           # Full builds
           - { os: linux, arch: amd64, variant: full, tags: 'full' }
           - { os: linux, arch: arm64, variant: full, tags: 'full' }
+          - { os: linux, arch: arm, variant: full, tags: 'full', goarm: '7' }
           - { os: windows, arch: amd64, variant: full, tags: 'full' }
+          - { os: darwin, arch: amd64, variant: full, tags: 'full' }
+          - { os: darwin, arch: arm64, variant: full, tags: 'full' }
 
     steps:
       - uses: actions/checkout@v4
@@ -139,9 +142,8 @@ jobs:
             echo "name=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
             echo "prerelease=false" >> $GITHUB_OUTPUT
           else
-            TAG="v2.1.0-dev.$(git rev-parse --short HEAD)"
-            echo "tag=${TAG}" >> $GITHUB_OUTPUT
-            echo "name=Dev Build ($(date -u +%Y-%m-%d))" >> $GITHUB_OUTPUT
+            echo "tag=dev" >> $GITHUB_OUTPUT
+            echo "name=Dev Build (latest)" >> $GITHUB_OUTPUT
             echo "prerelease=true" >> $GITHUB_OUTPUT
           fi
 
