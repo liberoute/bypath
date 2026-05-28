@@ -1,0 +1,28 @@
+# Bypath Configuration
+
+server:
+  api_port: 8080
+  dns_port: 53
+
+# Gateway mode — clients set DNS/GW to this machine
+gateway:
+  enabled: true
+  interface: ""           # auto-detect
+  dns_upstream:
+    - "1.1.1.1"
+    - "8.8.8.8"
+
+# Country IPs that bypass the tunnel (go direct)
+whitelist:
+  countries: ["ir"]
+  update_interval: "24h"
+
+# Network namespace isolation for tunnel processes
+isolation:
+  enabled: true
+
+# Tunnel chain — how traffic flows
+chains:
+  - name: "default"
+    hops:
+      - profile: "my-server"

@@ -1,0 +1,46 @@
+# Build output
+build/
+dist/
+
+# Engine binaries (downloaded at runtime)
+engines/
+
+# Runtime data
+data/profiles/
+data/ips/
+data/tmp/
+data/geo/
+logs/
+bypath.log
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# Environment
+.env
+.env.local
+
+# Temporary
+tmp/
+*.tmp
+*.bak
