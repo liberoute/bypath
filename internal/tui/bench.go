@@ -245,7 +245,7 @@ func runParallelBench(entries []benchEntry, group string) []benchEntry {
 }
 
 func tcpPing(host string, port int) int {
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	start := time.Now()
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
