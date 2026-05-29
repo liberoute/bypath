@@ -125,14 +125,6 @@ func (cg *ConfigGenerator) generateSingBox(link *profile.Link) (string, error) {
 	return cg.writeJSON("singbox", cfg)
 }
 
-func (cg *ConfigGenerator) dnsRuleSetTags() []string {
-	var tags []string
-	for _, country := range cg.WhitelistCountries {
-		tags = append(tags, fmt.Sprintf("geoip-%s", country))
-	}
-	return tags
-}
-
 func (cg *ConfigGenerator) singboxInbounds(link *profile.Link) []map[string]interface{} {
 	listenPort := link.ListenPort
 	if listenPort == 0 {

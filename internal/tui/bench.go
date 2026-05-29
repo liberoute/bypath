@@ -38,7 +38,6 @@ type benchEntry struct {
 	status   benchStatus
 	ping     int // ms, -1 = fail
 	relay    int // ms, -1 = fail
-	download float64 // KB/s, 0 = not tested
 }
 
 type sortMode int
@@ -47,7 +46,6 @@ const (
 	sortByIndex sortMode = iota
 	sortByPing
 	sortByRelay
-	sortByDownload
 )
 
 type benchModel struct {

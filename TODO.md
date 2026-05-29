@@ -2,43 +2,53 @@
 
 ## 🔴 Priority
 
-- [ ] **sing-box TUN inbound** — حذف tun2socks و dns2socks. sing-box خودش TUN device بسازه + DNS handle کنه. نتیجه: یه process کمتر، latency کمتر.
-- [ ] **xray fallback** — اگه sing-box با یه config fail شد، خودکار xray + tun2socks رو امتحان کنه.
-- [ ] **Full build (zero deps)** — sing-box + xray + tun2socks embed شده داخل باینری. user فقط یه فایل دانلود می‌کنه.
-- [ ] **Reality support** — pbk, sid, fingerprint رو از profile بخون و تو sing-box config بذار. الان reality links fail می‌شن.
-- [ ] **TUI bench: download/upload** — بعد ping و relay، تست سرعت واقعی (download KB/s).
-- [ ] **VPN detection bypass** — اپ‌های ایرانسل/همراه‌اول `cloudflare.com/cdn-cgi/trace` رو call می‌کنن و از `loc` فیلد می‌فهمن VPN فعاله. باید این endpoint (و مشابهش) رو force direct کنیم تا همیشه `loc=IR` برگردونه. domain‌های شناخته‌شده: `cloudflare.com/cdn-cgi/trace`, `ip-api.com`, `ipinfo.io`, `api.myip.com`.
+- [ ] **VPN detection bypass** — Mobile carrier apps (Irancell, Hamrah-e-Aval) call `cloudflare.com/cdn-cgi/trace` and detect VPN from the `loc` field. Force these endpoints direct so they always return `loc=IR`. Known domains: `cloudflare.com/cdn-cgi/trace`, `ip-api.com`, `ipinfo.io`, `api.myip.com`.
+- [ ] **sing-box TUN inbound** — Remove tun2socks and dns2socks. Let sing-box create TUN device + handle DNS. Result: one less process, lower latency.
+- [ ] **xray fallback** — If sing-box fails with a config, automatically try xray + tun2socks.
+- [ ] **Full build (zero deps)** — Embed sing-box + xray + tun2socks in the binary. User downloads one file.
+- [ ] **Reality support** — Read pbk, sid, fingerprint from profile and put in sing-box config. Currently reality links fail.
+- [ ] **TUI bench: download/upload** — After ping and relay, real speed test (download KB/s).
+- [ ] **digikala proxy mode** — digikala.com times out in proxy mode because DNS resolves to non-IR CDN IP via tunnel DNS. Need geosite-ir or domain-based whitelist rules.
 
 ## 🟡 Medium
 
-- [ ] **Auto-reconnect** — اگه tunnel قطع شد، خودکار reconnect. اگه 3 بار fail شد، switch به لینک بعدی.
-- [ ] **Health check timer** — هر 60 ثانیه connectivity check. اگه fail → restart engine.
-- [ ] **systemd installer** — `bypath install` که service file بسازه و enable کنه.
-- [ ] **Subscription auto-update** — هر 24h خودکار sub update بزنه (timer یا goroutine).
-- [ ] **DHCP server** — کلاینت‌ها خودکار DNS/GW بگیرن. دیگه نیاز به تنظیم دستی نباشه.
-- [ ] **Bench: skip info links** — لینک‌هایی که port 0 دارن یا address فارسی دارن رو skip کنه (الان skip می‌کنه ولی بهتر بشه).
+- [ ] **Auto-reconnect** — If tunnel drops, auto reconnect. If 3 failures, switch to next link.
+- [ ] **Health check timer** — Every 60s connectivity check. If fail → restart engine.
+- [ ] **systemd installer** — `bypath install` creates and enables service file.
+- [ ] **Subscription auto-update** — Every 24h auto sub update (timer or goroutine).
+- [ ] **DHCP server** — Clients auto-get DNS/GW. No manual config needed.
+- [ ] **Bench: skip info links** — Links with port 0 or Farsi address should be skipped (partially done).
+- [ ] **sing-box 1.14 migration** — Remove deprecated env vars, use proper `domain_resolver` and new DNS server format.
 
 ## 🟢 Nice to have
 
-- [ ] **Web UI** — یه dashboard ساده embed شده (static files). status, switch link, bench از browser.
-- [ ] **Metrics (Prometheus)** — endpoint `/metrics` برای monitoring.
-- [ ] **Windows gateway** — WinDivert برای routing بدون TUN.
-- [ ] **mTLS for API** — API فقط با certificate قابل دسترسی باشه.
+- [ ] **Web UI** — Simple embedded dashboard (static files). Status, switch link, bench from browser.
+- [ ] **Metrics (Prometheus)** — `/metrics` endpoint for monitoring.
+- [ ] **Windows gateway** — WinDivert for routing without TUN.
+- [ ] **mTLS for API** — API accessible only with certificate.
 - [ ] **Multi-hop chain** — hop1 (vmess) → hop2 (wireguard) → internet.
-- [ ] **sing-box as Go library** — بجای spawn process، in-process اجرا بشه (full build).
-- [ ] **xray as Go library** — همون بالا برای xray.
-- [ ] **Config hot-reload** — بدون restart، config عوض بشه.
-- [ ] **Per-client routing** — هر کلاینت (MAC/IP) rule جدا داشته باشه.
-- [ ] **Bandwidth limiter** — محدودیت سرعت per-client.
+- [ ] **sing-box as Go library** — Instead of spawning process, run in-process (full build).
+- [ ] **xray as Go library** — Same as above for xray.
+- [ ] **Config hot-reload** — Change config without restart.
+- [ ] **Per-client routing** — Each client (MAC/IP) has separate rules.
+- [ ] **Bandwidth limiter** — Per-client speed limit.
 
 ## ✅ Done
 
-- [x] Whitelist IR از iptables/ipset به sing-box geoip rule_set منتقل شد
-- [x] TUI menu (bubbletea) — start/stop/status/sub بدون flash
+- [x] Whitelist IR moved from iptables/ipset to sing-box geoip rule_set
+- [x] TUI menu (bubbletea) — start/stop/status/sub without flash
 - [x] TUI bench page — live progress, ping/relay, sort, select
-- [x] Parallel bench — همه لینک‌ها همزمان تست می‌شن
-- [x] vless/reality/comma-SNI fix در config generation
-- [x] Column alignment با runewidth
+- [x] Parallel bench — all links tested simultaneously
+- [x] vless/reality/comma-SNI fix in config generation
+- [x] Column alignment with runewidth
 - [x] Subscription support (add/update/list)
-- [x] Auto-fallback — اگه لینک اول fail شد، بقیه رو امتحان کنه
+- [x] Auto-fallback — if first link fails, try others
 - [x] CLI commands: run, stop, add, list, select, bench, sub, test, engines, update
+- [x] CI/CD pipeline (GitHub Actions) — test, lint, build, release
+- [x] Docker integration test (lite + full build from scratch)
+- [x] Auto-release on push to main (dev build)
+- [x] sing-box 1.13 compatibility (route actions, local geoip, DNS over tunnel)
+- [x] Proxy mode whitelist (sniff + resolve via tunnel DNS + geoip-ir)
+- [x] Update checker with proper semver comparison
+- [x] TUI update notification
+- [x] Dead code cleanup (removed legacy fetcher, unused methods)

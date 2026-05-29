@@ -3,6 +3,7 @@ package tunnel
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/liberoute/bypath/internal/engine"
@@ -118,13 +119,13 @@ func TestGenerateWireGuard(t *testing.T) {
 	data, _ := os.ReadFile(configFile)
 	content := string(data)
 
-	if !contains(content, "PrivateKey = privkey123") {
+	if !strings.Contains(content, "PrivateKey = privkey123") {
 		t.Error("missing PrivateKey")
 	}
-	if !contains(content, "PublicKey = pubkey456") {
+	if !strings.Contains(content, "PublicKey = pubkey456") {
 		t.Error("missing PublicKey")
 	}
-	if !contains(content, "Endpoint = wg.server.com:51820") {
+	if !strings.Contains(content, "Endpoint = wg.server.com:51820") {
 		t.Error("missing Endpoint")
 	}
 }
@@ -140,17 +141,4 @@ func TestGenerateUnsupported(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for unsupported engine")
 	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
-}
-
-func containsHelper(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

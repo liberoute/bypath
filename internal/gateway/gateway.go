@@ -307,25 +307,6 @@ func (gw *Gateway) getActiveLink() *profile.Link {
 	return g.Links[0]
 }
 
-// getNextLink returns the next link in the group after the current one (for fallback).
-func (gw *Gateway) getNextLink(current *profile.Link) *profile.Link {
-	g, err := gw.profileMgr.GetGroup(gw.config.Profiles.ActiveGroup)
-	if err != nil || len(g.Links) <= 1 {
-		return nil
-	}
-
-	for i, link := range g.Links {
-		if link.Remark == current.Remark {
-			nextIdx := (i + 1) % len(g.Links)
-			if nextIdx == i {
-				return nil
-			}
-			return g.Links[nextIdx]
-		}
-	}
-	return nil
-}
-
 func (gw *Gateway) startEngineWithFallback(link *profile.Link) error {
 	// Try active link first
 	err := gw.startEngine(link)
