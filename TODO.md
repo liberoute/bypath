@@ -7,6 +7,7 @@
 - [ ] **Full build (zero deps)** — sing-box + xray + tun2socks embed شده داخل باینری. user فقط یه فایل دانلود می‌کنه.
 - [ ] **Reality support** — pbk, sid, fingerprint رو از profile بخون و تو sing-box config بذار. الان reality links fail می‌شن.
 - [ ] **TUI bench: download/upload** — بعد ping و relay، تست سرعت واقعی (download KB/s).
+- [ ] **VPN detection bypass** — اپ‌های ایرانسل/همراه‌اول `cloudflare.com/cdn-cgi/trace` رو call می‌کنن و از `loc` فیلد می‌فهمن VPN فعاله. باید این endpoint (و مشابهش) رو force direct کنیم تا همیشه `loc=IR` برگردونه. domain‌های شناخته‌شده: `cloudflare.com/cdn-cgi/trace`, `ip-api.com`, `ipinfo.io`, `api.myip.com`.
 
 ## 🟡 Medium
 
