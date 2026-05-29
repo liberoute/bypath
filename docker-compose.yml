@@ -1,14 +1,16 @@
-version: "3.8"
-
 services:
-  liberoute:
-    build: .
+  bypath:
+    build:
+      context: .
+      args:
+        VARIANT: lite
+        VERSION: "2.1.0"
     container_name: bypath
     restart: unless-stopped
     cap_add:
       - NET_ADMIN
       - NET_RAW
-    network_mode: host          # Required for gateway mode (routing LAN traffic)
+    network_mode: host
     volumes:
       - ./configs:/app/configs
       - ./data:/app/data
@@ -18,9 +20,3 @@ services:
       - TZ=Asia/Tehran
     sysctls:
       - net.ipv4.ip_forward=1
-      - net.ipv6.conf.all.forwarding=1
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/status"]
-      interval: 30s
-      timeout: 5s
-      retries: 3

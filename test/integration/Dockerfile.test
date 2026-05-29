@@ -1,13 +1,13 @@
-# Integration test: builds both lite and full variants from scratch
-# and verifies they work correctly.
+# Integration test: builds both lite and full variants from scratch,
+# installs runtime deps, and verifies bypath actually works.
 #
 # Usage:
 #   docker build -f test/integration/Dockerfile.test -t bypath-test .
-#   docker run --rm bypath-test
+#   docker run --rm --cap-add=NET_ADMIN bypath-test
 
 FROM golang:1.24-alpine AS base
 
-RUN apk add --no-cache git curl
+RUN apk add --no-cache git
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -17,24 +17,43 @@ COPY . .
 # --- Lite Build ---
 FROM base AS build-lite
 RUN CGO_ENABLED=0 GOOS=linux go build \
-    -ldflags="-s -w -X github.com/liberoute/bypath/internal/build.Version=2.1.0-test -X github.com/liberoute/bypath/internal/build.Commit=test -X github.com/liberoute/bypath/internal/build.BuildDate=now" \
+    -ldflags="-s -w -X github.com/liberoute/bypath/internal/build.Version=2.1.0-test" \
     -o /bypath-lite ./cmd/bypath
 
 # --- Full Build ---
 FROM base AS build-full
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -tags full \
-    -ldflags="-s -w -X github.com/liberoute/bypath/internal/build.Version=2.1.0-test -X github.com/liberoute/bypath/internal/build.Commit=test -X github.com/liberoute/bypath/internal/build.BuildDate=now" \
+    -ldflags="-s -w -X github.com/liberoute/bypath/internal/build.Version=2.1.0-test" \
     -o /bypath-full ./cmd/bypath
 
 # --- Test Stage ---
 FROM alpine:3.20
 
-RUN apk add --no-cache bash curl jq
+RUN apk add --no-cache \
+    bash \
+    curl \
+    jq \
+    iptables \
+    iproute2 \
+    ca-certificates
+
+# Install sing-box
+RUN wget -qO /tmp/sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v1.11.0/sing-box-1.11.0-linux-amd64.tar.gz" && \
+    tar -xzf /tmp/sing-box.tar.gz -C /tmp && \
+    mv /tmp/sing-box-*/sing-box /usr/local/bin/sing-box && \
+    chmod +x /usr/local/bin/sing-box && \
+    rm -rf /tmp/sing-box*
+
+# Install tun2socks
+RUN wget -qO /usr/local/bin/tun2socks "https://github.com/xjasonlyu/tun2socks/releases/latest/download/tun2socks-linux-amd64" && \
+    chmod +x /usr/local/bin/tun2socks
 
 COPY --from=build-lite /bypath-lite /usr/local/bin/bypath-lite
 COPY --from=build-full /bypath-full /usr/local/bin/bypath-full
 COPY test/integration/run-tests.sh /run-tests.sh
-RUN chmod +x /run-tests.sh
+COPY configs/default.yaml /app/configs/default.yaml
+RUN chmod +x /run-tests.sh && mkdir -p /app/data/profiles /app/data/tmp /app/logs
 
+WORKDIR /app
 ENTRYPOINT ["/run-tests.sh"]
