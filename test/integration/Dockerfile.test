@@ -34,6 +34,7 @@ RUN apk add --no-cache \
     bash \
     curl \
     jq \
+    unzip \
     iptables \
     iproute2 \
     ca-certificates
@@ -46,8 +47,11 @@ RUN wget -qO /tmp/sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases
     rm -rf /tmp/sing-box*
 
 # Install tun2socks
-RUN wget -qO /usr/local/bin/tun2socks "https://github.com/xjasonlyu/tun2socks/releases/latest/download/tun2socks-linux-amd64" && \
-    chmod +x /usr/local/bin/tun2socks
+RUN wget -qO /tmp/tun2socks.zip "https://github.com/xjasonlyu/tun2socks/releases/download/v2.5.2/tun2socks-linux-amd64.zip" && \
+    unzip -o /tmp/tun2socks.zip -d /tmp/tun2socks && \
+    mv /tmp/tun2socks/tun2socks-linux-amd64 /usr/local/bin/tun2socks && \
+    chmod +x /usr/local/bin/tun2socks && \
+    rm -rf /tmp/tun2socks*
 
 COPY --from=build-lite /bypath-lite /usr/local/bin/bypath-lite
 COPY --from=build-full /bypath-full /usr/local/bin/bypath-full

@@ -26,6 +26,7 @@ RUN apk add --no-cache \
     ip6tables \
     iproute2 \
     curl \
+    unzip \
     ca-certificates \
     && mkdir -p /app/data/profiles /app/data/tmp /app/engines /app/logs /app/configs
 
@@ -44,15 +45,11 @@ RUN ARCH=$(uname -m) && \
     rm -rf /tmp/sing-box*
 
 # Install tun2socks
-RUN ARCH=$(uname -m) && \
-    case "$ARCH" in \
-        x86_64) T2S_ARCH="amd64" ;; \
-        aarch64) T2S_ARCH="arm64" ;; \
-        armv7l) T2S_ARCH="armv7" ;; \
-        *) T2S_ARCH="amd64" ;; \
-    esac && \
-    wget -qO /usr/local/bin/tun2socks "https://github.com/xjasonlyu/tun2socks/releases/latest/download/tun2socks-linux-${T2S_ARCH}" && \
-    chmod +x /usr/local/bin/tun2socks
+RUN wget -qO /tmp/tun2socks.zip "https://github.com/xjasonlyu/tun2socks/releases/download/v2.5.2/tun2socks-linux-amd64.zip" && \
+    unzip -o /tmp/tun2socks.zip -d /tmp/tun2socks && \
+    mv /tmp/tun2socks/tun2socks-linux-amd64 /usr/local/bin/tun2socks && \
+    chmod +x /usr/local/bin/tun2socks && \
+    rm -rf /tmp/tun2socks*
 
 WORKDIR /app
 
