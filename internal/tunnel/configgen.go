@@ -45,19 +45,33 @@ func (cg *ConfigGenerator) Generate(eng *engine.Engine, link *profile.Link) (str
 func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface{} {
 	var rules []map[string]interface{}
 
+	// Rule: sniff protocol to detect domain (sing-box 1.11+ route action)
+	rules = append(rules, map[string]interface{}{
+		"action":   "sniff",
+		"timeout":  "300ms",
+	})
+
+	// Rule: resolve destination to get IP for geoip matching
+	rules = append(rules, map[string]interface{}{
+		"action":   "resolve",
+		"strategy": "prefer_ipv4",
+	})
+
 	// Rule: private/LAN IPs → direct
 	rules = append(rules, map[string]interface{}{
 		"ip_is_private": true,
+		"action":        "route",
 		"outbound":      "direct",
 	})
 
-	// Rule: whitelisted countries → direct (using rule_set with remote geoip)
+	// Rule: whitelisted countries → direct (using rule_set with local geoip)
 	var ruleSetTags []string
 	for _, country := range cg.WhitelistCountries {
 		ruleSetTags = append(ruleSetTags, fmt.Sprintf("geoip-%s", country))
 	}
 	rules = append(rules, map[string]interface{}{
 		"rule_set": ruleSetTags,
+		"action":   "route",
 		"outbound": "direct",
 	})
 
