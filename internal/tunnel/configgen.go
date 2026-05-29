@@ -72,20 +72,31 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 	var ruleSetTags []string
 	for _, country := range cg.WhitelistCountries {
 		ruleSetTags = append(ruleSetTags, fmt.Sprintf("geoip-%s", country))
+		ruleSetTags = append(ruleSetTags, fmt.Sprintf("geosite-%s", country))
 	}
 	rules = append(rules, map[string]interface{}{
 		"rule_set": ruleSetTags,
 		"outbound": "direct",
 	})
 
-	// Build rule_set definitions (remote .srs binary format from SagerNet/sing-geoip)
+	// Build rule_set definitions (remote .srs binary format from SagerNet)
 	var ruleSets []map[string]interface{}
 	for _, country := range cg.WhitelistCountries {
+		// GeoIP (IP-based)
 		ruleSets = append(ruleSets, map[string]interface{}{
 			"type":            "remote",
 			"tag":             fmt.Sprintf("geoip-%s", country),
 			"format":          "binary",
 			"url":             fmt.Sprintf("https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-%s.srs", country),
+			"download_detour": "direct",
+			"update_interval": "7d",
+		})
+		// GeoSite (domain-based)
+		ruleSets = append(ruleSets, map[string]interface{}{
+			"type":            "remote",
+			"tag":             fmt.Sprintf("geosite-%s", country),
+			"format":          "binary",
+			"url":             fmt.Sprintf("https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-%s.srs", country),
 			"download_detour": "direct",
 			"update_interval": "7d",
 		})
@@ -113,6 +124,8 @@ func (cg *ConfigGenerator) singboxInbounds(link *profile.Link) []map[string]inte
 			"tag":         "mixed-in",
 			"listen":      "0.0.0.0",
 			"listen_port": listenPort,
+			"sniff":       true,
+			"sniff_override_destination": true,
 		},
 	}
 }
