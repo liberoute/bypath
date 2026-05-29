@@ -40,6 +40,49 @@ func (cg *ConfigGenerator) Generate(eng *engine.Engine, link *profile.Link) (str
 
 // --- sing-box config generation ---
 
+// singboxRoute builds the route section with geoip-based whitelist rules.
+// Traffic destined for whitelisted countries goes direct; everything else goes through proxy.
+func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface{} {
+	var rules []map[string]interface{}
+
+	// Rule: private/LAN IPs → direct
+	rules = append(rules, map[string]interface{}{
+		"ip_is_private": true,
+		"outbound":      "direct",
+	})
+
+	// Rule: whitelisted countries → direct (using rule_set with remote geoip)
+	var ruleSetTags []string
+	for _, country := range cg.WhitelistCountries {
+		ruleSetTags = append(ruleSetTags, fmt.Sprintf("geoip-%s", country))
+	}
+	rules = append(rules, map[string]interface{}{
+		"rule_set": ruleSetTags,
+		"outbound": "direct",
+	})
+
+	// Build rule_set definitions (local .srs files, downloaded separately)
+	var ruleSets []map[string]interface{}
+	for _, country := range cg.WhitelistCountries {
+		ruleSets = append(ruleSets, map[string]interface{}{
+			"type":   "local",
+			"tag":    fmt.Sprintf("geoip-%s", country),
+			"format": "binary",
+			"path":   fmt.Sprintf("data/geo/geoip-%s.srs", country),
+		})
+	}
+
+	route := map[string]interface{}{
+		"rules":                 rules,
+		"rule_set":              ruleSets,
+		"final":                 "proxy",
+		"auto_detect_interface": true,
+	}
+
+	return route
+}
+
+// generateSingBox generates the full sing-box config.
 func (cg *ConfigGenerator) generateSingBox(link *profile.Link) (string, error) {
 	cfg := map[string]interface{}{
 		"log": map[string]interface{}{
@@ -57,61 +100,6 @@ func (cg *ConfigGenerator) generateSingBox(link *profile.Link) (string, error) {
 	return cg.writeJSON("singbox", cfg)
 }
 
-// singboxRoute builds the route section with geoip-based whitelist rules.
-// Traffic destined for whitelisted countries goes direct; everything else goes through proxy.
-func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface{} {
-	var rules []map[string]interface{}
-
-	// Rule: private/LAN IPs → direct
-	rules = append(rules, map[string]interface{}{
-		"ip_is_private": true,
-		"outbound":      "direct",
-	})
-
-	// Rule: whitelisted countries → direct (using rule_set with remote geoip)
-	var ruleSetTags []string
-	for _, country := range cg.WhitelistCountries {
-		ruleSetTags = append(ruleSetTags, fmt.Sprintf("geoip-%s", country))
-		ruleSetTags = append(ruleSetTags, fmt.Sprintf("geosite-%s", country))
-	}
-	rules = append(rules, map[string]interface{}{
-		"rule_set": ruleSetTags,
-		"outbound": "direct",
-	})
-
-	// Build rule_set definitions (remote .srs binary format from SagerNet)
-	var ruleSets []map[string]interface{}
-	for _, country := range cg.WhitelistCountries {
-		// GeoIP (IP-based)
-		ruleSets = append(ruleSets, map[string]interface{}{
-			"type":            "remote",
-			"tag":             fmt.Sprintf("geoip-%s", country),
-			"format":          "binary",
-			"url":             fmt.Sprintf("https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-%s.srs", country),
-			"download_detour": "direct",
-			"update_interval": "7d",
-		})
-		// GeoSite (domain-based)
-		ruleSets = append(ruleSets, map[string]interface{}{
-			"type":            "remote",
-			"tag":             fmt.Sprintf("geosite-%s", country),
-			"format":          "binary",
-			"url":             fmt.Sprintf("https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-%s.srs", country),
-			"download_detour": "direct",
-			"update_interval": "7d",
-		})
-	}
-
-	route := map[string]interface{}{
-		"rules":                 rules,
-		"rule_set":              ruleSets,
-		"final":                 "proxy",
-		"auto_detect_interface": true,
-	}
-
-	return route
-}
-
 func (cg *ConfigGenerator) singboxInbounds(link *profile.Link) []map[string]interface{} {
 	listenPort := link.ListenPort
 	if listenPort == 0 {
@@ -124,8 +112,6 @@ func (cg *ConfigGenerator) singboxInbounds(link *profile.Link) []map[string]inte
 			"tag":         "mixed-in",
 			"listen":      "0.0.0.0",
 			"listen_port": listenPort,
-			"sniff":       true,
-			"sniff_override_destination": true,
 		},
 	}
 }
