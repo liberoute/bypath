@@ -177,7 +177,12 @@ Tab-based (Home / Servers / Subscriptions):
 ## Known Issues / Gotchas
 
 - CDN-based vless links (Cloudflare Workers) only relay HTTP, not HTTPS
-- `VLDR` links with comma-separated SNI need the first-entry fix
+- `VLDR` links with comma-separated SNI need the first-entry fix (applied in both configgen and bench)
 - sing-box 1.13 rejects `detour: "direct"` on DNS servers (use no detour)
 - Gateway verify needs `socks5h://` (DNS through proxy) and 2s delay after start
 - `sub update` replaces ALL links in a group (by design — subscription is source of truth)
+- Some sub URLs only accessible via proxy — TUI has `o`/`p` keys for proxy-based update
+- Port 8118 may conflict with privoxy if installed — use different http_proxy_port
+- `engines.preferred: "xray"` only works for vmess/vless/trojan/ss — wireguard/openvpn always use their native engine
+- SNI spoof replaces SNI on ALL outbound TLS connections — don't use with Reality links
+- Default group is protected: `sub add` without `-g` auto-creates named group from URL domain
