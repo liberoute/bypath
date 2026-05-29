@@ -47,14 +47,14 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 
 	// Rule: sniff protocol to detect domain (sing-box 1.11+ route action)
 	rules = append(rules, map[string]interface{}{
-		"action":   "sniff",
-		"timeout":  "300ms",
+		"action":  "sniff",
+		"timeout": "300ms",
 	})
 
-	// Rule: resolve destination to get IP for geoip matching
+	// Rule: resolve using clean DNS (through tunnel) for geoip matching
 	rules = append(rules, map[string]interface{}{
-		"action":   "resolve",
-		"strategy": "prefer_ipv4",
+		"action": "resolve",
+		"server": "proxy-dns",
 	})
 
 	// Rule: private/LAN IPs → direct
@@ -64,7 +64,7 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 		"outbound":      "direct",
 	})
 
-	// Rule: whitelisted countries → direct (using rule_set with local geoip)
+	// Rule: whitelisted countries → direct (using local geoip rule_set)
 	var ruleSetTags []string
 	for _, country := range cg.WhitelistCountries {
 		ruleSetTags = append(ruleSetTags, fmt.Sprintf("geoip-%s", country))
@@ -82,7 +82,7 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 			"type":   "local",
 			"tag":    fmt.Sprintf("geoip-%s", country),
 			"format": "binary",
-			"path":   fmt.Sprintf("data/geo/geoip-%s.srs", country),
+			"path":   fmt.Sprintf("/opt/bypath/data/geo/geoip-%s.srs", country),
 		})
 	}
 
@@ -102,6 +102,17 @@ func (cg *ConfigGenerator) generateSingBox(link *profile.Link) (string, error) {
 		"log": map[string]interface{}{
 			"level": "info",
 		},
+		"dns": map[string]interface{}{
+			"servers": []map[string]interface{}{
+				{
+					"tag":    "proxy-dns",
+					"type":   "https",
+					"server": "1.1.1.1",
+					"detour": "proxy",
+				},
+			},
+			"final": "proxy-dns",
+		},
 		"inbounds":  cg.singboxInbounds(link),
 		"outbounds": cg.singboxOutbounds(link),
 	}
@@ -112,6 +123,14 @@ func (cg *ConfigGenerator) generateSingBox(link *profile.Link) (string, error) {
 	}
 
 	return cg.writeJSON("singbox", cfg)
+}
+
+func (cg *ConfigGenerator) dnsRuleSetTags() []string {
+	var tags []string
+	for _, country := range cg.WhitelistCountries {
+		tags = append(tags, fmt.Sprintf("geoip-%s", country))
+	}
+	return tags
 }
 
 func (cg *ConfigGenerator) singboxInbounds(link *profile.Link) []map[string]interface{} {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -424,6 +425,10 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 	}
 
 	gw.engineProc = exec.CommandContext(gw.ctx, eng.Path, args...)
+	gw.engineProc.Env = append(os.Environ(),
+		"ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true",
+		"ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true",
+	)
 	if err := gw.engineProc.Start(); err != nil {
 		return fmt.Errorf("starting %s: %w", eng.Name, err)
 	}
