@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/liberoute/bypath/internal/engine"
 	"github.com/liberoute/bypath/internal/profile"
@@ -14,6 +15,8 @@ import (
 type ConfigGenerator struct {
 	tempDir            string
 	WhitelistCountries []string // country codes (e.g. "ir") to route direct via geoip
+	HTTPProxyPort      int      // separate HTTP proxy port (0 = disabled)
+	SNISpoof           string   // fake SNI to replace real one (empty = disabled)
 }
 
 // NewConfigGenerator creates a new config generator.
@@ -45,16 +48,16 @@ func (cg *ConfigGenerator) Generate(eng *engine.Engine, link *profile.Link) (str
 func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface{} {
 	var rules []map[string]interface{}
 
-	// Rule: sniff protocol to detect domain (sing-box 1.11+ route action)
+	// Rule: sniff to detect domain from TLS/HTTP
 	rules = append(rules, map[string]interface{}{
 		"action":  "sniff",
 		"timeout": "300ms",
 	})
 
-	// Rule: resolve using clean DNS (through tunnel) for geoip matching
+	// Rule: resolve destination IP using direct DNS (for geoip matching)
 	rules = append(rules, map[string]interface{}{
 		"action": "resolve",
-		"server": "proxy-dns",
+		"server": "dns-direct",
 	})
 
 	// Rule: private/LAN IPs → direct
@@ -75,7 +78,7 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 		"outbound": "direct",
 	})
 
-	// Build rule_set definitions (local .srs files, downloaded separately)
+	// Build rule_set definitions (local .srs files)
 	var ruleSets []map[string]interface{}
 	for _, country := range cg.WhitelistCountries {
 		ruleSets = append(ruleSets, map[string]interface{}{
@@ -87,10 +90,9 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 	}
 
 	route := map[string]interface{}{
-		"rules":                 rules,
-		"rule_set":              ruleSets,
-		"final":                 "proxy",
-		"auto_detect_interface": true,
+		"rules":    rules,
+		"rule_set": ruleSets,
+		"final":    "proxy",
 	}
 
 	return route
@@ -102,24 +104,24 @@ func (cg *ConfigGenerator) generateSingBox(link *profile.Link) (string, error) {
 		"log": map[string]interface{}{
 			"level": "info",
 		},
-		"dns": map[string]interface{}{
-			"servers": []map[string]interface{}{
-				{
-					"tag":    "proxy-dns",
-					"type":   "https",
-					"server": "1.1.1.1",
-					"detour": "proxy",
-				},
-			},
-			"final": "proxy-dns",
-		},
 		"inbounds":  cg.singboxInbounds(link),
 		"outbounds": cg.singboxOutbounds(link),
 	}
 
-	// Add route section with geoip whitelist (bypass tunnel for whitelisted countries)
+	// Route section: geoip whitelist for bypassing tunnel on IR traffic.
 	if len(cg.WhitelistCountries) > 0 {
 		cfg["route"] = cg.singboxRoute(link)
+		// DNS for route matching: resolve directly (no tunnel)
+		cfg["dns"] = map[string]interface{}{
+			"servers": []map[string]interface{}{
+				{
+					"tag":    "dns-direct",
+					"type":   "udp",
+					"server": "1.1.1.1",
+				},
+			},
+			"final": "dns-direct",
+		}
 	}
 
 	return cg.writeJSON("singbox", cfg)
@@ -131,7 +133,7 @@ func (cg *ConfigGenerator) singboxInbounds(link *profile.Link) []map[string]inte
 		listenPort = 2801
 	}
 
-	return []map[string]interface{}{
+	inbounds := []map[string]interface{}{
 		{
 			"type":        "mixed",
 			"tag":         "mixed-in",
@@ -139,10 +141,36 @@ func (cg *ConfigGenerator) singboxInbounds(link *profile.Link) []map[string]inte
 			"listen_port": listenPort,
 		},
 	}
+
+	// Add separate HTTP proxy inbound if configured
+	if cg.HTTPProxyPort > 0 {
+		inbounds = append(inbounds, map[string]interface{}{
+			"type":        "http",
+			"tag":         "http-in",
+			"listen":      "0.0.0.0",
+			"listen_port": cg.HTTPProxyPort,
+		})
+	}
+
+	return inbounds
 }
 
 func (cg *ConfigGenerator) singboxOutbounds(link *profile.Link) []map[string]interface{} {
 	var outbound map[string]interface{}
+
+	// Fix comma-separated SNI/Host — take first entry
+	sni := link.SNI
+	host := link.Host
+	if strings.Contains(sni, ",") {
+		sni = strings.TrimSpace(strings.Split(sni, ",")[0])
+	}
+	if strings.Contains(host, ",") {
+		host = strings.TrimSpace(strings.Split(host, ",")[0])
+	}
+	// Apply SNI spoof if configured
+	if cg.SNISpoof != "" && sni != "" {
+		sni = cg.SNISpoof
+	}
 
 	switch link.Protocol {
 	case "vmess":
@@ -161,9 +189,9 @@ func (cg *ConfigGenerator) singboxOutbounds(link *profile.Link) []map[string]int
 			if link.Path != "" {
 				transport["path"] = link.Path
 			}
-			if link.Host != "" {
+			if host != "" {
 				transport["headers"] = map[string]interface{}{
-					"Host": link.Host,
+					"Host": host,
 				}
 			}
 			outbound["transport"] = transport
@@ -171,8 +199,8 @@ func (cg *ConfigGenerator) singboxOutbounds(link *profile.Link) []map[string]int
 		// TLS
 		if link.TLS {
 			tls := map[string]interface{}{"enabled": true}
-			if link.SNI != "" {
-				tls["server_name"] = link.SNI
+			if sni != "" {
+				tls["server_name"] = sni
 			}
 			outbound["tls"] = tls
 		}
@@ -194,18 +222,18 @@ func (cg *ConfigGenerator) singboxOutbounds(link *profile.Link) []map[string]int
 			if link.Path != "" {
 				transport["path"] = link.Path
 			}
-			if link.Host != "" {
+			if host != "" {
 				transport["headers"] = map[string]interface{}{
-					"Host": link.Host,
+					"Host": host,
 				}
 			}
 			outbound["transport"] = transport
 		}
 		// TLS
 		if link.TLS {
-			tls := map[string]interface{}{"enabled": true}
-			if link.SNI != "" {
-				tls["server_name"] = link.SNI
+			tls := map[string]interface{}{"enabled": true, "insecure": true}
+			if sni != "" {
+				tls["server_name"] = sni
 			}
 			outbound["tls"] = tls
 		}
@@ -220,8 +248,8 @@ func (cg *ConfigGenerator) singboxOutbounds(link *profile.Link) []map[string]int
 		}
 		// TLS (always enabled for trojan)
 		tls := map[string]interface{}{"enabled": true}
-		if link.SNI != "" {
-			tls["server_name"] = link.SNI
+		if sni != "" {
+			tls["server_name"] = sni
 		}
 		outbound["tls"] = tls
 		// Transport
@@ -252,6 +280,34 @@ func (cg *ConfigGenerator) singboxOutbounds(link *profile.Link) []map[string]int
 			"private_key": link.PrivateKey,
 			"peer_public_key": link.PublicKey,
 			"local_address": []string{"10.0.0.2/32"},
+		}
+
+	case "socks5":
+		outbound = map[string]interface{}{
+			"type":       "socks",
+			"tag":        "proxy",
+			"server":     link.Address,
+			"server_port": link.Port,
+			"version":    "5",
+		}
+		if link.UUID != "" {
+			outbound["username"] = link.UUID
+			outbound["password"] = link.Security
+		}
+
+	case "http":
+		outbound = map[string]interface{}{
+			"type":       "http",
+			"tag":        "proxy",
+			"server":     link.Address,
+			"server_port": link.Port,
+		}
+		if link.UUID != "" {
+			outbound["username"] = link.UUID
+			outbound["password"] = link.Security
+		}
+		if link.TLS {
+			outbound["tls"] = map[string]interface{}{"enabled": true}
 		}
 
 	default:

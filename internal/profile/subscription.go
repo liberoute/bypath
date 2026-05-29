@@ -127,3 +127,21 @@ func (m *Manager) AddSubscription(groupName, subURL string) error {
 	g.Subscriptions = append(g.Subscriptions, subURL)
 	return m.saveGroup(g)
 }
+
+// RemoveSubscription removes a subscription URL from a group by index.
+func (m *Manager) RemoveSubscription(groupName string, idx int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	g, ok := m.groups[groupName]
+	if !ok {
+		return fmt.Errorf("group '%s' not found", groupName)
+	}
+
+	if idx < 0 || idx >= len(g.Subscriptions) {
+		return fmt.Errorf("subscription index %d out of range (group has %d subscriptions)", idx+1, len(g.Subscriptions))
+	}
+
+	g.Subscriptions = append(g.Subscriptions[:idx], g.Subscriptions[idx+1:]...)
+	return m.saveGroup(g)
+}

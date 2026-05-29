@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"github.com/liberoute/bypath/internal/config"
 	"github.com/liberoute/bypath/internal/engine"
 	"github.com/liberoute/bypath/internal/gateway"
+	"github.com/liberoute/bypath/internal/pidfile"
 	"github.com/liberoute/bypath/internal/profile"
 	"github.com/liberoute/bypath/internal/tui"
 	"github.com/liberoute/bypath/internal/updater"
@@ -42,6 +44,8 @@ func main() {
 		cmdRun(args) // alias
 	case "add":
 		cmdAdd(args)
+	case "remove", "rm", "del":
+		cmdRemove(args)
 	case "list":
 		cmdList(args)
 	case "select":
@@ -129,7 +133,18 @@ func cmdRun(args []string) {
 		}
 	}
 
+	// Check if already running
+	if pid, running := pidfile.IsRunningFromFile(""); running {
+		log.Fatalf("❌ Gateway already running (PID: %d). Use 'bypath stop' first.", pid)
+	}
+
 	log.Printf("🚀 %s starting...", build.FullVersion())
+
+	// Write PID file
+	if err := pidfile.Write(""); err != nil {
+		log.Printf("⚠️  Could not write PID file: %v", err)
+	}
+	defer pidfile.Remove("")
 
 	// Background update check
 	go updater.CheckAndLog()
@@ -211,6 +226,96 @@ func cmdAdd(args []string) {
 	fmt.Printf("✅ Added [%s] %s → %s:%d (group: %s)\n", link.Protocol, link.Remark, link.Address, link.Port, group)
 }
 
+func cmdRemove(args []string) {
+	if len(args) == 0 {
+		fmt.Println("Usage: bypath remove <name|number> [-g group]")
+		fmt.Println("       bypath remove all [-g group]   (remove all links in group)")
+		os.Exit(1)
+	}
+
+	group := ""
+	var target string
+	for i := 0; i < len(args); i++ {
+		if (args[i] == "-g" || args[i] == "--group") && i+1 < len(args) {
+			group = args[i+1]
+			i++
+		} else {
+			target = args[i]
+		}
+	}
+
+	if target == "" {
+		fmt.Println("❌ No link name or number provided")
+		os.Exit(1)
+	}
+
+	mgr, err := profile.NewManager("./data/profiles", "default")
+	if err != nil {
+		fmt.Printf("❌ %v\n", err)
+		os.Exit(1)
+	}
+
+	// Default to "default" group
+	if group == "" {
+		group = "default"
+	}
+
+	// "all" removes all links in the group
+	if target == "all" {
+		g, err := mgr.GetGroup(group)
+		if err != nil {
+			fmt.Printf("❌ Group '%s' not found\n", group)
+			os.Exit(1)
+		}
+		count := len(g.Links)
+		g.Links = nil
+		// Save by re-adding empty (use internal method via workaround)
+		data := fmt.Sprintf(`{"name":"%s","type":"%s","links":[],"subscriptions":%s}`,
+			g.Name, g.Type, mustJSON(g.Subscriptions))
+		os.WriteFile(fmt.Sprintf("./data/profiles/%s.json", group), []byte(data), 0644)
+		fmt.Printf("✅ Removed all %d links from group '%s'\n", count, group)
+		return
+	}
+
+	// Try as number
+	if idx := parseIndex(target); idx > 0 {
+		g, err := mgr.GetGroup(group)
+		if err != nil {
+			fmt.Printf("❌ Group '%s' not found\n", group)
+			os.Exit(1)
+		}
+		if idx > len(g.Links) {
+			fmt.Printf("❌ Link #%d not found (group has %d links)\n", idx, len(g.Links))
+			os.Exit(1)
+		}
+		link := g.Links[idx-1]
+		if err := mgr.RemoveLink(group, link.Remark); err != nil {
+			fmt.Printf("❌ %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✅ Removed [%s] %s from group '%s'\n", link.Protocol, link.Remark, group)
+		return
+	}
+
+	// Try as remark name
+	if err := mgr.RemoveLink(group, target); err != nil {
+		fmt.Printf("❌ %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("✅ Removed '%s' from group '%s'\n", target, group)
+}
+
+func mustJSON(v interface{}) string {
+	if v == nil {
+		return "[]"
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		return "[]"
+	}
+	return string(data)
+}
+
 func cmdList(args []string) {
 	group := ""
 	for i, arg := range args {
@@ -225,22 +330,28 @@ func cmdList(args []string) {
 		os.Exit(1)
 	}
 
-	// If no group specified, show all groups
+	// If no group specified, show all groups with their links
 	if group == "" {
 		groups := mgr.ListGroups()
 		if len(groups) == 0 {
 			fmt.Println("No groups found. Use 'bypath sub add <url>' to add a subscription.")
 			return
 		}
-		if len(groups) == 1 {
-			group = groups[0]
-		} else {
-			fmt.Println("Available groups:")
-			for i, g := range groups {
-				fmt.Printf("  %d. %s\n", i+1, g)
+		for _, gName := range groups {
+			g, err := mgr.GetGroup(gName)
+			if err != nil {
+				continue
 			}
-			return
+			testable := 0
+			for _, l := range g.Links {
+				if l.Port >= 10 && l.Address != "" && l.Address != "0.0.0.0" {
+					testable++
+				}
+			}
+			fmt.Printf("\n━━ %s (%d links) ━━\n", gName, testable)
+			printGroupLinks(g)
 		}
+		return
 	}
 
 	g, err := mgr.GetGroup(group)
@@ -254,9 +365,20 @@ func cmdList(args []string) {
 		return
 	}
 
-	fmt.Printf("\n  %-3s %-8s %-4s %-22s %-6s %s\n", "#", "Proto", "Flag", "Server", "Port", "Name")
+	printGroupLinks(g)
+}
+
+func printGroupLinks(g *profile.Group) {
+	if len(g.Links) == 0 {
+		fmt.Println("  (empty)")
+		return
+	}
+	fmt.Printf("  %-3s %-8s %-4s %-22s %-6s %s\n", "#", "Proto", "Flag", "Server", "Port", "Name")
 	fmt.Printf("  %-3s %-8s %-4s %-22s %-6s %s\n", "---", "-----", "----", "------", "----", "----")
 	for i, link := range g.Links {
+		if link.Port < 10 || link.Address == "" || link.Address == "0.0.0.0" {
+			continue // skip info links
+		}
 		proto := shortProto(link.Protocol)
 		flag := extractFlag(link.Remark)
 		name := cleanRemark(link.Remark)
@@ -325,11 +447,26 @@ func cleanRemark(remark string) string {
 func cmdSelect(args []string) {
 	if len(args) == 0 {
 		fmt.Println("Usage: bypath select <remark-name>")
-		fmt.Println("       bypath select <number>  (from 'bypath list')")
+		fmt.Println("       bypath select <number> [-g group]  (from 'bypath list')")
 		os.Exit(1)
 	}
 
-	name := args[0]
+	group := ""
+	var name string
+	for i := 0; i < len(args); i++ {
+		if (args[i] == "-g" || args[i] == "--group") && i+1 < len(args) {
+			group = args[i+1]
+			i++
+		} else {
+			name = args[i]
+		}
+	}
+
+	if name == "" {
+		fmt.Println("❌ No link name or number provided")
+		os.Exit(1)
+	}
+
 	mgr, err := profile.NewManager("./data/profiles", "default")
 	if err != nil {
 		fmt.Printf("❌ %v\n", err)
@@ -338,6 +475,19 @@ func cmdSelect(args []string) {
 
 	// Try as number first
 	if idx := parseIndex(name); idx > 0 {
+		if group != "" {
+			// Select from specific group
+			g, _ := mgr.GetGroup(group)
+			if g != nil && idx <= len(g.Links) {
+				link := g.Links[idx-1]
+				mgr.SetActiveLink(link)
+				fmt.Printf("✅ Active link: [%s] %s → %s:%d\n", link.Protocol, link.Remark, link.Address, link.Port)
+				return
+			}
+			fmt.Printf("❌ Link #%d not found in group '%s'\n", idx, group)
+			os.Exit(1)
+		}
+		// No group specified — search all groups
 		groups := mgr.ListGroups()
 		for _, gName := range groups {
 			g, _ := mgr.GetGroup(gName)
@@ -422,12 +572,16 @@ func cmdTest(args []string) {
 func cmdBench(args []string) {
 	group := ""
 	autoSelect := false
+	singleIdx := 0
 	for i, arg := range args {
 		if (arg == "-g" || arg == "--group") && i+1 < len(args) {
 			group = args[i+1]
 		}
 		if arg == "--auto" {
 			autoSelect = true
+		}
+		if arg == "--single" && i+1 < len(args) {
+			singleIdx = parseIndex(args[i+1])
 		}
 	}
 
@@ -469,6 +623,37 @@ func cmdBench(args []string) {
 	if len(testableLinks) == 0 {
 		fmt.Println("❌ No testable links found")
 		os.Exit(1)
+	}
+
+	// Single link test mode
+	if singleIdx > 0 {
+		if singleIdx > len(g.Links) {
+			fmt.Printf("❌ Link #%d not found\n", singleIdx)
+			os.Exit(1)
+		}
+		link := g.Links[singleIdx-1]
+		fmt.Printf("  🔍 Testing [%s] %s → %s:%d\n\n", link.Protocol, link.Remark, link.Address, link.Port)
+
+		// TCP Ping
+		addr := net.JoinHostPort(link.Address, fmt.Sprintf("%d", link.Port))
+		start := time.Now()
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			fmt.Printf("  ❌ Ping: timeout\n")
+		} else {
+			conn.Close()
+			fmt.Printf("  ✅ Ping: %dms\n", time.Since(start).Milliseconds())
+		}
+
+		// Relay test
+		port := 19999
+		latency, ok := benchLinkOnPort(link, port)
+		if ok {
+			fmt.Printf("  ✅ Relay: %s\n", latency)
+		} else {
+			fmt.Printf("  ❌ Relay: failed\n")
+		}
+		return
 	}
 
 	fmt.Printf("\n  🏁 Benchmarking %d links in group '%s' (parallel)...\n\n", len(testableLinks), group)
@@ -698,6 +883,7 @@ func cmdSub(args []string) {
 		fmt.Println("  bypath sub add <url>       Add subscription URL")
 		fmt.Println("  bypath sub update          Fetch latest links")
 		fmt.Println("  bypath sub list            Show subscription URLs")
+		fmt.Println("  bypath sub remove <index>  Remove subscription by index (from 'sub list')")
 		os.Exit(1)
 	}
 
@@ -727,6 +913,13 @@ func cmdSub(args []string) {
 			os.Exit(1)
 		}
 
+		// Don't allow subscriptions in "default" group — it's reserved for manual links
+		if group == "default" {
+			// Auto-generate group name from URL domain
+			group = groupNameFromURL(url)
+			fmt.Printf("ℹ️  'default' group is reserved for manual links. Using group '%s'\n", group)
+		}
+
 		// Ensure group exists
 		if _, err := mgr.GetGroup(group); err != nil {
 			mgr.CreateGroup(group, "subscription")
@@ -737,10 +930,10 @@ func cmdSub(args []string) {
 			os.Exit(1)
 		}
 		fmt.Printf("✅ Subscription added to group '%s'\n", group)
-		fmt.Println("   Run 'bypath sub update' to fetch links")
+		fmt.Println("   Run 'bypath sub update -g " + group + "' to fetch links")
 
 	case "update":
-		group := "default"
+		group := ""
 		for i := 0; i < len(subArgs); i++ {
 			if (subArgs[i] == "-g" || subArgs[i] == "--group") && i+1 < len(subArgs) {
 				group = subArgs[i+1]
@@ -748,13 +941,68 @@ func cmdSub(args []string) {
 			}
 		}
 
-		fmt.Printf("📡 Updating subscriptions for group '%s'...\n", group)
-		count, err := mgr.UpdateSubscriptions(group)
-		if err != nil {
+		if group != "" {
+			// Update specific group
+			fmt.Printf("📡 Updating subscriptions for group '%s'...\n", group)
+			count, err := mgr.UpdateSubscriptions(group)
+			if err != nil {
+				fmt.Printf("❌ %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("✅ Got %d links\n", count)
+		} else {
+			// Update ALL groups that have subscriptions
+			groups := mgr.ListGroups()
+			totalLinks := 0
+			updated := 0
+			for _, gName := range groups {
+				g, _ := mgr.GetGroup(gName)
+				if g == nil || len(g.Subscriptions) == 0 {
+					continue
+				}
+				fmt.Printf("📡 Updating group '%s'...\n", gName)
+				count, err := mgr.UpdateSubscriptions(gName)
+				if err != nil {
+					fmt.Printf("  ⚠️  %v\n", err)
+					continue
+				}
+				fmt.Printf("  ✅ Got %d links\n", count)
+				totalLinks += count
+				updated++
+			}
+			if updated == 0 {
+				fmt.Println("❌ No groups with subscriptions found")
+				os.Exit(1)
+			}
+			fmt.Printf("\n✅ Updated %d groups, total %d links\n", updated, totalLinks)
+		}
+
+	case "remove", "rm", "del":
+		group := "default"
+		var idxStr string
+		for i := 0; i < len(subArgs); i++ {
+			if (subArgs[i] == "-g" || subArgs[i] == "--group") && i+1 < len(subArgs) {
+				group = subArgs[i+1]
+				i++
+			} else {
+				idxStr = subArgs[i]
+			}
+		}
+		if idxStr == "" {
+			fmt.Println("❌ No index provided. Use 'bypath sub list' to see indices.")
+			os.Exit(1)
+		}
+		idx := parseIndex(idxStr)
+		if idx <= 0 {
+			fmt.Println("❌ Invalid index")
+			os.Exit(1)
+		}
+
+		if err := mgr.RemoveSubscription(group, idx-1); err != nil {
 			fmt.Printf("❌ %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("✅ Got %d links\n", count)
+		fmt.Printf("✅ Subscription #%d removed from group '%s'\n", idx, group)
 
 	case "list":
 		group := "default"
@@ -787,7 +1035,22 @@ func cmdSub(args []string) {
 
 func cmdStop() {
 	fmt.Println("🛑 Stopping gateway...")
-	exec.Command("pkill", "-f", "bypath run").Run()
+
+	// Try PID file first
+	pid, running := pidfile.IsRunningFromFile("")
+	if running {
+		fmt.Printf("  Stopping bypath (PID: %d)...\n", pid)
+		if err := pidfile.StopFromFile(""); err != nil {
+			fmt.Printf("  ⚠️  Could not kill process: %v\n", err)
+		} else {
+			fmt.Println("  ✓ bypath stopped")
+		}
+	} else {
+		// Fallback: try pkill (for old instances without PID file)
+		exec.Command("pkill", "-f", "bypath run").Run()
+	}
+
+	// Always cleanup child processes and network
 	exec.Command("pkill", "sing-box").Run()
 	exec.Command("pkill", "dns2socks").Run()
 	exec.Command("pkill", "tun2socks").Run()
@@ -798,6 +1061,10 @@ func cmdStop() {
 	exec.Command("iptables", "-F", "FORWARD").Run()
 	exec.Command("ip", "rule", "del", "fwmark", "0x1", "lookup", "100").Run()
 	exec.Command("ip", "rule", "del", "fwmark", "0x66/0xff", "lookup", "200").Run()
+
+	// Remove PID file if still exists
+	pidfile.Remove("")
+
 	fmt.Println("✅ Gateway stopped")
 }
 
@@ -893,4 +1160,37 @@ func detectEngineFromFile(path, forceEngine string) string {
 	}
 
 	return "unknown"
+}
+
+// groupNameFromURL extracts a short group name from a subscription URL.
+func groupNameFromURL(rawURL string) string {
+	// Try to extract domain
+	url := rawURL
+	if idx := strings.Index(url, "://"); idx != -1 {
+		url = url[idx+3:]
+	}
+	if idx := strings.Index(url, "/"); idx != -1 {
+		url = url[:idx]
+	}
+	if idx := strings.Index(url, ":"); idx != -1 {
+		url = url[:idx]
+	}
+
+	// Use first part of domain as group name
+	parts := strings.Split(url, ".")
+	if len(parts) >= 2 {
+		// Use second-level domain (e.g., "mslio" from "private-link.mslio.site")
+		name := parts[len(parts)-2]
+		if len(name) <= 2 {
+			// Too short, use more
+			if len(parts) >= 3 {
+				name = parts[len(parts)-3]
+			}
+		}
+		return name
+	}
+	if len(parts) > 0 && parts[0] != "" {
+		return parts[0]
+	}
+	return "sub"
 }

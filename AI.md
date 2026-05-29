@@ -6,7 +6,7 @@
 
 - **Name**: Bypath
 - **Org**: Liberoute (`github.com/liberoute/bypath`)
-- **Language**: Go 1.22+
+- **Language**: Go 1.24+
 - **License**: MIT
 
 ## What It Does
@@ -22,14 +22,22 @@ LAN clients → iptables (fwmark) → tun0 → tun2socks → SOCKS5:2801 → sin
                                                               * → proxy outbound
 ```
 
-**Key point:** Whitelist is inside sing-box (rule_set with remote geoip-ir.srs). No ipset, no iptables -m set.
+**Key point:** Whitelist is inside sing-box (rule_set with local geoip-ir.srs). No ipset, no iptables -m set.
+
+**Proxy ports:**
+- SOCKS5 (mixed): 0.0.0.0:2801
+- HTTP proxy: 0.0.0.0:8888 (configurable)
+- API: 0.0.0.0:8080
 
 ## Directory Map
 
 ```
 cmd/bypath/main.go              Entry point + CLI commands
 internal/
-├── api/                        REST API (gorilla/mux) :8080
+├── api/
+│   ├── server.go               REST API (gorilla/mux) :8080
+│   ├── handlers.go             API endpoint handlers
+│   └── auth.go                 Token-based auth middleware
 ├── config/config.go            YAML config + defaults
 ├── dns/socksproxy.go           Native Go DNS-over-SOCKS5
 ├── engine/
@@ -41,46 +49,77 @@ internal/
 ├── gateway/
 │   ├── gateway.go              Main orchestrator (start/stop)
 │   ├── dns.go                  DNS forwarding
-│   ├── router.go               iptables/NAT (unused now, gateway.go does it)
+│   ├── router.go               iptables/NAT
 │   └── dhcp.go                 DHCP (placeholder)
 ├── health/health.go            Connectivity check
 ├── isolation/netns.go          Network namespace
+├── pidfile/pidfile.go          PID file management
 ├── profile/
 │   ├── profile.go              Link/Group CRUD (JSON)
-│   ├── parser.go               URI parser (vmess/vless/trojan/ss/wg)
-│   └── subscription.go         Subscription fetch + parse
+│   ├── parser.go               URI parser (vmess/vless/trojan/ss/wg/socks5/http)
+│   └── subscription.go         Subscription fetch + parse + remove
 ├── tunnel/
 │   ├── tunnel.go               Tunnel lifecycle
 │   ├── chain.go                Multi-hop chains
 │   └── configgen.go            Generate sing-box/xray configs
 ├── tui/
-│   ├── tui.go                  Main TUI menu (bubbletea)
-│   ├── bench.go                Bench page (parallel ping/relay, sort, select)
+│   ├── tui.go                  Main TUI (tab-based: Home/Servers/Subs)
+│   ├── bench.go                Speed test page (parallel ping/relay)
 │   ├── proc_linux.go           Linux-specific (Setpgid)
 │   └── proc_other.go           Non-Linux stub
 ├── updater/                    Self-update check
 └── whitelist/
-    ├── whitelist.go            IP list manager (legacy, not used for routing)
-    └── fetcher.go              Download country CIDRs (legacy)
+    └── whitelist.go            IP list manager (legacy, routing via sing-box)
 ```
 
 ## How Whitelist Works (Current)
 
-1. `configgen.go` adds `route.rule_set` to sing-box config
-2. Rule set: remote `geoip-ir.srs` from `SagerNet/sing-geoip` (binary format)
-3. Route rules: `ip_is_private → direct`, `rule_set geoip-ir → direct`, `final → proxy`
-4. sing-box downloads and caches the .srs file, updates every 7 days
+1. `configgen.go` adds `route.rules` + `route.rule_set` to sing-box config
+2. DNS section: udp server `1.1.1.1` (no detour, resolves directly)
+3. Route rules: `sniff` → `resolve` → `ip_is_private → direct` → `geoip-ir → direct` → `final → proxy`
+4. Rule set: local `geoip-ir.srs` file at `/opt/bypath/data/geo/geoip-ir.srs`
 5. No iptables/ipset involved in whitelist decision
 
 ## How Gateway Works (Current)
 
 `gateway.go` Start():
-1. Detect network (interface, IP, real gateway)
-2. Start sing-box (generated config with SOCKS5 inbound + geoip route)
-3. Start dns2socks (DNS through SOCKS5 tunnel)
-4. Start tun2socks (TUN device → SOCKS5)
-5. iptables: mark LAN traffic → policy route through tun0
-6. NAT + forwarding rules
+1. Check PID file (prevent duplicate instances)
+2. Detect network (interface, IP, real gateway)
+3. Get active link from `.active` file (searches all groups)
+4. Start sing-box (generated config with mixed inbound + HTTP inbound + geoip route)
+5. Verify connection via `curl -x socks5h:// cp.cloudflare.com`
+6. If fails → fallback to other links in same group (skip info links)
+7. Start dns2socks (DNS through SOCKS5 tunnel)
+8. Start tun2socks (TUN device → SOCKS5)
+9. iptables: mark LAN traffic → policy route through tun0
+
+## How Groups Work
+
+- **default** — Reserved for manual links (user adds with `bypath add <uri>`)
+- **Subscription groups** — Auto-created from URL domain when `sub add` is used without `-g`
+- `sub update` without `-g` updates ALL groups
+- Active link stored in `data/profiles/.active` as `group\nremark`
+
+## Supported Protocols (outbound)
+
+| Protocol | sing-box type | Auth fields |
+|----------|--------------|-------------|
+| vmess | vmess | uuid, alter_id, security |
+| vless | vless | uuid, flow (+ insecure TLS) |
+| trojan | trojan | password (in uuid field) |
+| shadowsocks | shadowsocks | method (security), password (uuid) |
+| wireguard | wireguard | private_key, public_key |
+| socks5 | socks | username (uuid), password (security) |
+| http | http | username (uuid), password (security) |
+
+## Config Generation (configgen.go)
+
+Key fixes applied:
+- **SNI comma-separated**: Takes first entry from comma-separated SNI/Host lists
+- **TLS insecure**: Added `insecure: true` for vless (CDN links have mismatched certs)
+- **No `auto_detect_interface`**: Not needed for SOCKS inbound mode
+- **DNS without detour**: sing-box 1.13 rejects `detour: direct` on DNS servers
+- **HTTP proxy inbound**: Optional second inbound on configurable port
 
 ## Build
 
@@ -93,9 +132,6 @@ GOOS=linux GOARCH=arm64 go build -o bypath ./cmd/bypath/
 
 # Lite (x86_64)
 GOOS=linux GOARCH=amd64 go build -o bypath ./cmd/bypath/
-
-# Full (embedded engines — not yet implemented)
-go build -tags full -o bypath-full ./cmd/bypath/
 ```
 
 ## Conventions
@@ -106,6 +142,7 @@ go build -tags full -o bypath-full ./cmd/bypath/
 - JSON tags on API/profile structs, YAML tags on config structs
 - No global state
 - Platform-specific code in `_linux.go` / `_other.go` files
+- TUI: bubbletea with tab-based navigation, tea.Cmd for async (no raw goroutines)
 
 ## Dependencies
 
@@ -128,3 +165,19 @@ go build -tags full -o bypath-full ./cmd/bypath/
 | `curl` | Bench + health check | recommended |
 | `iptables` | Routing | ✅ (gateway mode) |
 | `iproute2` | ip commands | ✅ (gateway mode) |
+
+## TUI Structure
+
+Tab-based (Home / Servers / Subscriptions):
+- **Home**: Start/Stop, Speed Test, Add Sub, Add Server, Version
+- **Servers**: Group tabs (0=default, 1-9=others), server list, select/ping/bench/new group
+- **Subscriptions**: List subs, update single/all, rename group, delete
+- **Speed Test** (sub-page): Group tabs, press `s` to start, sort 1/2/3, enter to select
+
+## Known Issues / Gotchas
+
+- CDN-based vless links (Cloudflare Workers) only relay HTTP, not HTTPS
+- `VLDR` links with comma-separated SNI need the first-entry fix
+- sing-box 1.13 rejects `detour: "direct"` on DNS servers (use no detour)
+- Gateway verify needs `socks5h://` (DNS through proxy) and 2s delay after start
+- `sub update` replaces ALL links in a group (by design — subscription is source of truth)

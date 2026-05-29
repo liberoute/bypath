@@ -1,5 +1,55 @@
 # Changelog
 
+## v2.3.0 (2026-05-29)
+
+### Features — TUI Redesign
+- **Tab-based UI** — Three tabs: Home, Servers, Subscriptions. Navigate with `tab`/`shift+tab`.
+- **Servers tab** — Browse all groups, switch with `0-9`, select server with `enter`, ping with `t`, bench group with `b`, create new group with `n`.
+- **Subscriptions tab** — View all subs, `enter` to update single sub, `r` to rename group, `d` to delete, `u` to update all.
+- **Speed Test improvements** — No longer auto-starts. Press `s` to start. Switch groups with `tab`. Press `r` to retest.
+- **Active link display** — Header shows current active server and connection status (running/stopped).
+- **Group management** — Create groups from TUI, rename groups, groups shown with numbered shortcuts.
+
+### Features — Proxy & Protocol
+- **SOCKS5 as outbound** — Add upstream SOCKS5 proxies: `bypath add 'socks5://host:port#name'`
+- **HTTP proxy as outbound** — Add upstream HTTP proxies: `bypath add 'http://user:pass@host:port#name'`
+- **HTTP proxy inbound** — Separate HTTP proxy port (default 8888) in addition to SOCKS5 on 2801. Configurable via `server.http_proxy_port` in config.
+- **Default group protection** — `sub add` without `-g` auto-creates a named group from URL domain. Default group reserved for manual links only.
+- **Engine selection** — Choose between sing-box and xray via `engines.preferred` in config.
+- **SNI Spoofing** — Replace real SNI with a fake Iranian domain to bypass DPI. Configure via `sni_spoof` in config.
+
+### Features — Security & Reliability
+- **API authentication** — Token-based auth via `Authorization: Bearer <token>` or `X-API-Key` header. Configure with `server.api_token` in config. Empty = no auth (backward compatible).
+- **PID file management** — Gateway writes PID to `bypath.pid`. `stop` command uses PID file instead of `pkill`. Prevents duplicate instances.
+- **Subscription removal** — `bypath sub remove <index>` CLI command + TUI support.
+
+### Fixes
+- **Race condition in TUI** — Update check now uses `tea.Cmd` instead of raw goroutine (was writing to model without synchronization).
+- **Gateway fallback group** — Fallback now searches the active link's group, not hardcoded "default".
+- **Skip info links** — Links with port<10 or address 0.0.0.0 are skipped in bench, fallback, and list.
+- **SNI comma-separated fix** — `configgen.go` now takes first SNI from comma-separated lists (matches bench behavior).
+- **TLS insecure for vless** — Added `insecure: true` to vless TLS config (required for CDN-based links with mismatched certificates).
+- **DNS circular dependency** — Removed `detour: direct` from DNS config that caused sing-box 1.13 startup failure. DNS now resolves without detour.
+- **Whitelist with proxy mode** — Route section with sniff+resolve via direct DNS enables geoip matching for SOCKS5 clients. IR sites go direct.
+- **Verify connection** — Changed from `ip-api.com` to `cp.cloudflare.com` with `socks5h://` (DNS through proxy). Added 2s delay after engine start.
+- **`sub update` without `-g`** — Now updates ALL groups with subscriptions, not just default.
+- **`list` without `-g`** — Shows all groups with their links, info links filtered out.
+- **`select -g <group>`** — Select by number within a specific group.
+
+### Config Changes
+```yaml
+server:
+  api_token: ""           # NEW: API authentication token
+  http_proxy_port: 8888   # NEW: Separate HTTP proxy port
+
+engines:
+  preferred: ""           # NEW: "sing-box" or "xray" (empty = auto)
+
+sni_spoof:                # NEW: SNI spoofing for DPI bypass
+  enabled: false
+  sni: "digikala.com"
+```
+
 ## v2.2.0 (2026-05-29)
 
 ### Features

@@ -3,6 +3,8 @@
 server:
   api_port: 8080
   dns_port: 53
+  api_token: ""           # Set a token to require authentication for API (e.g. "my-secret-token")
+  http_proxy_port: 8888   # Separate HTTP proxy port (in addition to SOCKS5 on 2801)
 
 # Gateway mode — clients set DNS/GW to this machine
 gateway:
@@ -12,6 +14,12 @@ gateway:
     - "1.1.1.1"
     - "8.8.8.8"
 
+# Engine settings
+engines:
+  directory: "./engines"
+  prefer_system: true
+  preferred: ""           # "sing-box" or "xray" (empty = auto-detect based on protocol)
+
 # Country IPs that bypass the tunnel (go direct)
 whitelist:
   countries: ["ir"]
@@ -20,6 +28,11 @@ whitelist:
 # Network namespace isolation for tunnel processes
 isolation:
   enabled: true
+
+# SNI Spoofing — replace real SNI with a fake one to bypass DPI
+sni_spoof:
+  enabled: false
+  sni: "digikala.com"     # Fake SNI (Iranian domain to look like local traffic)
 
 # Tunnel chain — how traffic flows
 chains:

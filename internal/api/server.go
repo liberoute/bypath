@@ -30,6 +30,11 @@ func NewServer(cfg *config.Config, gw *gateway.Gateway, engineMgr *engine.Manage
 	}
 
 	s.registerRoutes()
+
+	// Apply auth middleware if token is configured
+	auth := NewAuthMiddleware(cfg.Server.APIToken)
+	s.router.Use(auth.Middleware)
+
 	return s
 }
 

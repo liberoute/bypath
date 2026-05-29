@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -299,12 +298,19 @@ func (gw *Gateway) getActiveLink() *profile.Link {
 		return link
 	}
 
-	// 2. Fallback: first link from active group
-	g, err := gw.profileMgr.GetGroup(gw.config.Profiles.ActiveGroup)
-	if err != nil || len(g.Links) == 0 {
-		return nil
+	// 2. Fallback: first testable link from any group
+	for _, gName := range gw.profileMgr.ListGroups() {
+		g, err := gw.profileMgr.GetGroup(gName)
+		if err != nil || len(g.Links) == 0 {
+			continue
+		}
+		for _, l := range g.Links {
+			if l.Port >= 10 && l.Address != "" && l.Address != "0.0.0.0" {
+				return l
+			}
+		}
 	}
-	return g.Links[0]
+	return nil
 }
 
 func (gw *Gateway) startEngineWithFallback(link *profile.Link) error {
@@ -326,8 +332,12 @@ func (gw *Gateway) startEngineWithFallback(link *profile.Link) error {
 		log.Printf("⚠️  Link '%s' failed to start: %v", link.Remark, err)
 	}
 
-	// Try other links in the group
-	g, gerr := gw.profileMgr.GetGroup(gw.config.Profiles.ActiveGroup)
+	// Try other links in the group (use the active link's group, not config default)
+	fallbackGroup := link.Group
+	if fallbackGroup == "" {
+		fallbackGroup = gw.config.Profiles.ActiveGroup
+	}
+	g, gerr := gw.profileMgr.GetGroup(fallbackGroup)
 	if gerr != nil {
 		return fmt.Errorf("no working link found (original error: %w)", err)
 	}
@@ -335,6 +345,10 @@ func (gw *Gateway) startEngineWithFallback(link *profile.Link) error {
 	for _, candidate := range g.Links {
 		if candidate.Remark == link.Remark {
 			continue // skip the one we already tried
+		}
+		// Skip info-only links (port < 10 or address 0.0.0.0)
+		if candidate.Port < 10 || candidate.Address == "" || candidate.Address == "0.0.0.0" {
+			continue
 		}
 
 		log.Printf("🔄 Trying link: [%s] %s → %s:%d", candidate.Protocol, candidate.Remark, candidate.Address, candidate.Port)
@@ -359,21 +373,22 @@ func (gw *Gateway) startEngineWithFallback(link *profile.Link) error {
 		}
 	}
 
-	return fmt.Errorf("no working link found in group '%s'", gw.config.Profiles.ActiveGroup)
+	return fmt.Errorf("no working link found in group '%s'", fallbackGroup)
 }
 
 // verifyConnection checks if the SOCKS proxy actually works.
 func (gw *Gateway) verifyConnection() bool {
-	addr := fmt.Sprintf("socks5://127.0.0.1:%d", gw.socksPort)
-	// Simple TCP test through proxy
+	addr := fmt.Sprintf("socks5h://127.0.0.1:%d", gw.socksPort)
+	// Simple TCP test through proxy (socks5h = DNS resolved by proxy)
 	cmd := exec.CommandContext(gw.ctx, "curl", "-s", "-x", addr,
-		"--connect-timeout", "8", "-o", "/dev/null", "-w", "%{http_code}",
-		"http://ip-api.com/json")
+		"--connect-timeout", "10", "-o", "/dev/null", "-w", "%{http_code}",
+		"http://cp.cloudflare.com")
 	out, err := cmd.Output()
 	if err != nil {
 		return false
 	}
-	return strings.TrimSpace(string(out)) == "200"
+	code := strings.TrimSpace(string(out))
+	return code == "200" || code == "204"
 }
 
 func (gw *Gateway) startEngine(link *profile.Link) error {
@@ -389,6 +404,10 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 	// Generate config (with whitelist countries for sing-box geoip routing)
 	configGen := tunnel.NewConfigGenerator("./data/tmp")
 	configGen.WhitelistCountries = gw.config.Whitelist.Countries
+	configGen.HTTPProxyPort = gw.config.Server.HTTPProxy
+	if gw.config.SNISpoof.Enabled {
+		configGen.SNISpoof = gw.config.SNISpoof.SNI
+	}
 	configFile, err := configGen.Generate(eng, link)
 	if err != nil {
 		return fmt.Errorf("generating config: %w", err)
@@ -406,10 +425,6 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 	}
 
 	gw.engineProc = exec.CommandContext(gw.ctx, eng.Path, args...)
-	gw.engineProc.Env = append(os.Environ(),
-		"ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true",
-		"ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true",
-	)
 	if err := gw.engineProc.Start(); err != nil {
 		return fmt.Errorf("starting %s: %w", eng.Name, err)
 	}
@@ -418,6 +433,9 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 	if err := waitForPort(gw.socksPort, 10*time.Second); err != nil {
 		return fmt.Errorf("%s didn't start in time: %w", eng.Name, err)
 	}
+
+	// Give sing-box a moment to fully initialize outbound connections
+	time.Sleep(2 * time.Second)
 
 	log.Printf("  ✅ %s running on :%d (PID: %d)", eng.Name, gw.socksPort, gw.engineProc.Process.Pid)
 	return nil
@@ -556,8 +574,15 @@ func (gw *Gateway) cleanupRouting() {
 }
 
 func (gw *Gateway) resolveEngine(protocol string) string {
+	// If user has a preferred engine, use it for supported protocols
+	if gw.config.Engines.PreferredEngine != "" {
+		switch protocol {
+		case "vmess", "vless", "trojan", "shadowsocks":
+			return gw.config.Engines.PreferredEngine
+		}
+	}
 	switch protocol {
-	case "vmess", "vless", "trojan", "shadowsocks", "hysteria2", "tuic":
+	case "vmess", "vless", "trojan", "shadowsocks", "hysteria2", "tuic", "socks5", "http":
 		return "sing-box"
 	case "wireguard":
 		return "wireguard-go"

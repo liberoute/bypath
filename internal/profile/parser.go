@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-// ParseURI parses a proxy URI (vmess://, vless://, trojan://, ss://, wireguard://)
+// ParseURI parses a proxy URI (vmess://, vless://, trojan://, ss://, wireguard://, socks5://, http://)
 // and returns a Link struct.
 func ParseURI(uri string) (*Link, error) {
 	uri = strings.TrimSpace(uri)
@@ -25,6 +25,14 @@ func ParseURI(uri string) (*Link, error) {
 		return parseShadowsocks(uri)
 	case strings.HasPrefix(uri, "wireguard://") || strings.HasPrefix(uri, "wg://"):
 		return parseWireguard(uri)
+	case strings.HasPrefix(uri, "socks5://") || strings.HasPrefix(uri, "socks://"):
+		return parseSocks5(uri)
+	case strings.HasPrefix(uri, "http://") || strings.HasPrefix(uri, "https://"):
+		// Only parse as proxy if it looks like a proxy URI (has @ or port without path)
+		if strings.Contains(uri, "@") || isProxyURI(uri) {
+			return parseHTTPProxy(uri)
+		}
+		return nil, fmt.Errorf("unsupported URI (looks like a URL, not a proxy): %s", truncate(uri, 30))
 	default:
 		return nil, fmt.Errorf("unsupported protocol URI: %s", truncate(uri, 30))
 	}
@@ -304,4 +312,89 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// parseSocks5 parses a socks5://[user:pass@]host:port[#remark] URI.
+func parseSocks5(uri string) (*Link, error) {
+	// Normalize scheme for url.Parse
+	normalized := uri
+	if strings.HasPrefix(normalized, "socks://") {
+		normalized = "socks5://" + strings.TrimPrefix(normalized, "socks://")
+	}
+
+	u, err := url.Parse(normalized)
+	if err != nil {
+		return nil, fmt.Errorf("socks5: invalid URI: %w", err)
+	}
+
+	port, _ := strconv.Atoi(u.Port())
+	if port == 0 {
+		port = 1080
+	}
+
+	link := &Link{
+		Protocol: "socks5",
+		RawURI:   uri,
+		Remark:   u.Fragment,
+		Address:  u.Hostname(),
+		Port:     port,
+	}
+
+	if u.User != nil {
+		link.UUID = u.User.Username()
+		link.Security, _ = u.User.Password()
+	}
+
+	if link.Remark == "" {
+		link.Remark = fmt.Sprintf("socks5-%s:%d", link.Address, link.Port)
+	}
+
+	return link, nil
+}
+
+// parseHTTPProxy parses a http://[user:pass@]host:port[#remark] URI.
+func parseHTTPProxy(uri string) (*Link, error) {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return nil, fmt.Errorf("http-proxy: invalid URI: %w", err)
+	}
+
+	port, _ := strconv.Atoi(u.Port())
+	if port == 0 {
+		if u.Scheme == "https" {
+			port = 443
+		} else {
+			port = 8080
+		}
+	}
+
+	link := &Link{
+		Protocol: "http",
+		RawURI:   uri,
+		Remark:   u.Fragment,
+		Address:  u.Hostname(),
+		Port:     port,
+		TLS:      u.Scheme == "https",
+	}
+
+	if u.User != nil {
+		link.UUID = u.User.Username()
+		link.Security, _ = u.User.Password()
+	}
+
+	if link.Remark == "" {
+		link.Remark = fmt.Sprintf("http-%s:%d", link.Address, link.Port)
+	}
+
+	return link, nil
+}
+
+// isProxyURI checks if an http:// URI looks like a proxy (host:port without path).
+func isProxyURI(uri string) bool {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return false
+	}
+	// A proxy URI typically has no path or just "/"
+	return u.Port() != "" && (u.Path == "" || u.Path == "/")
 }

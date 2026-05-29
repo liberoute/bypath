@@ -38,6 +38,8 @@ type benchEntry struct {
 	status   benchStatus
 	ping     int // ms, -1 = fail
 	relay    int // ms, -1 = fail
+	down     int // KB/s, -1 = not tested
+	up       int // KB/s, -1 = not tested
 }
 
 type sortMode int
@@ -46,6 +48,7 @@ const (
 	sortByIndex sortMode = iota
 	sortByPing
 	sortByRelay
+	sortByDown
 )
 
 type benchModel struct {
@@ -55,6 +58,9 @@ type benchModel struct {
 	done     bool
 	selected int // index of selected entry, -1 = none
 	group    string
+	groups   []string
+	groupIdx int
+	testMode string // "ping", "relay", "full"
 }
 
 // Messages
@@ -76,6 +82,11 @@ var (
 
 func newBenchModel(group string) benchModel {
 	entries := loadBenchEntries(group)
+	groups := findGroups()
+	gi := 0
+	for i, g := range groups {
+		if g == group { gi = i; break }
+	}
 	return benchModel{
 		entries:  entries,
 		cursor:   0,
@@ -83,6 +94,8 @@ func newBenchModel(group string) benchModel {
 		done:     false,
 		selected: -1,
 		group:    group,
+		groups:   groups,
+		groupIdx: gi,
 	}
 }
 
@@ -120,6 +133,8 @@ func loadBenchEntries(group string) []benchEntry {
 			status:   benchWaiting,
 			ping:     -1,
 			relay:    -1,
+			down:     -1,
+			up:       -1,
 		})
 	}
 	return entries
@@ -154,12 +169,104 @@ func cleanRemarkForBench(remark string) string {
 	return name
 }
 
-// startBench kicks off parallel testing and returns a Cmd that sends benchDoneMsg
+// startBench kicks off parallel testing (ping + relay + download)
 func startBench(entries []benchEntry, group string) tea.Cmd {
 	return func() tea.Msg {
 		results := runParallelBench(entries, group)
 		return benchDoneMsg{results: results}
 	}
+}
+
+// startPingOnly runs only TCP ping (no relay/download)
+func startPingOnly(entries []benchEntry) tea.Cmd {
+	return func() tea.Msg {
+		results := make([]benchEntry, len(entries))
+		copy(results, entries)
+		for i := range results {
+			results[i].status = benchTesting
+		}
+
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+
+		for i, e := range entries {
+			wg.Add(1)
+			go func(idx int, entry benchEntry) {
+				defer wg.Done()
+				pingMs := tcpPing(entry.address, entry.port)
+				mu.Lock()
+				results[idx].ping = pingMs
+				if pingMs > 0 {
+					results[idx].status = benchDone
+				} else {
+					results[idx].status = benchFailed
+				}
+				mu.Unlock()
+			}(i, e)
+		}
+
+		wg.Wait()
+		return benchDoneMsg{results: results}
+	}
+}
+
+// testDownload measures download speed through a SOCKS proxy (KB/s)
+func testDownload(proxyPort int) int {
+	// Download ~100KB file and measure speed
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "curl", "-s",
+		"-x", fmt.Sprintf("socks5h://127.0.0.1:%d", proxyPort),
+		"--connect-timeout", "5",
+		"-o", "/dev/null",
+		"-w", "%{speed_download}",
+		"http://speed.cloudflare.com/__down?bytes=102400")
+	out, err := cmd.Output()
+	if err != nil {
+		return -1
+	}
+	// speed_download is in bytes/sec
+	speed := 0.0
+	for _, ch := range strings.TrimSpace(string(out)) {
+		if ch == '.' {
+			break
+		}
+		if ch >= '0' && ch <= '9' {
+			speed = speed*10 + float64(ch-'0')
+		}
+	}
+	return int(speed / 1024) // KB/s
+}
+
+// testUpload measures upload speed through a SOCKS proxy (KB/s)
+func testUpload(proxyPort int) int {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "curl", "-s",
+		"-x", fmt.Sprintf("socks5h://127.0.0.1:%d", proxyPort),
+		"--connect-timeout", "5",
+		"-o", "/dev/null",
+		"-w", "%{speed_upload}",
+		"-X", "POST",
+		"--data-binary", "@/dev/zero",
+		"--max-time", "3",
+		"http://speed.cloudflare.com/__up")
+	out, err := cmd.Output()
+	if err != nil {
+		return -1
+	}
+	speed := 0.0
+	for _, ch := range strings.TrimSpace(string(out)) {
+		if ch == '.' {
+			break
+		}
+		if ch >= '0' && ch <= '9' {
+			speed = speed*10 + float64(ch-'0')
+		}
+	}
+	return int(speed / 1024) // KB/s
 }
 
 func runParallelBench(entries []benchEntry, group string) []benchEntry {
@@ -224,9 +331,16 @@ func runParallelBench(entries []benchEntry, group string) []benchEntry {
 				relayMs = testRelay(sbPath, outboundJSON, localPort)
 			}
 
+			// Download test (only if relay succeeded)
+			downKBs := -1
+			if relayMs > 0 {
+				downKBs = testDownload(localPort)
+			}
+
 			mu.Lock()
 			results[idx].ping = pingMs
 			results[idx].relay = relayMs
+			results[idx].down = downKBs
 			if relayMs > 0 {
 				results[idx].status = benchDone
 			} else if pingMs > 0 {
@@ -381,7 +495,8 @@ func buildOutboundJSON(protocol, address string, port int, uuid string, alterId 
 // --- Bench page Tea interface ---
 
 func (m benchModel) Init() tea.Cmd {
-	return startBench(m.entries, m.group)
+	// Don't auto-start — wait for user to press a key
+	return nil
 }
 
 func (m benchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -395,8 +510,7 @@ func (m benchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c", "esc":
-			// Return to main menu
-			return newMainPage(), nil
+			return initialModel(), initialModel().Init()
 		case "up", "k":
 			if m.cursor > 0 {
 				m.cursor--
@@ -405,10 +519,56 @@ func (m benchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor < len(m.entries)-1 {
 				m.cursor++
 			}
+		case "tab", "right":
+			// Switch to next group
+			if len(m.groups) > 1 {
+				m.groupIdx = (m.groupIdx + 1) % len(m.groups)
+				m.group = m.groups[m.groupIdx]
+				m.entries = loadBenchEntries(m.group)
+				m.done = false
+				m.cursor = 0
+				m.selected = -1
+			}
+		case "shift+tab", "left":
+			if len(m.groups) > 1 {
+				m.groupIdx = (m.groupIdx + len(m.groups) - 1) % len(m.groups)
+				m.group = m.groups[m.groupIdx]
+				m.entries = loadBenchEntries(m.group)
+				m.done = false
+				m.cursor = 0
+				m.selected = -1
+			}
+		case "s", "r", "p":
+			// Start bench with selected mode
+			m.entries = loadBenchEntries(m.group)
+			m.done = false
+			m.cursor = 0
+			m.selected = -1
+			switch msg.String() {
+			case "p":
+				m.testMode = "ping"
+				return m, startPingOnly(m.entries)
+			case "r":
+				m.testMode = "relay"
+				return m, startBench(m.entries, m.group)
+			case "s":
+				m.testMode = "full"
+				return m, startBench(m.entries, m.group)
+			}
+		case "t":
+			// Test single selected server
+			if len(m.entries) > 0 && m.cursor < len(m.entries) {
+				entry := m.entries[m.cursor]
+				m.done = false
+				m.selected = -1
+				m.testMode = "single"
+				// Only test this one entry
+				singleEntries := []benchEntry{entry}
+				return m, startBench(singleEntries, m.group)
+			}
 		case "enter":
 			if m.done && m.cursor < len(m.entries) && m.entries[m.cursor].status == benchDone {
 				m.selected = m.cursor
-				// Select this link
 				selectLink(m.entries[m.cursor].idx, m.group)
 			}
 		case "1":
@@ -420,6 +580,9 @@ func (m benchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "3":
 			m.sortBy = sortByRelay
 			m.applySorting()
+		case "4":
+			m.sortBy = sortByDown
+			m.applySorting()
 		}
 	}
 	return m, nil
@@ -430,24 +593,23 @@ func (m *benchModel) applySorting() {
 	case sortByPing:
 		sort.SliceStable(m.entries, func(i, j int) bool {
 			pi, pj := m.entries[i].ping, m.entries[j].ping
-			if pi <= 0 {
-				pi = 99999
-			}
-			if pj <= 0 {
-				pj = 99999
-			}
+			if pi <= 0 { pi = 99999 }
+			if pj <= 0 { pj = 99999 }
 			return pi < pj
 		})
 	case sortByRelay:
 		sort.SliceStable(m.entries, func(i, j int) bool {
 			ri, rj := m.entries[i].relay, m.entries[j].relay
-			if ri <= 0 {
-				ri = 99999
-			}
-			if rj <= 0 {
-				rj = 99999
-			}
+			if ri <= 0 { ri = 99999 }
+			if rj <= 0 { rj = 99999 }
 			return ri < rj
+		})
+	case sortByDown:
+		sort.SliceStable(m.entries, func(i, j int) bool {
+			di, dj := m.entries[i].down, m.entries[j].down
+			if di <= 0 { di = 0 }
+			if dj <= 0 { dj = 0 }
+			return di > dj // higher is better
 		})
 	case sortByIndex:
 		sort.SliceStable(m.entries, func(i, j int) bool {
@@ -459,7 +621,21 @@ func (m *benchModel) applySorting() {
 func (m benchModel) View() string {
 	var b strings.Builder
 
-	b.WriteString(titleStyle.Render("BENCH"))
+	b.WriteString(logoStyle.Render("SPEED TEST"))
+	b.WriteString("\n")
+
+	// Group tabs
+	b.WriteString(" ")
+	for i, g := range m.groups {
+		if i == m.groupIdx {
+			b.WriteString(activeTabStyle.Render(g))
+		} else {
+			b.WriteString(inactiveTabStyle.Render(g))
+		}
+		b.WriteString(" ")
+	}
+	b.WriteString("\n")
+	b.WriteString(dimStyle.Render(" ─────────────────────────────────────────────────"))
 	b.WriteString("\n")
 
 	if !m.done {
@@ -473,19 +649,57 @@ func (m benchModel) View() string {
 				done++
 			}
 		}
-		b.WriteString(subtitleStyle.Render(fmt.Sprintf("⏳ Testing %d/%d links...", done, len(m.entries))))
+		if testing == 0 && done == 0 {
+			// Not started yet — show test options
+			b.WriteString(fmt.Sprintf("\n  %d servers in group '%s'\n\n", len(m.entries), m.group))
+			b.WriteString("  Test ALL:\n")
+			b.WriteString("    p  Ping only (TCP connect)\n")
+			b.WriteString("    r  Relay test (ping + proxy)\n")
+			b.WriteString("    s  Full test (ping + relay)\n\n")
+			b.WriteString("  Test SINGLE (selected):\n")
+			b.WriteString("    t  Test current server (ping + relay)\n\n")
+			b.WriteString("  ↑↓ select server • tab switch group • esc back\n")
+
+			// Show server list for single selection
+			if len(m.entries) > 0 {
+				b.WriteString("\n")
+				maxShow := 10
+				end := maxShow
+				if end > len(m.entries) { end = len(m.entries) }
+				for i := 0; i < end; i++ {
+					e := m.entries[i]
+					proto := e.protocol
+					if proto == "shadowsocks" { proto = "ss" }
+					server := e.address
+					if len(server) > 16 { server = server[:13] + "..." }
+					line := fmt.Sprintf("%-4d %-7s %s %-16s :%d", e.idx, proto, e.flag, server, e.port)
+					if i == m.cursor {
+						b.WriteString(benchCursorStyle.Render("  ▸ " + line))
+					} else {
+						b.WriteString(benchRowStyle.Render("    " + line))
+					}
+					b.WriteString("\n")
+				}
+				if len(m.entries) > maxShow {
+					b.WriteString(benchDimStyle.Render(fmt.Sprintf("    ... +%d more", len(m.entries)-maxShow)))
+					b.WriteString("\n")
+				}
+			}
+			return b.String()
+		}
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  ⏳ Testing %d/%d links...", done, len(m.entries))))
 		b.WriteString("\n")
 	} else {
 		// Sort indicator
-		sortLabels := []string{"#", "ping", "relay"}
+		sortLabels := []string{"#", "ping", "relay", "download"}
 		sortLabel := sortLabels[m.sortBy]
-		b.WriteString(benchSortStyle.Render(fmt.Sprintf("  Sort: %s  [1]# [2]ping [3]relay", sortLabel)))
+		b.WriteString(benchSortStyle.Render(fmt.Sprintf("  Sort: %s  [1]# [2]ping [3]relay [4]download", sortLabel)))
 		b.WriteString("\n")
 	}
 	b.WriteString("\n")
 
 	// Header
-	header := padRight("#", 4) + padRight("Proto", 7) + padRight("Flag", 4) + padRight("Server", 18) + padRight("Port", 6) + padRight("Ping", 8) + padRight("Relay", 8) + "Name"
+	header := padRight("#", 4) + padRight("Proto", 7) + padRight("Flag", 4) + padRight("Server", 16) + padRight("Port", 6) + padRight("Ping", 7) + padRight("Relay", 7) + padRight("Down", 9) + "Name"
 	b.WriteString(benchHeaderStyle.Render("  " + header))
 	b.WriteString("\n")
 
@@ -513,6 +727,7 @@ func (m benchModel) View() string {
 
 		pingStr := "..."
 		relayStr := "..."
+		downStr := "..."
 
 		switch e.status {
 		case benchDone:
@@ -526,12 +741,21 @@ func (m benchModel) View() string {
 			} else {
 				relayStr = "✗"
 			}
+			if e.down > 0 {
+				downStr = fmt.Sprintf("%dKB/s", e.down)
+			} else if e.down == 0 {
+				downStr = "—"
+			} else {
+				downStr = "✗"
+			}
 		case benchFailed:
 			pingStr = "✗"
 			relayStr = "✗"
+			downStr = "✗"
 		case benchTesting:
 			pingStr = "..."
 			relayStr = "..."
+			downStr = "..."
 		}
 
 		name := e.remark
@@ -542,10 +766,11 @@ func (m benchModel) View() string {
 		line := padRight(fmt.Sprintf("%d", e.idx), 4) +
 			padRight(proto, 7) +
 			padRight(e.flag, 4) +
-			padRight(server, 18) +
+			padRight(server, 16) +
 			padRight(fmt.Sprintf("%d", e.port), 6) +
-			padRight(pingStr, 8) +
-			padRight(relayStr, 8) +
+			padRight(pingStr, 7) +
+			padRight(relayStr, 7) +
+			padRight(downStr, 9) +
 			name
 
 		prefix := "  "
@@ -580,9 +805,9 @@ func (m benchModel) View() string {
 
 	b.WriteString("\n")
 	if m.done {
-		b.WriteString(benchDimStyle.Render("  ↑↓ navigate • enter select • 1/2/3 sort • esc back"))
+		b.WriteString(benchDimStyle.Render("  ↑↓ navigate • enter select • tab group • r retest • 1/2/3/4 sort • esc back"))
 	} else {
-		b.WriteString(benchDimStyle.Render("  testing in progress... esc to cancel"))
+		b.WriteString(benchDimStyle.Render("  testing in progress... tab switch group • esc cancel"))
 	}
 	b.WriteString("\n")
 

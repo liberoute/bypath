@@ -18,12 +18,15 @@ type Config struct {
 	Chains      []ChainConfig     `yaml:"chains"`
 	HealthCheck HealthCheckConfig `yaml:"health_check,omitempty"`
 	DHCP        DHCPConfig        `yaml:"dhcp,omitempty"`
+	SNISpoof    SNISpoofConfig    `yaml:"sni_spoof,omitempty"`
 }
 
 type ServerConfig struct {
-	Listen  string `yaml:"listen"`
-	APIPort int    `yaml:"api_port"`
-	DNSPort int    `yaml:"dns_port"`
+	Listen    string `yaml:"listen"`
+	APIPort   int    `yaml:"api_port"`
+	DNSPort   int    `yaml:"dns_port"`
+	APIToken  string `yaml:"api_token,omitempty"`
+	HTTPProxy int    `yaml:"http_proxy_port,omitempty"` // Separate HTTP proxy port (0 = disabled, mixed inbound handles both)
 }
 
 type GatewayConfig struct {
@@ -33,8 +36,9 @@ type GatewayConfig struct {
 }
 
 type EnginesConfig struct {
-	Directory    string `yaml:"directory"`
-	PreferSystem bool   `yaml:"prefer_system"`
+	Directory       string `yaml:"directory"`
+	PreferSystem    bool   `yaml:"prefer_system"`
+	PreferredEngine string `yaml:"preferred,omitempty"` // "sing-box" or "xray" (empty = auto)
 }
 
 type WhitelistConfig struct {
@@ -76,6 +80,12 @@ type HopConfig struct {
 	Profile string `yaml:"profile"`
 	Engine  string `yaml:"engine,omitempty"`  // force engine (empty = auto-detect)
 	Isolate bool   `yaml:"isolate,omitempty"` // run in network namespace
+}
+
+type SNISpoofConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	SNI     string `yaml:"sni,omitempty"`     // fake SNI to use (e.g. "digikala.com")
+	Mode    string `yaml:"mode,omitempty"`    // "replace" or "fragment"
 }
 
 // Load reads and parses the YAML configuration file.
