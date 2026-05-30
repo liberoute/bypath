@@ -13,35 +13,61 @@ Iranian IPs go direct (no tunnel). Everything else goes through your proxy serve
 - **Parallel speed test** — test all servers simultaneously, auto-select best
 - **Interactive TUI** — tab-based terminal UI (Home / Servers / Subscriptions)
 - **Auto-fallback** — if a link fails, tries the next one
-- **Dual proxy** — SOCKS5 (:2801) + HTTP proxy (:8888) for clients
+- **Mixed proxy** — SOCKS5 + HTTP on configurable port (default: 2801)
 - **API authentication** — token-based auth for REST API
 - **PID management** — clean start/stop without orphan processes
+- **Auto-install** — installer handles all dependencies automatically
+
+## Installation
+
+One-liner install (recommended):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/liberoute/bypath/main/install.sh | sudo bash
+```
+
+Or with a specific version and variant:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/liberoute/bypath/main/install.sh | sudo bash -s -- v2.3.0 full
+```
+
+Or download and run manually:
+
+```bash
+curl -fsSL -o install.sh https://raw.githubusercontent.com/liberoute/bypath/main/install.sh
+chmod +x install.sh
+sudo ./install.sh
+```
+
+The installer will:
+- Detect your OS and architecture automatically
+- Download the correct binary from GitHub releases
+- **Auto-install dependencies** (sing-box, tun2socks, iptables, iproute2, curl)
+- Install to `/opt/bypath/` with proper directory structure
+- Download `geoip-ir.srs` for Iran IP whitelist
+- Optionally create a systemd service
+
+### Installer options
+
+| Usage | Description |
+|-------|-------------|
+| `./install.sh` | Interactive — latest version, asks for variant |
+| `./install.sh v2.3.0` | Specific version, lite |
+| `./install.sh v2.3.0 full` | Specific version, full variant |
+| `./install.sh latest full` | Latest version, full variant |
+
+Environment variables:
+- `BYPATH_INSTALL_DIR` — Override install path (default: `/opt/bypath`)
+- `BYPATH_NO_SYSTEMD=1` — Skip systemd service creation
 
 ## Quick Start
 
 ```bash
-# On your Linux box (Orange Pi, Raspberry Pi, any server):
-
-# Install dependencies
-apt install -y iptables iproute2 curl
-# Install sing-box: https://sing-box.sagernet.org/installation/package-manager/
-# Install tun2socks:
-wget https://github.com/xjasonlyu/tun2socks/releases/latest/download/tun2socks-linux-armv7 -O /usr/local/bin/tun2socks
-chmod +x /usr/local/bin/tun2socks
-
-# Download geoip for Iran whitelist
-mkdir -p /opt/bypath/data/geo
-wget -O /opt/bypath/data/geo/geoip-ir.srs https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip-ir.srs
-
-# Setup bypath
-mkdir -p /opt/bypath && cd /opt/bypath
-wget https://github.com/liberoute/bypath/releases/latest/download/bypath-lite-linux-arm -O bypath
-chmod +x bypath
-
-# Add your subscription and go
-./bypath sub add "https://your-subscription-url"
-./bypath bench --auto
-./bypath run
+# After installation:
+bypath sub add "https://your-subscription-url"
+bypath bench --auto
+bypath run
 ```
 
 Then on your phone/laptop: set Gateway and DNS to the Bypath machine's IP.
@@ -50,11 +76,11 @@ Then on your phone/laptop: set Gateway and DNS to the Bypath machine's IP.
 
 ### Interactive TUI
 ```bash
-./bypath
+bypath
 ```
 
 Tab-based interface:
-- **Home** — Start/Stop gateway, speed test, add subscription, status
+- **Home** — Start/Stop gateway, speed test, add subscription, change port, status
 - **Servers** — Browse groups (0-9), select server, ping, bench
 - **Subscriptions** — Update, rename, delete subscriptions
 
@@ -62,6 +88,7 @@ Tab-based interface:
 ```bash
 # Gateway
 bypath run                        # Start gateway
+bypath run -c /path/to/config     # Custom config path
 bypath stop                       # Stop gateway
 
 # Servers
@@ -114,19 +141,34 @@ Bypath (iptables → tun0 → tun2socks → sing-box)
     └── google.com → tunnel → exit in Germany/Netherlands/etc
 ```
 
-Proxy ports available for manual configuration:
-- **SOCKS5**: `<bypath-ip>:2801`
-- **HTTP**: `<bypath-ip>:8888`
+Proxy port available for manual configuration:
+- **SOCKS5 + HTTP (mixed)**: `<bypath-ip>:2801` (configurable)
+
+## File Paths
+
+Bypath auto-detects its installation mode:
+
+| | Local (./bypath) | Installed (system) |
+|---|---|---|
+| Config | `configs/default.yaml` | `/etc/bypath/config.yaml` |
+| Profiles | `./data/profiles/` | `/var/lib/bypath/profiles/` |
+| Temp | `./data/tmp/` | `/var/lib/bypath/tmp/` |
+| Geo data | `./data/geo/` | `/var/lib/bypath/geo/` |
+| Engines | `./engines/` | `/opt/bypath/engines/` |
+| Logs | stdout | `/var/log/bypath/error.log` |
+
+Detection: if binary is in `/opt/bypath/`, `/usr/local/bin/`, or `/usr/bin/`, or `/etc/bypath/config.yaml` exists → installed mode.
 
 ## Configuration
 
-`configs/default.yaml`:
+Config file (auto-created on first run if missing):
+
 ```yaml
 server:
   api_port: 8080
   dns_port: 53
+  socks_port: 2801        # SOCKS5/HTTP mixed proxy port
   api_token: ""           # API auth token (empty = no auth)
-  http_proxy_port: 8888   # HTTP proxy port (0 = disabled)
 
 gateway:
   enabled: true
@@ -138,6 +180,10 @@ whitelist:
 
 isolation:
   enabled: true
+
+sni_spoof:
+  enabled: false
+  sni: "digikala.com"
 ```
 
 See [docs/configuration.md](docs/configuration.md) for full reference.
@@ -167,6 +213,8 @@ GOOS=linux GOARCH=amd64 go build -o bypath ./cmd/bypath/
 
 ## Requirements (Lite build)
 
+All dependencies are auto-installed by `install.sh`. For manual setup:
+
 | | Required | Why |
 |---|---|---|
 | Linux (arm/arm64/amd64) | ✅ | OS |
@@ -174,7 +222,6 @@ GOOS=linux GOARCH=amd64 go build -o bypath ./cmd/bypath/
 | sing-box ≥1.10 | ✅ | Tunnel engine |
 | tun2socks | ✅ | TUN → SOCKS5 (gateway mode) |
 | iptables + iproute2 | ✅ | Routing (gateway mode) |
-| dns2socks | recommended | DNS through tunnel |
 | curl | recommended | Bench + health check |
 
 ## License

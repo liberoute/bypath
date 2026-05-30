@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/liberoute/bypath/internal/engine"
+	"github.com/liberoute/bypath/internal/paths"
 	"github.com/liberoute/bypath/internal/profile"
 )
 
@@ -15,7 +16,7 @@ import (
 type ConfigGenerator struct {
 	tempDir            string
 	WhitelistCountries []string // country codes (e.g. "ir") to route direct via geoip
-	HTTPProxyPort      int      // separate HTTP proxy port (0 = disabled)
+	SOCKSPort          int      // SOCKS5/mixed listen port (default: 2801)
 	SNISpoof           string   // fake SNI to replace real one (empty = disabled)
 }
 
@@ -85,7 +86,7 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 			"type":   "local",
 			"tag":    fmt.Sprintf("geoip-%s", country),
 			"format": "binary",
-			"path":   fmt.Sprintf("/opt/bypath/data/geo/geoip-%s.srs", country),
+			"path":   filepath.Join(paths.Get().GeoDir, fmt.Sprintf("geoip-%s.srs", country)),
 		})
 	}
 
@@ -115,9 +116,8 @@ func (cg *ConfigGenerator) generateSingBox(link *profile.Link) (string, error) {
 		cfg["dns"] = map[string]interface{}{
 			"servers": []map[string]interface{}{
 				{
-					"tag":    "dns-direct",
-					"type":   "udp",
-					"server": "1.1.1.1",
+					"tag":     "dns-direct",
+					"address": "udp://1.1.1.1",
 				},
 			},
 			"final": "dns-direct",
@@ -130,7 +130,10 @@ func (cg *ConfigGenerator) generateSingBox(link *profile.Link) (string, error) {
 func (cg *ConfigGenerator) singboxInbounds(link *profile.Link) []map[string]interface{} {
 	listenPort := link.ListenPort
 	if listenPort == 0 {
-		listenPort = 2801
+		listenPort = cg.SOCKSPort
+		if listenPort == 0 {
+			listenPort = 2801
+		}
 	}
 
 	inbounds := []map[string]interface{}{
@@ -140,16 +143,6 @@ func (cg *ConfigGenerator) singboxInbounds(link *profile.Link) []map[string]inte
 			"listen":      "0.0.0.0",
 			"listen_port": listenPort,
 		},
-	}
-
-	// Add separate HTTP proxy inbound if configured
-	if cg.HTTPProxyPort > 0 {
-		inbounds = append(inbounds, map[string]interface{}{
-			"type":        "http",
-			"tag":         "http-in",
-			"listen":      "0.0.0.0",
-			"listen_port": cg.HTTPProxyPort,
-		})
 	}
 
 	return inbounds
@@ -344,7 +337,10 @@ func (cg *ConfigGenerator) singboxOutbounds(link *profile.Link) []map[string]int
 func (cg *ConfigGenerator) generateXray(link *profile.Link) (string, error) {
 	listenPort := link.ListenPort
 	if listenPort == 0 {
-		listenPort = 2801
+		listenPort = cg.SOCKSPort
+		if listenPort == 0 {
+			listenPort = 2801
+		}
 	}
 
 	cfg := map[string]interface{}{

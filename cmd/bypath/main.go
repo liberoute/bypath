@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,6 +21,7 @@ import (
 	"github.com/liberoute/bypath/internal/config"
 	"github.com/liberoute/bypath/internal/engine"
 	"github.com/liberoute/bypath/internal/gateway"
+	"github.com/liberoute/bypath/internal/paths"
 	"github.com/liberoute/bypath/internal/pidfile"
 	"github.com/liberoute/bypath/internal/profile"
 	"github.com/liberoute/bypath/internal/tui"
@@ -126,11 +128,26 @@ Examples:
 // --- Commands ---
 
 func cmdRun(args []string) {
-	configPath := "configs/default.yaml"
+	p := paths.Detect()
+	p.EnsureDirs()
+
+	configPath := p.ConfigFile
 	for i, arg := range args {
 		if (arg == "-c" || arg == "--config") && i+1 < len(args) {
 			configPath = args[i+1]
 		}
+	}
+
+	// Setup logging
+	setupLogging(p)
+
+	// Auto-create config if it doesn't exist
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		log.Printf("⚠️  Config file not found: %s — creating with defaults...", configPath)
+		if err := createDefaultConfig(configPath); err != nil {
+			log.Fatalf("❌ Could not create config: %v", err)
+		}
+		log.Printf("✅ Default config created: %s", configPath)
 	}
 
 	// Check if already running
@@ -212,7 +229,7 @@ func cmdAdd(args []string) {
 	}
 
 	// Load profile manager
-	mgr, err := profile.NewManager("./data/profiles", "default")
+	mgr, err := profile.NewManager(profileDir(), "default")
 	if err != nil {
 		fmt.Printf("❌ Profile error: %v\n", err)
 		os.Exit(1)
@@ -249,7 +266,7 @@ func cmdRemove(args []string) {
 		os.Exit(1)
 	}
 
-	mgr, err := profile.NewManager("./data/profiles", "default")
+	mgr, err := profile.NewManager(profileDir(), "default")
 	if err != nil {
 		fmt.Printf("❌ %v\n", err)
 		os.Exit(1)
@@ -272,7 +289,7 @@ func cmdRemove(args []string) {
 		// Save by re-adding empty (use internal method via workaround)
 		data := fmt.Sprintf(`{"name":"%s","type":"%s","links":[],"subscriptions":%s}`,
 			g.Name, g.Type, mustJSON(g.Subscriptions))
-		os.WriteFile(fmt.Sprintf("./data/profiles/%s.json", group), []byte(data), 0644)
+		os.WriteFile(filepath.Join(profileDir(), group+".json"), []byte(data), 0644)
 		fmt.Printf("✅ Removed all %d links from group '%s'\n", count, group)
 		return
 	}
@@ -324,7 +341,7 @@ func cmdList(args []string) {
 		}
 	}
 
-	mgr, err := profile.NewManager("./data/profiles", "default")
+	mgr, err := profile.NewManager(profileDir(), "default")
 	if err != nil {
 		fmt.Printf("❌ %v\n", err)
 		os.Exit(1)
@@ -467,7 +484,7 @@ func cmdSelect(args []string) {
 		os.Exit(1)
 	}
 
-	mgr, err := profile.NewManager("./data/profiles", "default")
+	mgr, err := profile.NewManager(profileDir(), "default")
 	if err != nil {
 		fmt.Printf("❌ %v\n", err)
 		os.Exit(1)
@@ -585,7 +602,7 @@ func cmdBench(args []string) {
 		}
 	}
 
-	mgr, err := profile.NewManager("./data/profiles", "default")
+	mgr, err := profile.NewManager(profileDir(), "default")
 	if err != nil {
 		fmt.Printf("❌ %v\n", err)
 		os.Exit(1)
@@ -742,14 +759,14 @@ func cmdBench(args []string) {
 func benchLinkOnPort(link *profile.Link, port int) (string, bool) {
 	configContent := fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":%d}],"outbounds":[%s,{"type":"direct","tag":"direct"}]}`, port, buildOutbound(link))
 
-	tmpFile := fmt.Sprintf("./data/tmp/bench-%d-%d.json", os.Getpid(), port)
-	os.MkdirAll("./data/tmp", 0755)
+	tmpFile := fmt.Sprintf(tmpDir()+"/bench-%d-%d.json", os.Getpid(), port)
+	os.MkdirAll(tmpDir(), 0755)
 	os.WriteFile(tmpFile, []byte(configContent), 0644)
 	defer os.Remove(tmpFile)
 
 	sbPath, err := exec.LookPath("sing-box")
 	if err != nil {
-		sbPath = "./engines/sing-box"
+		sbPath = filepath.Join(engineDir(), "sing-box")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
@@ -890,7 +907,7 @@ func cmdSub(args []string) {
 	subCmd := args[0]
 	subArgs := args[1:]
 
-	mgr, err := profile.NewManager("./data/profiles", "default")
+	mgr, err := profile.NewManager(profileDir(), "default")
 	if err != nil {
 		fmt.Printf("❌ %v\n", err)
 		os.Exit(1)
@@ -1069,7 +1086,7 @@ func cmdStop() {
 }
 
 func cmdEngines(args []string) {
-	cfg := config.EnginesConfig{Directory: "./engines", PreferSystem: true}
+	cfg := config.EnginesConfig{Directory: engineDir(), PreferSystem: true}
 	mgr := engine.NewManager(cfg)
 	mgr.Init()
 
@@ -1193,4 +1210,87 @@ func groupNameFromURL(rawURL string) string {
 		return parts[0]
 	}
 	return "sub"
+}
+
+// createDefaultConfig generates a default configuration file with sane defaults.
+func createDefaultConfig(path string) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("creating config directory: %w", err)
+	}
+
+	p := paths.Get()
+	content := fmt.Sprintf(`# Bypath Configuration
+
+server:
+  api_port: 8080
+  dns_port: 53
+  socks_port: 2801
+  api_token: ""
+
+gateway:
+  enabled: true
+  interface: ""
+  dns_upstream:
+    - "1.1.1.1"
+    - "8.8.8.8"
+
+engines:
+  directory: "%s"
+  prefer_system: true
+  preferred: ""
+
+profiles:
+  directory: "%s"
+  active_group: "default"
+
+whitelist:
+  countries: ["ir"]
+  update_interval: "24h"
+
+isolation:
+  enabled: true
+
+sni_spoof:
+  enabled: false
+  sni: "digikala.com"
+`, p.EngineDir, p.ProfileDir)
+
+	return os.WriteFile(path, []byte(content), 0644)
+}
+
+// setupLogging configures log output based on installation mode.
+// In installed mode, logs go to /var/log/bypath/error.log.
+// In local mode, logs go to stdout.
+func setupLogging(p *paths.Resolved) {
+	if p.LogDir == "" {
+		return // local mode — stdout is fine
+	}
+
+	os.MkdirAll(p.LogDir, 0755)
+
+	logFile := filepath.Join(p.LogDir, "error.log")
+	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Printf("⚠️  Cannot open log file %s: %v (using stdout)", logFile, err)
+		return
+	}
+
+	log.SetOutput(f)
+	log.Printf("📝 Logging to %s", logFile)
+}
+
+// profileDir returns the profile directory for the current installation mode.
+func profileDir() string {
+	return paths.Get().ProfileDir
+}
+
+// tmpDir returns the temp directory for the current installation mode.
+func tmpDir() string {
+	return paths.Get().TmpDir
+}
+
+// engineDir returns the engine directory for the current installation mode.
+func engineDir() string {
+	return paths.Get().EngineDir
 }

@@ -3,8 +3,8 @@
 server:
   api_port: 8080
   dns_port: 53
+  socks_port: 2801        # SOCKS5/HTTP mixed proxy port (configurable)
   api_token: ""           # Set a token to require authentication for API (e.g. "my-secret-token")
-  http_proxy_port: 8888   # Separate HTTP proxy port (in addition to SOCKS5 on 2801)
 
 # Gateway mode — clients set DNS/GW to this machine
 gateway:

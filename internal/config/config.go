@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/liberoute/bypath/internal/paths"
 	"gopkg.in/yaml.v3"
 )
 
@@ -25,8 +26,8 @@ type ServerConfig struct {
 	Listen    string `yaml:"listen"`
 	APIPort   int    `yaml:"api_port"`
 	DNSPort   int    `yaml:"dns_port"`
+	SOCKSPort int    `yaml:"socks_port"`
 	APIToken  string `yaml:"api_token,omitempty"`
-	HTTPProxy int    `yaml:"http_proxy_port,omitempty"` // Separate HTTP proxy port (0 = disabled, mixed inbound handles both)
 }
 
 type GatewayConfig struct {
@@ -114,11 +115,14 @@ func applyDefaults(cfg *Config) {
 	if cfg.Server.DNSPort == 0 {
 		cfg.Server.DNSPort = 53
 	}
+	if cfg.Server.SOCKSPort == 0 {
+		cfg.Server.SOCKSPort = 2801
+	}
 	if cfg.Engines.Directory == "" {
-		cfg.Engines.Directory = "./engines"
+		cfg.Engines.Directory = paths.Get().EngineDir
 	}
 	if cfg.Profiles.Directory == "" {
-		cfg.Profiles.Directory = "./data/profiles"
+		cfg.Profiles.Directory = paths.Get().ProfileDir
 	}
 	if cfg.Profiles.ActiveGroup == "" {
 		cfg.Profiles.ActiveGroup = "default"

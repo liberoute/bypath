@@ -13,6 +13,7 @@ import (
 
 	"github.com/liberoute/bypath/internal/config"
 	"github.com/liberoute/bypath/internal/engine"
+	"github.com/liberoute/bypath/internal/paths"
 	"github.com/liberoute/bypath/internal/profile"
 	"github.com/liberoute/bypath/internal/tunnel"
 	"github.com/liberoute/bypath/internal/whitelist"
@@ -73,7 +74,7 @@ func New(cfg *config.Config, engineMgr *engine.Manager) (*Gateway, error) {
 		tunnelMgr:  tunnelMgr,
 		profileMgr: profileMgr,
 		whitelist:  wlMgr,
-		socksPort:  2801,
+		socksPort:  cfg.Server.SOCKSPort,
 		dnsPort:    cfg.Server.DNSPort,
 		ctx:        ctx,
 		cancel:     cancel,
@@ -402,9 +403,9 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 	}
 
 	// Generate config (with whitelist countries for sing-box geoip routing)
-	configGen := tunnel.NewConfigGenerator("./data/tmp")
+	configGen := tunnel.NewConfigGenerator(paths.Get().TmpDir)
 	configGen.WhitelistCountries = gw.config.Whitelist.Countries
-	configGen.HTTPProxyPort = gw.config.Server.HTTPProxy
+	configGen.SOCKSPort = gw.socksPort
 	if gw.config.SNISpoof.Enabled {
 		configGen.SNISpoof = gw.config.SNISpoof.SNI
 	}

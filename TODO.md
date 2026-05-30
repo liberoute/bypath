@@ -2,6 +2,13 @@
 
 ## 🔴 Priority
 
+- [x] **install.sh** — Interactive installer script with auto-install of all dependencies
+- [x] **Configurable SOCKS port** — Read from `server.socks_port` in config (default: 2801)
+- [x] **Auto-create default.yaml** — On first run, generate config with sane defaults
+- [x] **Path resolution** — Auto-detect installed vs local mode (internal/paths package)
+- [x] **Remove separate HTTP proxy** — Mixed inbound handles both SOCKS5 and HTTP
+- [x] **TUI port change** — Change SOCKS port from TUI Home tab
+- [x] **sing-box 1.11 DNS fix** — Use `address: "udp://1.1.1.1"` format
 - [ ] **VPN detection bypass** — Mobile carrier apps (Irancell, Hamrah-e-Aval) call `cloudflare.com/cdn-cgi/trace` and detect VPN from the `loc` field. Force these endpoints direct so they always return `loc=IR`. Known domains: `cloudflare.com/cdn-cgi/trace`, `ip-api.com`, `ipinfo.io`, `api.myip.com`.
 - [ ] **sing-box TUN inbound** — Remove tun2socks and dns2socks. Let sing-box create TUN device + handle DNS. Result: one less process, lower latency.
 - [ ] **xray fallback** — If sing-box fails with a config, automatically try xray + tun2socks.
@@ -13,7 +20,7 @@
 
 - [ ] **Auto-reconnect** — If tunnel drops, auto reconnect. If 3 failures, switch to next link.
 - [ ] **Health check timer** — Every 60s connectivity check. If fail → restart engine.
-- [ ] **systemd installer** — `bypath install` creates and enables service file.
+- [x] **systemd installer** — install.sh creates and enables service file.
 - [ ] **Subscription auto-update** — Every 24h auto sub update (timer or goroutine).
 - [ ] **DHCP server** — Clients auto-get DNS/GW. No manual config needed.
 - [ ] **sing-box 1.14 migration** — Remove deprecated env vars, use proper `domain_resolver` and new DNS server format.

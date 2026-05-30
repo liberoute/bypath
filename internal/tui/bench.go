@@ -7,12 +7,14 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/liberoute/bypath/internal/paths"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
 )
@@ -100,7 +102,7 @@ func newBenchModel(group string) benchModel {
 }
 
 func loadBenchEntries(group string) []benchEntry {
-	data, err := os.ReadFile(fmt.Sprintf("./data/profiles/%s.json", group))
+	data, err := os.ReadFile(filepath.Join(paths.Get().ProfileDir, group+".json"))
 	if err != nil {
 		return nil
 	}
@@ -274,7 +276,7 @@ func runParallelBench(entries []benchEntry, group string) []benchEntry {
 	var mu sync.Mutex
 
 	// Load full profile for config generation
-	data, _ := os.ReadFile(fmt.Sprintf("./data/profiles/%s.json", group))
+	data, _ := os.ReadFile(filepath.Join(paths.Get().ProfileDir, group+".json"))
 	var g struct {
 		Links []struct {
 			Remark   string `json:"remark"`
@@ -303,7 +305,7 @@ func runParallelBench(entries []benchEntry, group string) []benchEntry {
 
 	sbPath, _ := exec.LookPath("sing-box")
 	if sbPath == "" {
-		sbPath = "./engines/sing-box"
+		sbPath = filepath.Join(paths.Get().EngineDir, "sing-box")
 	}
 
 	for i, entry := range entries {
@@ -370,7 +372,7 @@ func tcpPing(host string, port int) int {
 func testRelay(sbPath, outboundJSON string, port int) int {
 	cfg := fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":%d}],"outbounds":[%s,{"type":"direct","tag":"direct"}]}`, port, outboundJSON)
 
-	tmpFile := fmt.Sprintf("./data/tmp/bench-%d-%d.json", os.Getpid(), port)
+	tmpFile := fmt.Sprintf(filepath.Join(paths.Get().TmpDir, "bench-%d-%d.json"), os.Getpid(), port)
 	os.WriteFile(tmpFile, []byte(cfg), 0644)
 	defer os.Remove(tmpFile)
 

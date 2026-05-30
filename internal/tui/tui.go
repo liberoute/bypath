@@ -8,14 +8,31 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/liberoute/bypath/internal/config"
+	"github.com/liberoute/bypath/internal/paths"
 	"github.com/liberoute/bypath/internal/updater"
 )
+
+// socksPort returns the configured SOCKS5 port (reads from config, defaults to 2801).
+func socksPort() int {
+	cfg, err := config.Load(paths.Get().ConfigFile)
+	if err == nil && cfg.Server.SOCKSPort > 0 {
+		return cfg.Server.SOCKSPort
+	}
+	return 2801
+}
+
+// socksAddr returns the full SOCKS5 proxy address string.
+func socksAddr() string {
+	return fmt.Sprintf("socks5h://127.0.0.1:%d", socksPort())
+}
 
 // --- Styles ---
 var (
@@ -117,7 +134,7 @@ func checkUpdateCmd() tea.Msg {
 }
 
 func loadActiveInfoCmd() tea.Msg {
-	data, err := os.ReadFile("./data/profiles/.active")
+	data, err := os.ReadFile(filepath.Join(paths.Get().ProfileDir, ".active"))
 	if err != nil {
 		return activeInfoMsg{info: "No server selected"}
 	}
@@ -251,6 +268,7 @@ func (m model) homeItems() []homeItem {
 			{"📥", "Update All Subs", "sub-update"},
 			{"📡", "Add Subscription", "sub-add"},
 			{"➕", "Add Server (URI)", "add-link"},
+			{"🔧", fmt.Sprintf("Change Port (current: %d)", socksPort()), "change-port"},
 			{"ℹ️", "Version Info", "status"},
 		}
 	}
@@ -259,6 +277,7 @@ func (m model) homeItems() []homeItem {
 		{"📥", "Update All Subs", "sub-update"},
 		{"📡", "Add Subscription", "sub-add"},
 		{"➕", "Add Server (URI)", "add-link"},
+		{"🔧", fmt.Sprintf("Change Port (current: %d)", socksPort()), "change-port"},
 		{"ℹ️", "Version Info", "status"},
 	}
 }
@@ -276,6 +295,12 @@ func (m model) executeHomeAction(item homeItem) (tea.Model, tea.Cmd) {
 		m.inputLabel = "Server URI (vmess://, vless://, ss://...)"
 		m.inputBuf = ""
 		m.inputAction = "add-link"
+		return m, nil
+	case "change-port":
+		m.inputMode = true
+		m.inputLabel = "New SOCKS/Mixed port"
+		m.inputBuf = fmt.Sprintf("%d", socksPort())
+		m.inputAction = "change-port"
 		return m, nil
 	default:
 		m.running = true
@@ -460,10 +485,11 @@ func (m model) handleSubsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, func() tea.Msg {
 			exe, _ := os.Executable()
 			cmd := exec.Command(exe, "sub", "update")
+			proxy := socksAddr()
 			cmd.Env = append(os.Environ(),
-				"http_proxy=socks5h://127.0.0.1:2801",
-				"https_proxy=socks5h://127.0.0.1:2801",
-				"ALL_PROXY=socks5h://127.0.0.1:2801",
+				"http_proxy="+proxy,
+				"https_proxy="+proxy,
+				"ALL_PROXY="+proxy,
 			)
 			var buf bytes.Buffer
 			cmd.Stdout = &buf
@@ -491,10 +517,11 @@ func (m model) handleSubsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, func() tea.Msg {
 				exe, _ := os.Executable()
 				cmd := exec.Command(exe, "sub", "update", "-g", g)
+				proxy := socksAddr()
 				cmd.Env = append(os.Environ(),
-					"http_proxy=socks5h://127.0.0.1:2801",
-					"https_proxy=socks5h://127.0.0.1:2801",
-					"ALL_PROXY=socks5h://127.0.0.1:2801",
+					"http_proxy="+proxy,
+					"https_proxy="+proxy,
+					"ALL_PROXY="+proxy,
 				)
 				var buf bytes.Buffer
 				cmd.Stdout = &buf
@@ -785,7 +812,7 @@ func (m model) viewServers() string {
 }
 
 func getActiveLinkInfo() (group, remark string) {
-	data, err := os.ReadFile("./data/profiles/.active")
+	data, err := os.ReadFile(filepath.Join(paths.Get().ProfileDir, ".active"))
 	if err != nil { return "", "" }
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 	if len(lines) < 2 { return "", "" }
@@ -832,7 +859,7 @@ type linkEntry struct {
 }
 
 func loadGroupLinks(group string) []linkEntry {
-	data, err := os.ReadFile(fmt.Sprintf("./data/profiles/%s.json", group))
+	data, err := os.ReadFile(filepath.Join(paths.Get().ProfileDir, group+".json"))
 	if err != nil { return nil }
 
 	var g struct {
@@ -882,7 +909,7 @@ func loadSubscriptions() []subEntry {
 	groups := findGroups()
 	var subs []subEntry
 	for _, group := range groups {
-		data, err := os.ReadFile(fmt.Sprintf("./data/profiles/%s.json", group))
+		data, err := os.ReadFile(filepath.Join(paths.Get().ProfileDir, group+".json"))
 		if err != nil { continue }
 		var g struct { Subscriptions []string `json:"subscriptions"` }
 		if json.Unmarshal(data, &g) != nil { continue }
@@ -894,7 +921,7 @@ func loadSubscriptions() []subEntry {
 }
 
 func findGroups() []string {
-	entries, err := os.ReadDir("./data/profiles")
+	entries, err := os.ReadDir(paths.Get().ProfileDir)
 	if err != nil { return nil }
 	var groups []string
 	for _, e := range entries {
@@ -964,7 +991,7 @@ func executeAction(action, group string) actionDoneMsg {
 	case "live-status":
 		// Test current connection: relay delay + exit IP
 		start := time.Now()
-		cmd := exec.Command("curl", "-s", "-x", "socks5h://127.0.0.1:2801",
+		cmd := exec.Command("curl", "-s", "-x", socksAddr(),
 			"--connect-timeout", "8", "http://ip-api.com/json")
 		out, err := cmd.Output()
 		elapsed := time.Since(start).Milliseconds()
@@ -981,7 +1008,7 @@ func executeAction(action, group string) actionDoneMsg {
 		json.Unmarshal(out, &resp)
 
 		// Read active link
-		activeData, _ := os.ReadFile("./data/profiles/.active")
+		activeData, _ := os.ReadFile(filepath.Join(paths.Get().ProfileDir, ".active"))
 		lines := strings.Split(strings.TrimSpace(string(activeData)), "\n")
 		activeStr := ""
 		if len(lines) >= 2 {
@@ -1015,11 +1042,13 @@ func executeActionWithInput(action, input string) actionDoneMsg {
 		return result
 	case "add-link":
 		return runCmdCapture(exe, "add", input)
+	case "change-port":
+		return changeSOCKSPort(input)
 	case "create-group":
 		name := strings.TrimSpace(input)
 		if name == "" { return actionDoneMsg{output: "No name"} }
 		// Create empty group JSON
-		path := fmt.Sprintf("./data/profiles/%s.json", name)
+		path := filepath.Join(paths.Get().ProfileDir, name+".json")
 		if _, err := os.Stat(path); err == nil {
 			return actionDoneMsg{output: fmt.Sprintf("❌ Group '%s' already exists", name)}
 		}
@@ -1061,7 +1090,7 @@ func isProcessRunning(pid int) bool {
 }
 
 func removeSubscription(group string, idx int) error {
-	path := fmt.Sprintf("./data/profiles/%s.json", group)
+	path := filepath.Join(paths.Get().ProfileDir, group+".json")
 	data, err := os.ReadFile(path)
 	if err != nil { return err }
 	var g map[string]interface{}
@@ -1078,8 +1107,8 @@ func removeSubscription(group string, idx int) error {
 
 // renameGroup renames a group by renaming its JSON file and updating the name field.
 func renameGroup(oldName, newName string) error {
-	oldPath := fmt.Sprintf("./data/profiles/%s.json", oldName)
-	newPath := fmt.Sprintf("./data/profiles/%s.json", newName)
+	oldPath := filepath.Join(paths.Get().ProfileDir, oldName+".json")
+	newPath := filepath.Join(paths.Get().ProfileDir, newName+".json")
 
 	// Check old exists
 	if _, err := os.Stat(oldPath); err != nil {
@@ -1105,14 +1134,69 @@ func renameGroup(oldName, newName string) error {
 	os.Remove(oldPath)
 
 	// Update .active if it references old group
-	activeData, err := os.ReadFile("./data/profiles/.active")
+	activeData, err := os.ReadFile(filepath.Join(paths.Get().ProfileDir, ".active"))
 	if err == nil {
 		lines := strings.Split(strings.TrimSpace(string(activeData)), "\n")
 		if len(lines) >= 2 && strings.TrimSpace(lines[0]) == oldName {
 			newActive := newName + "\n" + lines[1]
-			os.WriteFile("./data/profiles/.active", []byte(newActive), 0644)
+			os.WriteFile(filepath.Join(paths.Get().ProfileDir, ".active"), []byte(newActive), 0644)
 		}
 	}
 
 	return nil
+}
+
+// changeSOCKSPort updates the socks_port in the config file.
+func changeSOCKSPort(input string) actionDoneMsg {
+	// Parse port number
+	port := 0
+	for _, ch := range input {
+		if ch >= '0' && ch <= '9' {
+			port = port*10 + int(ch-'0')
+		}
+	}
+	if port < 1 || port > 65535 {
+		return actionDoneMsg{output: "❌ Invalid port (must be 1-65535)"}
+	}
+
+	configPath := paths.Get().ConfigFile
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return actionDoneMsg{output: fmt.Sprintf("❌ Cannot read config: %v", err)}
+	}
+
+	content := string(data)
+
+	// Replace or add socks_port line
+	lines := strings.Split(content, "\n")
+	found := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "socks_port:") {
+			// Preserve indentation
+			indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+			lines[i] = fmt.Sprintf("%ssocks_port: %d", indent, port)
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		// Add after dns_port line
+		for i, line := range lines {
+			if strings.Contains(line, "dns_port:") {
+				indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+				newLine := fmt.Sprintf("%ssocks_port: %d", indent, port)
+				lines = append(lines[:i+1], append([]string{newLine}, lines[i+1:]...)...)
+				break
+			}
+		}
+	}
+
+	newContent := strings.Join(lines, "\n")
+	if err := os.WriteFile(configPath, []byte(newContent), 0644); err != nil {
+		return actionDoneMsg{output: fmt.Sprintf("❌ Cannot write config: %v", err)}
+	}
+
+	return actionDoneMsg{output: fmt.Sprintf("✅ Port changed to %d. Restart gateway to apply.", port)}
 }

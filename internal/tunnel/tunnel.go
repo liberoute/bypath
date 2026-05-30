@@ -8,6 +8,7 @@ import (
 
 	"github.com/liberoute/bypath/internal/config"
 	"github.com/liberoute/bypath/internal/engine"
+	"github.com/liberoute/bypath/internal/paths"
 	"github.com/liberoute/bypath/internal/profile"
 )
 
@@ -48,7 +49,7 @@ func NewManager(cfg *config.Config, engineMgr *engine.Manager) *Manager {
 	return &Manager{
 		engineMgr: engineMgr,
 		config:    cfg,
-		configGen: NewConfigGenerator("./data/tmp"),
+		configGen: NewConfigGenerator(paths.Get().TmpDir),
 		tunnels:   make(map[string]*Tunnel),
 		chains:    make(map[string]*Chain),
 	}

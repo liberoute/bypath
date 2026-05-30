@@ -148,10 +148,10 @@ func detectGeoData() []geoFileInfo {
 		name string
 		locs []string
 	}{
-		{"geoip.db", []string{"./data/geo/geoip.db", "./engines/geoip.db", "/usr/share/sing-box/geoip.db"}},
-		{"geosite.db", []string{"./data/geo/geosite.db", "./engines/geosite.db", "/usr/share/sing-box/geosite.db"}},
-		{"geoip.dat", []string{"./data/geo/geoip.dat", "./engines/geoip.dat", "/usr/share/xray/geoip.dat"}},
-		{"geosite.dat", []string{"./data/geo/geosite.dat", "./engines/geosite.dat", "/usr/share/xray/geosite.dat"}},
+		{"geoip.db", []string{"./data/geo/geoip.db", "./engines/geoip.db", "/var/lib/bypath/geo/geoip.db", "/usr/share/sing-box/geoip.db"}},
+		{"geosite.db", []string{"./data/geo/geosite.db", "./engines/geosite.db", "/var/lib/bypath/geo/geosite.db", "/usr/share/sing-box/geosite.db"}},
+		{"geoip.dat", []string{"./data/geo/geoip.dat", "./engines/geoip.dat", "/var/lib/bypath/geo/geoip.dat", "/usr/share/xray/geoip.dat"}},
+		{"geosite.dat", []string{"./data/geo/geosite.dat", "./engines/geosite.dat", "/var/lib/bypath/geo/geosite.dat", "/usr/share/xray/geosite.dat"}},
 	}
 
 	var results []geoFileInfo
