@@ -55,11 +55,12 @@ run_variant_test() {
 
     # Clean slate
     rm -rf "$WORKDIR"
-    mkdir -p "$WORKDIR/data/profiles" "$WORKDIR/data/tmp" "$WORKDIR/configs" "$WORKDIR/engines" "$WORKDIR/logs"
+    mkdir -p "$WORKDIR/data/profiles" "$WORKDIR/data/tmp" "$WORKDIR/data/geo" "$WORKDIR/configs" "$WORKDIR/engines" "$WORKDIR/logs"
     cat > "$WORKDIR/configs/default.yaml" << 'EOF'
 server:
   api_port: 8080
   dns_port: 5353
+  socks_port: 2801
 gateway:
   enabled: true
   interface: ""
@@ -67,7 +68,7 @@ gateway:
     - "1.1.1.1"
     - "8.8.8.8"
 whitelist:
-  countries: ["ir"]
+  countries: []
 isolation:
   enabled: false
 EOF
