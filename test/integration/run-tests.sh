@@ -56,6 +56,32 @@ run_variant_test() {
     # Clean slate
     rm -rf "$WORKDIR"
     mkdir -p "$WORKDIR/data/profiles" "$WORKDIR/data/tmp" "$WORKDIR/data/geo" "$WORKDIR/configs" "$WORKDIR/engines" "$WORKDIR/logs"
+
+    # Setup installed mode paths (binary is in /usr/local/bin → installed mode)
+    mkdir -p /etc/bypath /var/lib/bypath/profiles /var/lib/bypath/tmp /var/lib/bypath/geo /var/log/bypath /opt/bypath/engines
+    rm -f /var/log/bypath/error.log
+
+    # Copy sing-box to engines dir for installed mode
+    cp /usr/local/bin/sing-box /opt/bypath/engines/sing-box 2>/dev/null || true
+
+    cat > /etc/bypath/config.yaml << 'EOF'
+server:
+  api_port: 8080
+  dns_port: 5353
+  socks_port: 2801
+gateway:
+  enabled: true
+  interface: ""
+  dns_upstream:
+    - "1.1.1.1"
+    - "8.8.8.8"
+whitelist:
+  countries: []
+isolation:
+  enabled: false
+EOF
+
+    # Also create local config for fallback
     cat > "$WORKDIR/configs/default.yaml" << 'EOF'
 server:
   api_port: 8080
@@ -155,9 +181,10 @@ EOF
     RUN_PID=$!
 
     # Wait for engine to start (max 15s)
+    # Note: in installed mode, logs go to /var/log/bypath/error.log
     SOCKS_UP=false
     for i in $(seq 1 15); do
-        if grep -q "sing-box running on :2801\|Engine.*running" "$WORKDIR/logs/run.log" 2>/dev/null; then
+        if grep -q "sing-box running on :2801\|Engine.*running" "$WORKDIR/logs/run.log" /var/log/bypath/error.log 2>/dev/null; then
             SOCKS_UP=true
             break
         fi
@@ -168,10 +195,10 @@ EOF
         pass "${VARIANT}: engine started (SOCKS5 :2801)"
     else
         # Check if it at least attempted
-        if grep -q "Starting engine\|starting" "$WORKDIR/logs/run.log" 2>/dev/null; then
+        if grep -q "Starting engine\|starting" "$WORKDIR/logs/run.log" /var/log/bypath/error.log 2>/dev/null; then
             pass "${VARIANT}: engine attempted start"
         else
-            fail "${VARIANT}: engine start" "$(tail -5 "$WORKDIR/logs/run.log" 2>/dev/null)"
+            fail "${VARIANT}: engine start" "$(tail -5 "$WORKDIR/logs/run.log" 2>/dev/null; tail -5 /var/log/bypath/error.log 2>/dev/null)"
         fi
     fi
 
