@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-// ParseURI parses a proxy URI (vmess://, vless://, trojan://, ss://, wireguard://, socks5://, http://)
+// ParseURI parses a proxy URI (vmess://, vless://, trojan://, ss://, wireguard://, ssh://, socks5://, http://)
 // and returns a Link struct.
 func ParseURI(uri string) (*Link, error) {
 	uri = strings.TrimSpace(uri)
@@ -25,6 +25,8 @@ func ParseURI(uri string) (*Link, error) {
 		return parseShadowsocks(uri)
 	case strings.HasPrefix(uri, "wireguard://") || strings.HasPrefix(uri, "wg://"):
 		return parseWireguard(uri)
+	case strings.HasPrefix(uri, "ssh://"):
+		return parseSSH(uri)
 	case strings.HasPrefix(uri, "socks5://") || strings.HasPrefix(uri, "socks://"):
 		return parseSocks5(uri)
 	case strings.HasPrefix(uri, "http://") || strings.HasPrefix(uri, "https://"):
@@ -138,6 +140,11 @@ func parseVless(uri string) (*Link, error) {
 	link.Path = params.Get("path")
 	link.Host = params.Get("host")
 	link.Flow = params.Get("flow")
+
+	// Reality/UTLS fields
+	link.RealityPublicKey = params.Get("pbk")
+	link.RealityShortID = params.Get("sid")
+	link.Fingerprint = params.Get("fp")
 
 	if link.Remark == "" {
 		link.Remark = fmt.Sprintf("%s:%d", link.Address, link.Port)
@@ -286,6 +293,54 @@ func parseWireguard(uri string) (*Link, error) {
 
 	if link.Remark == "" {
 		link.Remark = fmt.Sprintf("wg-%s:%d", link.Address, link.Port)
+	}
+
+	return link, nil
+}
+
+// parseSSH parses an ssh:// URI.
+// Format: ssh://[user[:password]]@host[:port][?key=<path>&fingerprint=<fp>]#remark
+func parseSSH(uri string) (*Link, error) {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return nil, fmt.Errorf("ssh: invalid URI: %w", err)
+	}
+
+	host := u.Hostname()
+	if host == "" {
+		return nil, fmt.Errorf("ssh: missing host")
+	}
+
+	port, _ := strconv.Atoi(u.Port())
+	if port == 0 {
+		port = 22
+	}
+
+	user := "root"
+	password := ""
+	if u.User != nil {
+		if u.User.Username() != "" {
+			user = u.User.Username()
+		}
+		password, _ = u.User.Password()
+	}
+
+	params := u.Query()
+	keyPath := params.Get("key")
+
+	link := &Link{
+		Protocol:    "ssh",
+		RawURI:      uri,
+		Remark:      u.Fragment,
+		Address:     host,
+		Port:        port,
+		SSHUser:     user,
+		SSHPassword: password,
+		SSHKeyPath:  keyPath,
+	}
+
+	if link.Remark == "" {
+		link.Remark = fmt.Sprintf("ssh-%s:%d", link.Address, link.Port)
 	}
 
 	return link, nil

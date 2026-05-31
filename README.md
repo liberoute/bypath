@@ -8,7 +8,7 @@ Iranian IPs go direct (no tunnel). Everything else goes through your proxy serve
 
 - **Zero-config for clients** — just change DNS/Gateway
 - **Country whitelist** — IR traffic bypasses tunnel automatically (sing-box geoip)
-- **Multi-protocol** — VMess, VLESS, Trojan, Shadowsocks, WireGuard, SOCKS5, HTTP proxy
+- **Multi-protocol** — VMess, VLESS, Trojan, Shadowsocks, WireGuard, SSH, SOCKS5, HTTP proxy
 - **Subscription support** — add URL, auto-fetch links, auto-group by domain
 - **Parallel speed test** — test all servers simultaneously, auto-select best
 - **Interactive TUI** — tab-based terminal UI (Home / Servers / Subscriptions)
@@ -92,7 +92,7 @@ bypath run -c /path/to/config     # Custom config path
 bypath stop                       # Stop gateway
 
 # Servers
-bypath add <uri>                  # Add link (vmess/vless/ss/trojan/socks5/http)
+bypath add <uri>                  # Add link (vmess/vless/ss/trojan/ssh/socks5/http)
 bypath list                       # Show all groups and servers
 bypath list -g <group>            # Show specific group
 bypath select <name|number>       # Select active server
@@ -125,6 +125,7 @@ bypath version                    # Show version info
 | Trojan | `trojan://pass@host:port?params#name` | Always TLS |
 | Shadowsocks | `ss://base64@host:port#name` | All methods |
 | WireGuard | `wireguard://key@host:port?publickey=x#name` | Native support |
+| SSH | `ssh://[user[:pass]]@host[:port][?key=path]#name` | Dynamic SOCKS5 forwarding |
 | SOCKS5 | `socks5://[user:pass@]host:port#name` | Upstream SOCKS5 proxy |
 | HTTP | `http://[user:pass@]host:port#name` | Upstream HTTP proxy |
 

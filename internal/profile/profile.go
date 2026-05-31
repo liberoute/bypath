@@ -28,9 +28,31 @@ type Link struct {
 	Path       string `json:"path,omitempty"`
 	Host       string `json:"host,omitempty"`
 	Flow       string `json:"flow,omitempty"`
+
+	// Reality/UTLS fields (populated from VLESS Reality URIs)
+	RealityPublicKey string `json:"reality_pbk,omitempty"`  // pbk param
+	RealityShortID   string `json:"reality_sid,omitempty"`  // sid param
+	Fingerprint      string `json:"fingerprint,omitempty"`  // fp param (UTLS)
+
+	// WireGuard fields
 	PublicKey  string `json:"public_key,omitempty"`  // wireguard
 	PrivateKey string `json:"private_key,omitempty"` // wireguard
 	Endpoint   string `json:"endpoint,omitempty"`    // wireguard
+
+	// SSH-specific fields
+	SSHUser     string `json:"ssh_user,omitempty"`     // SSH username (default: "root")
+	SSHKeyPath  string `json:"ssh_key_path,omitempty"` // Path to SSH private key file
+	SSHPassword string `json:"ssh_password,omitempty"` // Password auth (if no key)
+
+	// HTTPSCapable indicates HTTPS relay capability:
+	//   0 = untested (default zero value)
+	//   1 = passed HTTPS test
+	//  -1 = failed HTTPS test
+	HTTPSCapable int `json:"https_capable,omitempty"`
+
+	// CDNDetected indicates the static heuristic flagged this as a CDN link.
+	// This is computed, not persisted (use json:"-" or omitempty with recompute on load).
+	CDNDetected bool `json:"-"`
 
 	// Chain support
 	ChainProxy string `json:"-"` // upstream SOCKS proxy for chaining
@@ -257,10 +279,26 @@ func (m *Manager) loadAll() error {
 			continue
 		}
 
+		// Mark CDN detection on each link at load time
+		for _, link := range g.Links {
+			MarkCDNDetected(link)
+		}
+
 		m.groups[g.Name] = &g
 	}
 
 	return nil
+}
+
+// SaveGroup persists a group to disk by name.
+func (m *Manager) SaveGroup(name string) error {
+	m.mu.RLock()
+	g, ok := m.groups[name]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("group '%s' not found", name)
+	}
+	return m.saveGroup(g)
 }
 
 // saveGroup persists a group to disk.

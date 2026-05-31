@@ -22,6 +22,7 @@ Desktop.ini
 # IDE
 .idea/
 .vscode/
+.kiro/
 *.swp
 *.swo
 *~

@@ -140,6 +140,9 @@ func (gw *Gateway) Start() error {
 		log.Printf("   Mode:       PROXY ONLY (use socks5://%s:%d)", gw.localIP, gw.socksPort)
 	}
 
+	// 8. Auto-start chains with auto_start: true
+	gw.startAutoChains()
+
 	return nil
 }
 
@@ -405,6 +408,7 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 	// Generate config (with whitelist countries for sing-box geoip routing)
 	configGen := tunnel.NewConfigGenerator(paths.Get().TmpDir)
 	configGen.WhitelistCountries = gw.config.Whitelist.Countries
+	configGen.GeositeCountries = gw.config.Whitelist.GeositeCountries
 	configGen.BypassDomains = gw.config.Whitelist.BypassDomains
 	configGen.SOCKSPort = gw.socksPort
 	if gw.config.SNISpoof.Enabled {
@@ -590,6 +594,8 @@ func (gw *Gateway) resolveEngine(protocol string) string {
 		return "wireguard-go"
 	case "openvpn":
 		return "openvpn"
+	case "ssh":
+		return "ssh"
 	default:
 		return "sing-box"
 	}
@@ -610,6 +616,21 @@ func run(name string, args ...string) error {
 		return fmt.Errorf("%s %s: %s (%w)", name, strings.Join(args, " "), string(out), err)
 	}
 	return nil
+}
+
+// startAutoChains starts all chains that have auto_start: true.
+func (gw *Gateway) startAutoChains() {
+	for _, chainCfg := range gw.config.Chains {
+		if !chainCfg.AutoStart {
+			continue
+		}
+		log.Printf("⛓️  Auto-starting chain: %s (%d hops)", chainCfg.Name, len(chainCfg.Hops))
+		if err := gw.tunnelMgr.StartChain(gw.ctx, chainCfg, gw.profileMgr); err != nil {
+			log.Printf("⚠️  Chain %s auto-start failed: %v", chainCfg.Name, err)
+		} else {
+			log.Printf("✅ Chain %s auto-started", chainCfg.Name)
+		}
+	}
 }
 
 func waitForPort(port int, timeout time.Duration) error {

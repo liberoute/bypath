@@ -23,6 +23,10 @@ engines:
 # Country IPs that bypass the tunnel (go direct)
 whitelist:
   countries: ["ir"]
+  # Domain-based whitelist using geosite rule sets (complements geoip)
+  # geosite_countries: ["ir"]
+  # Custom geosite download URL (empty = default SagerNet/sing-geosite GitHub releases)
+  # geosite_url: ""
   # Domains to route directly (bypass tunnel) for VPN detection bypass
   # bypass_domains:
   #   - "cloudflare.com"
@@ -41,6 +45,17 @@ sni_spoof:
   sni: "digikala.com"     # Fake SNI (Iranian domain to look like local traffic)
 
 # Tunnel chain — how traffic flows
+# A chain defines an ordered sequence of proxy hops.
+# Traffic flows: client → hop1 → hop2 → ... → internet
+#
+# Multi-hop example (uncomment and adjust):
+#   - name: "multi-hop"
+#     hops:
+#       - profile: "iran-relay"
+#         engine: "sing-box"    # optional: force engine (empty = auto-detect)
+#       - profile: "germany-exit"
+#     auto_start: false         # start this chain automatically on gateway startup
+
 chains:
   - name: "default"
     hops:

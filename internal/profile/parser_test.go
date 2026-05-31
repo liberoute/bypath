@@ -1,6 +1,7 @@
 package profile
 
 import (
+	"encoding/json"
 	"testing"
 )
 
@@ -146,6 +147,132 @@ func TestParseWireguard(t *testing.T) {
 	}
 }
 
+func TestParseSSH(t *testing.T) {
+	t.Run("key-based", func(t *testing.T) {
+		uri := "ssh://root@myserver.com:22?key=/etc/bypath/keys/id_rsa#my-ssh-server"
+
+		link, err := ParseURI(uri)
+		if err != nil {
+			t.Fatalf("ParseURI failed: %v", err)
+		}
+
+		if link.Protocol != "ssh" {
+			t.Errorf("protocol: got %s, want ssh", link.Protocol)
+		}
+		if link.Address != "myserver.com" {
+			t.Errorf("address: got %s, want myserver.com", link.Address)
+		}
+		if link.Port != 22 {
+			t.Errorf("port: got %d, want 22", link.Port)
+		}
+		if link.SSHUser != "root" {
+			t.Errorf("ssh_user: got %s, want root", link.SSHUser)
+		}
+		if link.SSHPassword != "" {
+			t.Errorf("ssh_password: got %s, want empty", link.SSHPassword)
+		}
+		if link.SSHKeyPath != "/etc/bypath/keys/id_rsa" {
+			t.Errorf("ssh_key_path: got %s, want /etc/bypath/keys/id_rsa", link.SSHKeyPath)
+		}
+		if link.Remark != "my-ssh-server" {
+			t.Errorf("remark: got %s, want my-ssh-server", link.Remark)
+		}
+	})
+
+	t.Run("password-based", func(t *testing.T) {
+		uri := "ssh://user:password123@10.0.0.1:2222#office-relay"
+
+		link, err := ParseURI(uri)
+		if err != nil {
+			t.Fatalf("ParseURI failed: %v", err)
+		}
+
+		if link.Protocol != "ssh" {
+			t.Errorf("protocol: got %s, want ssh", link.Protocol)
+		}
+		if link.Address != "10.0.0.1" {
+			t.Errorf("address: got %s, want 10.0.0.1", link.Address)
+		}
+		if link.Port != 2222 {
+			t.Errorf("port: got %d, want 2222", link.Port)
+		}
+		if link.SSHUser != "user" {
+			t.Errorf("ssh_user: got %s, want user", link.SSHUser)
+		}
+		if link.SSHPassword != "password123" {
+			t.Errorf("ssh_password: got %s, want password123", link.SSHPassword)
+		}
+		if link.SSHKeyPath != "" {
+			t.Errorf("ssh_key_path: got %s, want empty", link.SSHKeyPath)
+		}
+		if link.Remark != "office-relay" {
+			t.Errorf("remark: got %s, want office-relay", link.Remark)
+		}
+	})
+
+	t.Run("minimal-defaults-port", func(t *testing.T) {
+		uri := "ssh://admin@192.168.1.1#home-router"
+
+		link, err := ParseURI(uri)
+		if err != nil {
+			t.Fatalf("ParseURI failed: %v", err)
+		}
+
+		if link.Protocol != "ssh" {
+			t.Errorf("protocol: got %s, want ssh", link.Protocol)
+		}
+		if link.Address != "192.168.1.1" {
+			t.Errorf("address: got %s, want 192.168.1.1", link.Address)
+		}
+		if link.Port != 22 {
+			t.Errorf("port: got %d, want 22 (default)", link.Port)
+		}
+		if link.SSHUser != "admin" {
+			t.Errorf("ssh_user: got %s, want admin", link.SSHUser)
+		}
+		if link.SSHPassword != "" {
+			t.Errorf("ssh_password: got %s, want empty", link.SSHPassword)
+		}
+		if link.SSHKeyPath != "" {
+			t.Errorf("ssh_key_path: got %s, want empty", link.SSHKeyPath)
+		}
+		if link.Remark != "home-router" {
+			t.Errorf("remark: got %s, want home-router", link.Remark)
+		}
+	})
+
+	t.Run("no-user-defaults-to-root", func(t *testing.T) {
+		uri := "ssh://host.com:22#test"
+
+		link, err := ParseURI(uri)
+		if err != nil {
+			t.Fatalf("ParseURI failed: %v", err)
+		}
+
+		if link.Protocol != "ssh" {
+			t.Errorf("protocol: got %s, want ssh", link.Protocol)
+		}
+		if link.Address != "host.com" {
+			t.Errorf("address: got %s, want host.com", link.Address)
+		}
+		if link.Port != 22 {
+			t.Errorf("port: got %d, want 22", link.Port)
+		}
+		if link.SSHUser != "root" {
+			t.Errorf("ssh_user: got %s, want root (default)", link.SSHUser)
+		}
+		if link.SSHPassword != "" {
+			t.Errorf("ssh_password: got %s, want empty", link.SSHPassword)
+		}
+		if link.SSHKeyPath != "" {
+			t.Errorf("ssh_key_path: got %s, want empty", link.SSHKeyPath)
+		}
+		if link.Remark != "test" {
+			t.Errorf("remark: got %s, want test", link.Remark)
+		}
+	})
+}
+
 func TestParseUnsupported(t *testing.T) {
 	_, err := ParseURI("http://not-a-proxy.com")
 	if err == nil {
@@ -157,5 +284,53 @@ func TestParseEmpty(t *testing.T) {
 	_, err := ParseURI("")
 	if err == nil {
 		t.Error("expected error for empty URI")
+	}
+}
+
+func TestParseSSH_RoundTrip(t *testing.T) {
+	// Parse an SSH URI, serialize to JSON, deserialize back, and verify all fields are preserved.
+	uri := "ssh://admin:s3cret@bastion.example.com:2222?key=/home/user/.ssh/id_ed25519#bastion-server"
+
+	original, err := ParseURI(uri)
+	if err != nil {
+		t.Fatalf("ParseURI failed: %v", err)
+	}
+
+	// Serialize to JSON
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+
+	// Deserialize back
+	var restored Link
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+
+	// Verify all SSH-specific fields survived the round-trip
+	if restored.Protocol != "ssh" {
+		t.Errorf("protocol: got %q, want %q", restored.Protocol, "ssh")
+	}
+	if restored.Address != "bastion.example.com" {
+		t.Errorf("address: got %q, want %q", restored.Address, "bastion.example.com")
+	}
+	if restored.Port != 2222 {
+		t.Errorf("port: got %d, want %d", restored.Port, 2222)
+	}
+	if restored.SSHUser != "admin" {
+		t.Errorf("ssh_user: got %q, want %q", restored.SSHUser, "admin")
+	}
+	if restored.SSHPassword != "s3cret" {
+		t.Errorf("ssh_password: got %q, want %q", restored.SSHPassword, "s3cret")
+	}
+	if restored.SSHKeyPath != "/home/user/.ssh/id_ed25519" {
+		t.Errorf("ssh_key_path: got %q, want %q", restored.SSHKeyPath, "/home/user/.ssh/id_ed25519")
+	}
+	if restored.Remark != "bastion-server" {
+		t.Errorf("remark: got %q, want %q", restored.Remark, "bastion-server")
+	}
+	if restored.RawURI != uri {
+		t.Errorf("raw_uri: got %q, want %q", restored.RawURI, uri)
 	}
 }

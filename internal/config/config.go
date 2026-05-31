@@ -44,10 +44,12 @@ type EnginesConfig struct {
 }
 
 type WhitelistConfig struct {
-	Countries      []string `yaml:"countries"`
-	BypassDomains  []string `yaml:"bypass_domains,omitempty"`
-	CustomFile     string   `yaml:"custom_file,omitempty"`
-	UpdateInterval string   `yaml:"update_interval"`
+	Countries        []string `yaml:"countries"`
+	GeositeCountries []string `yaml:"geosite_countries,omitempty"`
+	GeositeURL       string   `yaml:"geosite_url,omitempty"`
+	BypassDomains    []string `yaml:"bypass_domains,omitempty"`
+	CustomFile       string   `yaml:"custom_file,omitempty"`
+	UpdateInterval   string   `yaml:"update_interval"`
 }
 
 type IsolationConfig struct {
@@ -75,8 +77,9 @@ type ProfilesConfig struct {
 }
 
 type ChainConfig struct {
-	Name string      `yaml:"name"`
-	Hops []HopConfig `yaml:"hops"`
+	Name      string      `yaml:"name"`
+	Hops      []HopConfig `yaml:"hops"`
+	AutoStart bool        `yaml:"auto_start,omitempty"`
 }
 
 type HopConfig struct {
@@ -153,6 +156,9 @@ func applyDefaults(cfg *Config) {
 			"ipinfo.io",
 			"api.myip.com",
 		}
+	}
+	if cfg.Whitelist.GeositeURL == "" {
+		cfg.Whitelist.GeositeURL = "https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite-{country}.srs"
 	}
 	if cfg.Whitelist.UpdateInterval == "" {
 		cfg.Whitelist.UpdateInterval = "24h"

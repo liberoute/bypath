@@ -1,5 +1,27 @@
 # Changelog
 
+## v2.4.2 (2026-05-31)
+
+### Features
+- **Reality support** — Full VLESS Reality parsing with `public_key`, `short_id`, and `fingerprint` (uTLS). Both `buildOutbound()` and `singboxOutbounds()` now generate correct Reality TLS config.
+- **SSH tunnel protocol** — Native SSH dynamic port forwarding as a proxy protocol. Parse `ssh://` URIs, bench via `ssh -D`, no sing-box needed.
+- **Multi-hop chains** — `bypath chain add/remove/list` CLI commands. Chain config stored in YAML, tunnel orchestration via `internal/tunnel/chain.go`.
+- **CDN/HTTPS detection** — Bench now tests HTTPS connectivity per link. Links marked `[CDN]` or `[HTTPS✗]` in list output. `SelectBest()` prefers HTTPS-capable links.
+- **SNI spoofing config** — `sni_spoof` section in config for DPI bypass with fake Iranian SNI.
+- **Geosite domain whitelist** — Download and validate geosite `.srs` files per country. Integrated into gateway startup.
+- **Chain CLI** — `bypath chain add <name> <hop1> [hop2...] [--auto-start]`, `chain remove`, `chain list`.
+
+### Improvements
+- Bench results now show HTTPS column (✓/✗/—)
+- `select` command warns if chosen link is CDN-based
+- `buildOutbound()` handles SSH protocol gracefully (returns direct outbound)
+- Bench timeout increased to 20s, SSH bench uses `sshpass` for password auth
+- Profile `HTTPSCapable` field persisted after bench
+
+### Housekeeping
+- Removed `.kiro/` from git tracking (added to `.gitignore`)
+- Removed dead kiro spec files from repository
+
 ## v2.3.0 (2026-05-29)
 
 ### Features — TUI Redesign

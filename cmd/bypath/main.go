@@ -21,11 +21,13 @@ import (
 	"github.com/liberoute/bypath/internal/config"
 	"github.com/liberoute/bypath/internal/engine"
 	"github.com/liberoute/bypath/internal/gateway"
+	"github.com/liberoute/bypath/internal/geo"
 	"github.com/liberoute/bypath/internal/paths"
 	"github.com/liberoute/bypath/internal/pidfile"
 	"github.com/liberoute/bypath/internal/profile"
 	"github.com/liberoute/bypath/internal/tui"
 	"github.com/liberoute/bypath/internal/updater"
+	"gopkg.in/yaml.v3"
 )
 
 func main() {
@@ -60,6 +62,8 @@ func main() {
 		cmdTest(args)
 	case "sub":
 		cmdSub(args)
+	case "chain":
+		cmdChain(args)
 	case "engines":
 		cmdEngines(args)
 	case "update":
@@ -169,6 +173,20 @@ func cmdRun(args []string) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		log.Fatalf("❌ Config error: %v", err)
+	}
+
+	// Download geosite files if configured
+	if len(cfg.Whitelist.GeositeCountries) > 0 {
+		updateInterval, parseErr := time.ParseDuration(cfg.Whitelist.UpdateInterval)
+		if parseErr != nil {
+			updateInterval = 24 * time.Hour
+		}
+		geo.DownloadGeositeFiles(cfg.Whitelist.GeositeURL, cfg.Whitelist.GeositeCountries, paths.Get().GeoDir, updateInterval)
+		validatedCountries := geo.ValidateGeositeFiles(cfg.Whitelist.GeositeCountries, paths.Get().GeoDir)
+		if len(validatedCountries) < len(cfg.Whitelist.GeositeCountries) {
+			log.Printf("⚠️  Geosite: only %d/%d country files available", len(validatedCountries), len(cfg.Whitelist.GeositeCountries))
+		}
+		cfg.Whitelist.GeositeCountries = validatedCountries
 	}
 
 	engineMgr := engine.NewManager(cfg.Engines)
@@ -403,7 +421,15 @@ func printGroupLinks(g *profile.Group) {
 		if len(server) > 20 {
 			server = server[:17] + "..."
 		}
-		fmt.Printf("  %-3d %-8s %-4s %-22s %-6d %s\n", i+1, proto, flag, server, link.Port, name)
+		// Build status tags for CDN detection and HTTPS failure
+		var status string
+		if profile.IsCDNPattern(link) {
+			status += " [CDN]"
+		}
+		if link.HTTPSCapable == -1 {
+			status += " [HTTPS✗]"
+		}
+		fmt.Printf("  %-3d %-8s %-4s %-22s %-6d %s%s\n", i+1, proto, flag, server, link.Port, name, status)
 	}
 	fmt.Println()
 }
@@ -416,6 +442,8 @@ func shortProto(p string) string {
 		return "wg"
 	case "trojan":
 		return "trojan"
+	case "ssh":
+		return "ssh"
 	default:
 		return p
 	}
@@ -499,6 +527,7 @@ func cmdSelect(args []string) {
 				link := g.Links[idx-1]
 				mgr.SetActiveLink(link)
 				fmt.Printf("✅ Active link: [%s] %s → %s:%d\n", link.Protocol, link.Remark, link.Address, link.Port)
+				warnIfCDN(link)
 				return
 			}
 			fmt.Printf("❌ Link #%d not found in group '%s'\n", idx, group)
@@ -512,6 +541,7 @@ func cmdSelect(args []string) {
 				link := g.Links[idx-1]
 				mgr.SetActiveLink(link)
 				fmt.Printf("✅ Active link: [%s] %s → %s:%d\n", link.Protocol, link.Remark, link.Address, link.Port)
+				warnIfCDN(link)
 				return
 			}
 		}
@@ -527,6 +557,14 @@ func cmdSelect(args []string) {
 
 	mgr.SetActiveLink(link)
 	fmt.Printf("✅ Active link: [%s] %s → %s:%d\n", link.Protocol, link.Remark, link.Address, link.Port)
+	warnIfCDN(link)
+}
+
+// warnIfCDN prints a warning if the selected link is CDN-based or has failed HTTPS testing.
+func warnIfCDN(link *profile.Link) {
+	if profile.IsCDNPattern(link) || link.HTTPSCapable == -1 {
+		fmt.Println("  ⚠️  This link is CDN-based and may not support HTTPS browsing")
+	}
 }
 
 func parseIndex(s string) int {
@@ -664,7 +702,7 @@ func cmdBench(args []string) {
 
 		// Relay test
 		port := 19999
-		latency, ok := benchLinkOnPort(link, port)
+		latency, ok, _ := benchLinkOnPort(link, port)
 		if ok {
 			fmt.Printf("  ✅ Relay: %s\n", latency)
 		} else {
@@ -681,6 +719,7 @@ func cmdBench(args []string) {
 		latency string
 		status  string
 		ms      int
+		httpsOk bool
 	}
 
 	// Run all benchmarks in parallel
@@ -692,21 +731,32 @@ func cmdBench(args []string) {
 		go func(idx int, l *profile.Link) {
 			defer wg.Done()
 			port := 19870 + idx // unique port per link
-			latency, ok := benchLinkOnPort(l, port)
+			latency, ok, httpsOk := benchLinkOnPort(l, port)
 			if ok {
 				ms := parseMs(latency)
-				results[idx] = benchResult{idx, l, latency, "ok", ms}
+				results[idx] = benchResult{idx, l, latency, "ok", ms, httpsOk}
 			} else {
-				results[idx] = benchResult{idx, l, "-", "fail", 99999}
+				results[idx] = benchResult{idx, l, "-", "fail", 99999, false}
 			}
 		}(i, link)
 	}
 
 	wg.Wait()
 
+	// Persist HTTPSCapable results to the profile
+	for _, r := range results {
+		if r.status == "ok" && r.httpsOk {
+			r.link.HTTPSCapable = 1
+		} else if r.status == "ok" && !r.httpsOk {
+			r.link.HTTPSCapable = -1
+		}
+		// If status == "fail", leave HTTPSCapable as-is (we didn't test HTTPS)
+	}
+	mgr.SaveGroup(group)
+
 	// Print results
-	fmt.Printf("  %-3s %-8s %-4s %-22s %-6s %-8s %s\n", "#", "Proto", "Flag", "Server", "Port", "Latency", "Status")
-	fmt.Printf("  %-3s %-8s %-4s %-22s %-6s %-8s %s\n", "---", "-----", "----", "------", "----", "-------", "------")
+	fmt.Printf("  %-3s %-8s %-4s %-22s %-6s %-8s %-5s %s\n", "#", "Proto", "Flag", "Server", "Port", "Latency", "HTTPS", "Status")
+	fmt.Printf("  %-3s %-8s %-4s %-22s %-6s %-8s %-5s %s\n", "---", "-----", "----", "------", "----", "-------", "-----", "------")
 
 	for i, r := range results {
 		flag := extractFlag(r.link.Remark)
@@ -715,32 +765,65 @@ func cmdBench(args []string) {
 			server = server[:17] + "..."
 		}
 		proto := shortProto(r.link.Protocol)
-		if r.status == "ok" {
-			fmt.Printf("  %-3d %-8s %-4s %-22s %-6d %-8s ✅ OK\n", i+1, proto, flag, server, r.link.Port, r.latency)
+		var httpsCol string
+		if r.status == "fail" {
+			httpsCol = "—"
+		} else if r.httpsOk {
+			httpsCol = "✓"
 		} else {
-			fmt.Printf("  %-3d %-8s %-4s %-22s %-6d %-8s ❌ FAIL\n", i+1, proto, flag, server, r.link.Port, "timeout")
+			httpsCol = "✗"
+		}
+		if r.status == "ok" {
+			fmt.Printf("  %-3d %-8s %-4s %-22s %-6d %-8s %-5s ✅ OK\n", i+1, proto, flag, server, r.link.Port, r.latency, httpsCol)
+		} else {
+			fmt.Printf("  %-3d %-8s %-4s %-22s %-6d %-8s %-5s ❌ FAIL\n", i+1, proto, flag, server, r.link.Port, "timeout", httpsCol)
 		}
 	}
 
-	// Find best
-	var best *benchResult
+	// Convert results to profile.BenchResult for SelectBest
+	var benchResults []*profile.BenchResult
 	for i := range results {
-		if results[i].status == "ok" {
-			if best == nil || results[i].ms < best.ms {
-				best = &results[i]
-			}
-		}
+		benchResults = append(benchResults, &profile.BenchResult{
+			Link:    results[i].link,
+			Latency: time.Duration(results[i].ms) * time.Millisecond,
+			HTTPSOk: results[i].httpsOk,
+			Passed:  results[i].status == "ok",
+		})
 	}
 
-	if best == nil {
+	sel := profile.SelectBest(benchResults)
+
+	if sel.Best == nil {
 		fmt.Println("\n  ❌ No working links found!")
 		return
 	}
 
-	fmt.Printf("\n  🏆 Best: #%d [%s] %s:%d (%s)\n", best.idx+1, best.link.Protocol, best.link.Address, best.link.Port, best.latency)
+	// Find the original benchResult index for display
+	bestIdx := 0
+	var bestLatencyStr string
+	for i := range results {
+		if results[i].link == sel.Best.Link {
+			bestIdx = i
+			bestLatencyStr = results[i].latency
+			break
+		}
+	}
+
+	fmt.Printf("\n  🏆 Best: #%d [%s] %s:%d (%s)\n", bestIdx+1, sel.Best.Link.Protocol, sel.Best.Link.Address, sel.Best.Link.Port, bestLatencyStr)
+
+	// Print warnings based on selection result
+	if sel.NoHTTPS {
+		fmt.Println("  ⚠️  No HTTPS-capable links found — selected fastest HTTP link")
+	}
+	if len(sel.Skipped) > 0 {
+		fmt.Printf("  ℹ️  Skipped %d faster link(s) that lack HTTPS support\n", len(sel.Skipped))
+		for _, sk := range sel.Skipped {
+			fmt.Printf("      • %s:%d (%dms)\n", sk.Link.Address, sk.Link.Port, sk.Latency.Milliseconds())
+		}
+	}
 
 	if autoSelect {
-		mgr.SetActiveLink(best.link)
+		mgr.SetActiveLink(sel.Best.Link)
 		fmt.Printf("  ✅ Auto-selected! Run 'bypath run' to start.\n")
 	} else {
 		fmt.Printf("\n  Auto-select this link? [Y/n]: ")
@@ -750,29 +833,41 @@ func cmdBench(args []string) {
 		input = strings.TrimSpace(strings.ToLower(input))
 
 		if input == "" || input == "y" || input == "yes" {
-			mgr.SetActiveLink(best.link)
+			mgr.SetActiveLink(sel.Best.Link)
 			fmt.Printf("  ✅ Selected! Run 'bypath run' to start.\n")
 		}
 	}
 }
 
-func benchLinkOnPort(link *profile.Link, port int) (string, bool) {
-	configContent := fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":%d}],"outbounds":[%s,{"type":"direct","tag":"direct"}]}`, port, buildOutbound(link))
-
-	tmpFile := fmt.Sprintf(tmpDir()+"/bench-%d-%d.json", os.Getpid(), port)
-	os.MkdirAll(tmpDir(), 0755)
-	os.WriteFile(tmpFile, []byte(configContent), 0644)
-	defer os.Remove(tmpFile)
-
-	sbPath, err := exec.LookPath("sing-box")
-	if err != nil {
-		sbPath = filepath.Join(engineDir(), "sing-box")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+func benchLinkOnPort(link *profile.Link, port int) (latency string, ok bool, httpsOk bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, sbPath, "run", "-c", tmpFile)
+	var cmd *exec.Cmd
+
+	if link.Protocol == "ssh" {
+		// SSH links: start SSH tunnel directly instead of sing-box
+		cmd = buildSSHBenchCmd(ctx, link, port)
+		if cmd == nil {
+			return "", false, false
+		}
+	} else {
+		// All other protocols: use sing-box with generated config
+		configContent := fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":%d}],"outbounds":[%s,{"type":"direct","tag":"direct"}]}`, port, buildOutbound(link))
+
+		tmpFile := fmt.Sprintf(tmpDir()+"/bench-%d-%d.json", os.Getpid(), port)
+		os.MkdirAll(tmpDir(), 0755)
+		os.WriteFile(tmpFile, []byte(configContent), 0644)
+		defer os.Remove(tmpFile)
+
+		sbPath, err := exec.LookPath("sing-box")
+		if err != nil {
+			sbPath = filepath.Join(engineDir(), "sing-box")
+		}
+
+		cmd = exec.CommandContext(ctx, sbPath, "run", "-c", tmpFile)
+	}
+
 	cmd.Start()
 	defer func() {
 		if cmd.Process != nil {
@@ -794,10 +889,10 @@ func benchLinkOnPort(link *profile.Link, port int) (string, bool) {
 		time.Sleep(300 * time.Millisecond)
 	}
 	if !ready {
-		return "", false
+		return "", false, false
 	}
 
-	// Test connectivity
+	// Test HTTP connectivity
 	start := time.Now()
 	testCmd := exec.CommandContext(ctx, "curl", "-s", "-x", fmt.Sprintf("socks5h://127.0.0.1:%d", port),
 		"--connect-timeout", "6", "-o", "/dev/null", "-w", "%{http_code}", "http://ip-api.com/json")
@@ -805,10 +900,68 @@ func benchLinkOnPort(link *profile.Link, port int) (string, bool) {
 	elapsed := time.Since(start)
 
 	if err != nil || strings.TrimSpace(string(out)) != "200" {
-		return "", false
+		return "", false, false
 	}
 
-	return fmt.Sprintf("%dms", elapsed.Milliseconds()), true
+	// HTTP relay passed — now test HTTPS connectivity
+	httpsOk = profile.TestHTTPS(ctx, port)
+
+	return fmt.Sprintf("%dms", elapsed.Milliseconds()), true, httpsOk
+}
+
+// buildSSHBenchCmd constructs an SSH tunnel command for benchmarking.
+// It mirrors the logic in tunnel.go's startSSHTunnel but returns an exec.Cmd
+// bound to the bench port.
+func buildSSHBenchCmd(ctx context.Context, link *profile.Link, port int) *exec.Cmd {
+	sshPath, err := exec.LookPath("ssh")
+	if err != nil {
+		return nil
+	}
+
+	// Determine SSH port
+	sshPort := link.Port
+	if sshPort == 0 {
+		sshPort = 22
+	}
+
+	// Determine SSH user
+	sshUser := link.SSHUser
+	if sshUser == "" {
+		sshUser = "root"
+	}
+
+	// Build SSH args
+	args := []string{
+		"-D", fmt.Sprintf("127.0.0.1:%d", port),
+		"-N",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ServerAliveInterval=30",
+		"-o", "ServerAliveCountMax=3",
+	}
+
+	// Add key-based auth if key path is set
+	if link.SSHKeyPath != "" {
+		args = append(args, "-i", link.SSHKeyPath)
+	}
+
+	// Add SSH port
+	args = append(args, "-p", fmt.Sprintf("%d", sshPort))
+
+	// Add user@host
+	args = append(args, fmt.Sprintf("%s@%s", sshUser, link.Address))
+
+	// Handle password-based auth via sshpass
+	if link.SSHKeyPath == "" && link.SSHPassword != "" {
+		sshpassPath, err := exec.LookPath("sshpass")
+		if err != nil {
+			return nil
+		}
+		finalArgs := append([]string{"-p", link.SSHPassword, sshPath}, args...)
+		return exec.CommandContext(ctx, sshpassPath, finalArgs...)
+	}
+
+	return exec.CommandContext(ctx, sshPath, args...)
 }
 
 func buildOutbound(link *profile.Link) string {
@@ -823,6 +976,9 @@ func buildOutbound(link *profile.Link) string {
 	}
 
 	switch link.Protocol {
+	case "ssh":
+		// SSH doesn't use sing-box outbound config — it runs as a direct process
+		return `{"type":"direct","tag":"proxy"}`
 	case "shadowsocks":
 		return fmt.Sprintf(`{"type":"shadowsocks","tag":"proxy","server":"%s","server_port":%d,"method":"%s","password":"%s"}`,
 			link.Address, link.Port, link.Security, link.UUID)
@@ -865,9 +1021,20 @@ func buildOutbound(link *profile.Link) string {
 			ob += "}"
 		}
 		if link.Security == "reality" {
-			ob += `,"tls":{"enabled":true,"reality":{"enabled":true}`
+			ob += `,"tls":{"enabled":true`
 			if sni != "" {
 				ob += fmt.Sprintf(`,"server_name":"%s"`, sni)
+			}
+			ob += `,"reality":{"enabled":true`
+			if link.RealityPublicKey != "" {
+				ob += fmt.Sprintf(`,"public_key":"%s"`, link.RealityPublicKey)
+			}
+			if link.RealityShortID != "" {
+				ob += fmt.Sprintf(`,"short_id":"%s"`, link.RealityShortID)
+			}
+			ob += "}"
+			if link.Fingerprint != "" {
+				ob += fmt.Sprintf(`,"utls":{"enabled":true,"fingerprint":"%s"}`, link.Fingerprint)
 			}
 			ob += "}"
 		} else if link.TLS {
@@ -1050,6 +1217,176 @@ func cmdSub(args []string) {
 	}
 }
 
+func cmdChain(args []string) {
+	if len(args) == 0 {
+		fmt.Println("Usage:")
+		fmt.Println("  bypath chain add <name> <hop1> <hop2> [hop3...] [--auto-start]")
+		fmt.Println("  bypath chain remove <name>")
+		fmt.Println("  bypath chain list")
+		fmt.Println("  bypath chain start <name>")
+		fmt.Println("  bypath chain stop <name>")
+		fmt.Println("  bypath chain status [name]")
+		os.Exit(1)
+	}
+
+	subCmd := args[0]
+	subArgs := args[1:]
+
+	switch subCmd {
+	case "add":
+		cmdChainAdd(subArgs)
+	case "remove", "rm", "del":
+		cmdChainRemove(subArgs)
+	case "list":
+		cmdChainList(subArgs)
+	case "start":
+		cmdChainStart(subArgs)
+	case "stop":
+		cmdChainStop(subArgs)
+	case "status":
+		cmdChainStatus(subArgs)
+	default:
+		fmt.Printf("Unknown chain command: %s\n", subCmd)
+		os.Exit(1)
+	}
+}
+
+func cmdChainAdd(args []string) {
+	if len(args) < 2 {
+		fmt.Println("Usage: bypath chain add <name> <hop1-profile> [hop2-profile...] [--auto-start]")
+		os.Exit(1)
+	}
+
+	// Parse args: first is chain name, rest are hop profiles (filter --auto-start flag)
+	chainName := args[0]
+	autoStart := false
+	var hopProfiles []string
+
+	for _, arg := range args[1:] {
+		if arg == "--auto-start" {
+			autoStart = true
+		} else {
+			hopProfiles = append(hopProfiles, arg)
+		}
+	}
+
+	if len(hopProfiles) == 0 {
+		fmt.Println("❌ At least one hop profile is required")
+		os.Exit(1)
+	}
+
+	// Load config
+	configPath := paths.Get().ConfigFile
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		fmt.Printf("❌ Cannot load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Check for duplicate chain name
+	for _, chain := range cfg.Chains {
+		if chain.Name == chainName {
+			fmt.Printf("❌ Chain '%s' already exists\n", chainName)
+			os.Exit(1)
+		}
+	}
+
+	// Build hops
+	hops := make([]config.HopConfig, len(hopProfiles))
+	for i, p := range hopProfiles {
+		hops[i] = config.HopConfig{Profile: p}
+	}
+
+	// Create chain config
+	newChain := config.ChainConfig{
+		Name:      chainName,
+		Hops:      hops,
+		AutoStart: autoStart,
+	}
+
+	// Append to config
+	cfg.Chains = append(cfg.Chains, newChain)
+
+	// Write updated config back to YAML
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		fmt.Printf("❌ Cannot marshal config: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := os.WriteFile(configPath, data, 0644); err != nil {
+		fmt.Printf("❌ Cannot write config: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("✅ Chain '%s' added with %d hop(s)\n", chainName, len(hopProfiles))
+	if autoStart {
+		fmt.Println("   Auto-start: enabled")
+	}
+}
+
+func cmdChainRemove(args []string) {
+	if len(args) == 0 {
+		fmt.Println("Usage: bypath chain remove <name>")
+		os.Exit(1)
+	}
+
+	chainName := args[0]
+
+	// Load config
+	configPath := paths.Get().ConfigFile
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		fmt.Printf("❌ Cannot load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Find and remove the chain
+	found := false
+	for i, chain := range cfg.Chains {
+		if chain.Name == chainName {
+			cfg.Chains = append(cfg.Chains[:i], cfg.Chains[i+1:]...)
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		fmt.Printf("❌ Chain '%s' not found\n", chainName)
+		os.Exit(1)
+	}
+
+	// Write updated config back to YAML
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		fmt.Printf("❌ Cannot marshal config: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := os.WriteFile(configPath, data, 0644); err != nil {
+		fmt.Printf("❌ Cannot write config: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("✅ Chain '%s' removed\n", chainName)
+}
+
+func cmdChainList(args []string) {
+	fmt.Println("chain list: not implemented")
+}
+
+func cmdChainStart(args []string) {
+	fmt.Println("chain start: not implemented")
+}
+
+func cmdChainStop(args []string) {
+	fmt.Println("chain stop: not implemented")
+}
+
+func cmdChainStatus(args []string) {
+	fmt.Println("chain status: not implemented")
+}
+
 func cmdStop() {
 	fmt.Println("🛑 Stopping gateway...")
 
@@ -1130,6 +1467,8 @@ func detectEngine(protocol, forceEngine string) string {
 		return "wireguard-go (auto)"
 	case "openvpn":
 		return "openvpn (auto)"
+	case "ssh":
+		return "ssh (native)"
 	default:
 		return "sing-box (fallback)"
 	}

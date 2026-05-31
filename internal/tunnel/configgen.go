@@ -16,6 +16,7 @@ import (
 type ConfigGenerator struct {
 	tempDir            string
 	WhitelistCountries []string // country codes (e.g. "ir") to route direct via geoip
+	GeositeCountries   []string // country codes (e.g. "ir") to route direct via geosite (domain-based)
 	BypassDomains      []string // domains to route direct (bypass tunnel)
 	SOCKSPort          int      // SOCKS5/mixed listen port (default: 2801)
 	SNISpoof           string   // fake SNI to replace real one (empty = disabled)
@@ -43,7 +44,344 @@ func (cg *ConfigGenerator) Generate(eng *engine.Engine, link *profile.Link) (str
 	}
 }
 
+// GenerateChainConfig creates a sing-box config with detour-linked outbounds for a multi-hop chain.
+// Each link becomes an outbound with a unique tag (chain-<name>-hop-<i>), and each outbound's
+// detour field points to the next hop. The last hop has no detour (it connects directly).
+// Returns the path to the generated JSON config file.
+func (cg *ConfigGenerator) GenerateChainConfig(chainName string, links []*profile.Link) (string, error) {
+	if len(links) == 0 {
+		return "", fmt.Errorf("chain %q: no links provided", chainName)
+	}
+
+	// Task 2.2: Generate outbounds with unique tags and detour linkage
+	outbounds := cg.buildChainOutbounds(chainName, links)
+
+	// Task 2.3: Generate single mixed inbound routing to first hop's tag
+	// Use port 10800 for chain inbound to avoid conflict with main gateway (2801)
+	chainPort := 10800
+	inbounds := []map[string]interface{}{
+		{
+			"type":        "mixed",
+			"tag":         "mixed-in",
+			"listen":      "0.0.0.0",
+			"listen_port": chainPort,
+		},
+	}
+
+	// Route: direct all inbound traffic to the last hop's outbound (exit node)
+	lastHopTag := fmt.Sprintf("chain-%s-hop-%d", chainName, len(links)-1)
+	route := map[string]interface{}{
+		"final":                lastHopTag,
+		"auto_detect_interface": true,
+	}
+
+	// DNS: simple direct DNS for chain resolution
+	dns := map[string]interface{}{
+		"servers": []map[string]interface{}{
+			{
+				"tag":     "dns-direct",
+				"address": "udp://1.1.1.1",
+			},
+		},
+		"final": "dns-direct",
+	}
+
+	cfg := map[string]interface{}{
+		"log": map[string]interface{}{
+			"level": "info",
+		},
+		"inbounds":  inbounds,
+		"outbounds": outbounds,
+		"route":     route,
+		"dns":       dns,
+	}
+
+	return cg.writeJSON(fmt.Sprintf("chain-%s", sanitizeName(chainName)), cfg)
+}
+
+// buildChainOutbounds generates the outbound slice for a multi-hop chain.
+// In sing-box, "detour" means "connect through this outbound as transport".
+// For a chain: client → hop0 → hop1 → ... → hopN → internet
+// The inbound routes to the LAST hop (exit node), and each hop's detour
+// points to the PREVIOUS hop (its transport). The first hop has no detour
+// (it connects directly to its server).
+func (cg *ConfigGenerator) buildChainOutbounds(chainName string, links []*profile.Link) []map[string]interface{} {
+	outbounds := make([]map[string]interface{}, 0, len(links)+1)
+
+	for i, link := range links {
+		outbound := cg.buildSingboxOutbound(link)
+
+		// Assign unique tag: chain-<chainName>-hop-<index>
+		tag := fmt.Sprintf("chain-%s-hop-%d", chainName, i)
+		outbound["tag"] = tag
+
+		// Add detour to previous hop (except for the first hop which connects directly)
+		if i > 0 {
+			prevTag := fmt.Sprintf("chain-%s-hop-%d", chainName, i-1)
+			outbound["detour"] = prevTag
+
+			// Remove flow field when using detour — xtls-rprx-vision requires direct TCP
+			// and is incompatible with sing-box's detour mechanism
+			delete(outbound, "flow")
+		}
+
+		outbounds = append(outbounds, outbound)
+	}
+
+	// Append the direct outbound (needed for route rules)
+	outbounds = append(outbounds, map[string]interface{}{
+		"type": "direct",
+		"tag":  "direct",
+	})
+
+	return outbounds
+}
+
+// buildSingboxOutbound builds a single sing-box outbound map for a link.
+// This extracts the protocol-specific outbound generation logic so it can be
+// reused by both singboxOutbounds (single-hop) and buildChainOutbounds (multi-hop).
+// The returned map does NOT include "tag" or "detour" — callers set those.
+func (cg *ConfigGenerator) buildSingboxOutbound(link *profile.Link) map[string]interface{} {
+	// Fix comma-separated SNI/Host — take first entry
+	sni := link.SNI
+	host := link.Host
+	if strings.Contains(sni, ",") {
+		sni = strings.TrimSpace(strings.Split(sni, ",")[0])
+	}
+	if strings.Contains(host, ",") {
+		host = strings.TrimSpace(strings.Split(host, ",")[0])
+	}
+	// Apply SNI spoof if configured
+	if cg.SNISpoof != "" && sni != "" {
+		sni = cg.SNISpoof
+	}
+
+	var outbound map[string]interface{}
+
+	switch link.Protocol {
+	case "vmess":
+		outbound = map[string]interface{}{
+			"type":        "vmess",
+			"server":      link.Address,
+			"server_port": link.Port,
+			"uuid":        link.UUID,
+			"alter_id":    link.AlterId,
+			"security":    link.Security,
+		}
+		if link.Network != "" && link.Network != "tcp" {
+			transport := map[string]interface{}{"type": link.Network}
+			if link.Path != "" {
+				transport["path"] = link.Path
+			}
+			if host != "" {
+				transport["headers"] = map[string]interface{}{
+					"Host": host,
+				}
+			}
+			outbound["transport"] = transport
+		}
+		if link.TLS {
+			tls := map[string]interface{}{"enabled": true}
+			if sni != "" {
+				tls["server_name"] = sni
+			}
+			outbound["tls"] = tls
+		}
+
+	case "vless":
+		outbound = map[string]interface{}{
+			"type":        "vless",
+			"server":      link.Address,
+			"server_port": link.Port,
+			"uuid":        link.UUID,
+		}
+		if link.Flow != "" {
+			outbound["flow"] = link.Flow
+		}
+		if link.Network != "" && link.Network != "tcp" {
+			transport := map[string]interface{}{"type": link.Network}
+			if link.Path != "" {
+				transport["path"] = link.Path
+			}
+			if host != "" {
+				transport["headers"] = map[string]interface{}{
+					"Host": host,
+				}
+			}
+			outbound["transport"] = transport
+		}
+		if link.Security == "reality" {
+			tls := map[string]interface{}{"enabled": true}
+			if sni != "" {
+				tls["server_name"] = sni
+			}
+			reality := map[string]interface{}{"enabled": true}
+			if link.RealityPublicKey != "" {
+				reality["public_key"] = link.RealityPublicKey
+			}
+			if link.RealityShortID != "" {
+				reality["short_id"] = link.RealityShortID
+			}
+			tls["reality"] = reality
+			if link.Fingerprint != "" {
+				tls["utls"] = map[string]interface{}{
+					"enabled":     true,
+					"fingerprint": link.Fingerprint,
+				}
+			}
+			outbound["tls"] = tls
+		} else if link.TLS {
+			tls := map[string]interface{}{"enabled": true, "insecure": true}
+			if sni != "" {
+				tls["server_name"] = sni
+			}
+			outbound["tls"] = tls
+		}
+
+	case "trojan":
+		outbound = map[string]interface{}{
+			"type":        "trojan",
+			"server":      link.Address,
+			"server_port": link.Port,
+			"password":    link.UUID,
+		}
+		tls := map[string]interface{}{"enabled": true}
+		if sni != "" {
+			tls["server_name"] = sni
+		}
+		outbound["tls"] = tls
+		if link.Network != "" && link.Network != "tcp" {
+			transport := map[string]interface{}{"type": link.Network}
+			if link.Path != "" {
+				transport["path"] = link.Path
+			}
+			outbound["transport"] = transport
+		}
+
+	case "shadowsocks":
+		outbound = map[string]interface{}{
+			"type":        "shadowsocks",
+			"server":      link.Address,
+			"server_port": link.Port,
+			"method":      link.Security,
+			"password":    link.UUID,
+		}
+
+	case "wireguard":
+		outbound = map[string]interface{}{
+			"type":           "wireguard",
+			"server":         link.Address,
+			"server_port":    link.Port,
+			"private_key":    link.PrivateKey,
+			"peer_public_key": link.PublicKey,
+			"local_address":  []string{"10.0.0.2/32"},
+		}
+
+	case "socks5":
+		outbound = map[string]interface{}{
+			"type":        "socks",
+			"server":      link.Address,
+			"server_port": link.Port,
+			"version":     "5",
+		}
+		if link.UUID != "" {
+			outbound["username"] = link.UUID
+			outbound["password"] = link.Security
+		}
+
+	case "http":
+		outbound = map[string]interface{}{
+			"type":        "http",
+			"server":      link.Address,
+			"server_port": link.Port,
+		}
+		if link.UUID != "" {
+			outbound["username"] = link.UUID
+			outbound["password"] = link.Security
+		}
+		if link.TLS {
+			outbound["tls"] = map[string]interface{}{"enabled": true}
+		}
+
+	case "ssh":
+		// SSH tunnels run as a local SOCKS5 proxy (ssh -D). In chain/detour
+		// scenarios, reference the SSH hop via its local listen port.
+		port := link.ListenPort
+		if port == 0 {
+			port = 10800 // default chain port
+		}
+		outbound = map[string]interface{}{
+			"type":        "socks",
+			"server":      "127.0.0.1",
+			"server_port": port,
+			"version":     "5",
+		}
+
+	default:
+		outbound = map[string]interface{}{
+			"type": "direct",
+		}
+	}
+
+	return outbound
+}
+
 // --- sing-box config generation ---
+
+// singboxDNS generates the DNS section for the sing-box config.
+// When GeositeCountries is non-empty, it produces split DNS:
+//   - dns-direct: resolves without tunnel (no detour)
+//   - dns-tunnel: resolves through proxy (detour: "proxy")
+//   - DNS rules: geosite rule_sets point to dns-direct
+//   - final: dns-tunnel (unmatched domains resolve through tunnel)
+//
+// When GeositeCountries is empty, it falls back to simple DNS (direct only, no split).
+func (cg *ConfigGenerator) singboxDNS(link *profile.Link) map[string]interface{} {
+	if len(cg.GeositeCountries) == 0 {
+		// Fallback: simple DNS, direct only (current behavior)
+		return map[string]interface{}{
+			"servers": []map[string]interface{}{
+				{
+					"tag":     "dns-direct",
+					"address": "udp://1.1.1.1",
+				},
+			},
+			"final": "dns-direct",
+		}
+	}
+
+	// Split DNS: direct + tunnel
+	servers := []map[string]interface{}{
+		{
+			"tag":     "dns-direct",
+			"address": "udp://1.1.1.1",
+		},
+		{
+			"tag":     "dns-tunnel",
+			"address": "udp://1.1.1.1",
+			"detour":  "proxy",
+		},
+	}
+
+	// DNS rules: geosite rule_sets → dns-direct
+	var ruleSetTags []string
+	for _, country := range cg.GeositeCountries {
+		ruleSetTags = append(ruleSetTags, fmt.Sprintf("geosite-%s", country))
+	}
+
+	rules := []map[string]interface{}{
+		{
+			"rule_set": ruleSetTags,
+			"server":   "dns-direct",
+		},
+	}
+
+	return map[string]interface{}{
+		"servers": servers,
+		"rules":   rules,
+		"final":   "dns-tunnel",
+	}
+}
 
 // singboxBypassDomainRule returns a sing-box route rule that matches bypass domains
 // using domain_suffix and routes them to the "direct" outbound.
@@ -53,6 +391,21 @@ func (cg *ConfigGenerator) singboxBypassDomainRule() map[string]interface{} {
 		"action":        "route",
 		"outbound":      "direct",
 	}
+}
+
+// singboxGeositeRuleSets returns rule_set definitions for geosite files.
+// Each entry is a local binary rule set pointing to GeoDir/geosite-{country}.srs.
+func (cg *ConfigGenerator) singboxGeositeRuleSets() []map[string]interface{} {
+	var ruleSets []map[string]interface{}
+	for _, country := range cg.GeositeCountries {
+		ruleSets = append(ruleSets, map[string]interface{}{
+			"type":   "local",
+			"tag":    fmt.Sprintf("geosite-%s", country),
+			"format": "binary",
+			"path":   filepath.Join(paths.Get().GeoDir, fmt.Sprintf("geosite-%s.srs", country)),
+		})
+	}
+	return ruleSets
 }
 
 // singboxRoute builds the route section with geoip-based whitelist rules.
@@ -84,19 +437,41 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 		"outbound":      "direct",
 	})
 
-	// Rule: whitelisted countries → direct (using local geoip rule_set)
-	var ruleSetTags []string
-	for _, country := range cg.WhitelistCountries {
-		ruleSetTags = append(ruleSetTags, fmt.Sprintf("geoip-%s", country))
+	// Rule: geosite domain whitelist → direct (must come before geoip)
+	if len(cg.GeositeCountries) > 0 {
+		var geositeRuleSetTags []string
+		for _, country := range cg.GeositeCountries {
+			geositeRuleSetTags = append(geositeRuleSetTags, fmt.Sprintf("geosite-%s", country))
+		}
+		rules = append(rules, map[string]interface{}{
+			"rule_set": geositeRuleSetTags,
+			"action":   "route",
+			"outbound": "direct",
+		})
 	}
-	rules = append(rules, map[string]interface{}{
-		"rule_set": ruleSetTags,
-		"action":   "route",
-		"outbound": "direct",
-	})
+
+	// Rule: whitelisted countries → direct (using local geoip rule_set)
+	if len(cg.WhitelistCountries) > 0 {
+		var ruleSetTags []string
+		for _, country := range cg.WhitelistCountries {
+			ruleSetTags = append(ruleSetTags, fmt.Sprintf("geoip-%s", country))
+		}
+		rules = append(rules, map[string]interface{}{
+			"rule_set": ruleSetTags,
+			"action":   "route",
+			"outbound": "direct",
+		})
+	}
 
 	// Build rule_set definitions (local .srs files)
 	var ruleSets []map[string]interface{}
+
+	// Geosite rule_set definitions (domain-based whitelist)
+	if len(cg.GeositeCountries) > 0 {
+		ruleSets = append(ruleSets, cg.singboxGeositeRuleSets()...)
+	}
+
+	// Geoip rule_set definitions (IP-based whitelist)
 	for _, country := range cg.WhitelistCountries {
 		ruleSets = append(ruleSets, map[string]interface{}{
 			"type":   "local",
@@ -107,9 +482,13 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 	}
 
 	route := map[string]interface{}{
-		"rules":    rules,
-		"rule_set": ruleSets,
-		"final":    "proxy",
+		"rules": rules,
+		"final": "proxy",
+	}
+
+	// Only include rule_set key when there are definitions
+	if len(ruleSets) > 0 {
+		route["rule_set"] = ruleSets
 	}
 
 	return route
@@ -127,18 +506,10 @@ func (cg *ConfigGenerator) generateSingBox(link *profile.Link) (string, error) {
 
 	// Route section: geoip whitelist for bypassing tunnel on IR traffic,
 	// or domain bypass for VPN detection endpoints.
-	if len(cg.WhitelistCountries) > 0 || len(cg.BypassDomains) > 0 {
+	if len(cg.WhitelistCountries) > 0 || len(cg.BypassDomains) > 0 || len(cg.GeositeCountries) > 0 {
 		cfg["route"] = cg.singboxRoute(link)
-		// DNS for route matching: resolve directly (no tunnel)
-		cfg["dns"] = map[string]interface{}{
-			"servers": []map[string]interface{}{
-				{
-					"tag":     "dns-direct",
-					"address": "udp://1.1.1.1",
-				},
-			},
-			"final": "dns-direct",
-		}
+		// DNS: split DNS when geosite is configured, simple direct DNS otherwise
+		cfg["dns"] = cg.singboxDNS(link)
 	}
 
 	return cg.writeJSON("singbox", cfg)
@@ -241,10 +612,32 @@ func (cg *ConfigGenerator) singboxOutbounds(link *profile.Link) []map[string]int
 		}
 		// TLS
 		if link.TLS {
-			tls := map[string]interface{}{"enabled": true, "insecure": true}
+			tls := map[string]interface{}{"enabled": true}
 			if sni != "" {
 				tls["server_name"] = sni
 			}
+
+			if link.Security == "reality" {
+				// Reality-specific TLS config
+				reality := map[string]interface{}{"enabled": true}
+				if link.RealityPublicKey != "" {
+					reality["public_key"] = link.RealityPublicKey
+				}
+				if link.RealityShortID != "" {
+					reality["short_id"] = link.RealityShortID
+				}
+				tls["reality"] = reality
+			} else {
+				tls["insecure"] = true
+			}
+
+			if link.Fingerprint != "" {
+				tls["utls"] = map[string]interface{}{
+					"enabled":     true,
+					"fingerprint": link.Fingerprint,
+				}
+			}
+
 			outbound["tls"] = tls
 		}
 
@@ -318,6 +711,21 @@ func (cg *ConfigGenerator) singboxOutbounds(link *profile.Link) []map[string]int
 		}
 		if link.TLS {
 			outbound["tls"] = map[string]interface{}{"enabled": true}
+		}
+
+	case "ssh":
+		// SSH tunnels run as a local SOCKS5 proxy (ssh -D). In chain/detour
+		// scenarios, reference the SSH hop via its local listen port.
+		port := link.ListenPort
+		if port == 0 {
+			port = 10800 // default chain port
+		}
+		outbound = map[string]interface{}{
+			"type":       "socks",
+			"tag":        "proxy",
+			"server":     "127.0.0.1",
+			"server_port": port,
+			"version":    "5",
 		}
 
 	default:

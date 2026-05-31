@@ -14,8 +14,9 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/liberoute/bypath/internal/paths"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/liberoute/bypath/internal/paths"
+	"github.com/liberoute/bypath/internal/profile"
 	"github.com/mattn/go-runewidth"
 )
 
@@ -42,6 +43,7 @@ type benchEntry struct {
 	relay    int // ms, -1 = fail
 	down     int // KB/s, -1 = not tested
 	up       int // KB/s, -1 = not tested
+	https    int // 1=ok, 0=untested, -1=failed
 }
 
 type sortMode int
@@ -335,14 +337,22 @@ func runParallelBench(entries []benchEntry, group string) []benchEntry {
 
 			// Download test (only if relay succeeded)
 			downKBs := -1
+			httpsResult := 0 // 0=untested
 			if relayMs > 0 {
 				downKBs = testDownload(localPort)
+				// HTTPS connectivity test
+				if profile.TestHTTPS(context.Background(), localPort) {
+					httpsResult = 1
+				} else {
+					httpsResult = -1
+				}
 			}
 
 			mu.Lock()
 			results[idx].ping = pingMs
 			results[idx].relay = relayMs
 			results[idx].down = downKBs
+			results[idx].https = httpsResult
 			if relayMs > 0 {
 				results[idx].status = benchDone
 			} else if pingMs > 0 {
@@ -507,6 +517,8 @@ func (m benchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.entries = msg.results
 		m.done = true
 		m.applySorting()
+		// Persist HTTPSCapable results to the profile
+		persistHTTPSResults(m.group, m.entries)
 		return m, nil
 
 	case tea.KeyMsg:
@@ -701,7 +713,7 @@ func (m benchModel) View() string {
 	b.WriteString("\n")
 
 	// Header
-	header := padRight("#", 4) + padRight("Proto", 7) + padRight("Flag", 4) + padRight("Server", 16) + padRight("Port", 6) + padRight("Ping", 7) + padRight("Relay", 7) + padRight("Down", 9) + "Name"
+	header := padRight("#", 4) + padRight("Proto", 7) + padRight("Flag", 4) + padRight("Server", 16) + padRight("Port", 6) + padRight("Ping", 7) + padRight("Relay", 7) + padRight("Down", 9) + padRight("HTTPS", 7) + "Name"
 	b.WriteString(benchHeaderStyle.Render("  " + header))
 	b.WriteString("\n")
 
@@ -760,6 +772,23 @@ func (m benchModel) View() string {
 			downStr = "..."
 		}
 
+		httpsStr := "..."
+		switch e.status {
+		case benchDone:
+			switch e.https {
+			case 1:
+				httpsStr = benchOkStyle.Render("✓")
+			case -1:
+				httpsStr = benchFailStyle.Render("✗")
+			default:
+				httpsStr = benchDimStyle.Render("—")
+			}
+		case benchFailed:
+			httpsStr = benchFailStyle.Render("✗")
+		case benchTesting:
+			httpsStr = "..."
+		}
+
 		name := e.remark
 		if runewidth.StringWidth(name) > 20 {
 			name = runewidth.Truncate(name, 19, "..")
@@ -773,6 +802,7 @@ func (m benchModel) View() string {
 			padRight(pingStr, 7) +
 			padRight(relayStr, 7) +
 			padRight(downStr, 9) +
+			padRight(httpsStr, 7) +
 			name
 
 		prefix := "  "
@@ -834,4 +864,33 @@ func padRight(s string, width int) string {
 		return s
 	}
 	return s + strings.Repeat(" ", width-w)
+}
+
+// persistHTTPSResults updates the HTTPSCapable field on links in the profile JSON
+// after bench completes, then saves the group.
+func persistHTTPSResults(group string, entries []benchEntry) {
+	mgr, err := profile.NewManager(paths.Get().ProfileDir, "default")
+	if err != nil {
+		return
+	}
+	g, err := mgr.GetGroup(group)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.status != benchDone {
+			continue
+		}
+		// Match by index (entry.idx is 1-based)
+		linkIdx := entry.idx - 1
+		if linkIdx < 0 || linkIdx >= len(g.Links) {
+			continue
+		}
+		if entry.https == 1 {
+			g.Links[linkIdx].HTTPSCapable = 1
+		} else if entry.https == -1 {
+			g.Links[linkIdx].HTTPSCapable = -1
+		}
+	}
+	mgr.SaveGroup(group)
 }

@@ -21,8 +21,9 @@ type Engine struct {
 
 // Manager handles engine detection, download, and lifecycle.
 type Manager struct {
-	config  config.EnginesConfig
-	engines map[string]*Engine
+	config         config.EnginesConfig
+	engines        map[string]*Engine
+	SSHPassAvailable bool // whether sshpass binary is available (for password auth)
 }
 
 // NewManager creates a new engine manager.
@@ -61,6 +62,23 @@ func (m *Manager) Init() error {
 		} else {
 			log.Printf("  ⚠️  %s: not found (will download on demand)", eng.name)
 		}
+	}
+
+	// Detect SSH binary (system tool, not downloadable)
+	if sshPath, err := exec.LookPath("ssh"); err == nil {
+		m.engines["ssh"] = &Engine{Name: "ssh", Path: sshPath, Source: "system"}
+		log.Printf("  ✅ ssh: %s (system)", sshPath)
+	} else {
+		log.Printf("  ⚠️  ssh: not found")
+	}
+
+	// Detect sshpass binary (optional, needed for password-based SSH auth)
+	if sshpassPath, err := exec.LookPath("sshpass"); err == nil {
+		m.SSHPassAvailable = true
+		log.Printf("  ✅ sshpass: %s (system)", sshpassPath)
+	} else {
+		m.SSHPassAvailable = false
+		log.Printf("  ℹ️  sshpass: not found (password auth unavailable, use key-based auth)")
 	}
 
 	return nil
