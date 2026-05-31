@@ -187,7 +187,7 @@ sni_spoof:
   sni: "digikala.com"
 ```
 
-See [docs/configuration.md](docs/configuration.md) for full reference.
+See [Configuration](https://github.com/liberoute/bypath/wiki/Configuration) for full reference.
 
 ## Build from Source
 
@@ -207,10 +207,13 @@ GOOS=linux GOARCH=amd64 go build -o bypath ./cmd/bypath/
 
 ## Docs
 
-- [Architecture](docs/architecture.md)
-- [Configuration](docs/configuration.md)
-- [Deployment Guide](docs/deployment.md)
-- [API Reference](docs/api.md)
+- [Architecture](https://github.com/liberoute/bypath/wiki/Architecture)
+- [Configuration](https://github.com/liberoute/bypath/wiki/Configuration)
+- [Deployment Guide](https://github.com/liberoute/bypath/wiki/Deployment)
+- [API Reference](https://github.com/liberoute/bypath/wiki/API-Reference)
+- [Supported Protocols](https://github.com/liberoute/bypath/wiki/Supported-Protocols)
+- [Troubleshooting](https://github.com/liberoute/bypath/wiki/Troubleshooting)
+- [Build from Source](https://github.com/liberoute/bypath/wiki/Build-from-Source)
 
 ## Requirements (Lite build)
 

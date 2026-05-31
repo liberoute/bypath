@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.4.3 (2026-06-01)
+
+### Improvements
+- **Expanded test coverage** — Added comprehensive tests for `internal/config` (YAML parsing, defaults, edge cases) and `internal/tunnel/configgen` (all protocols, Reality, chains, SNI spoofing).
+- **Documentation migrated to wiki** — Moved `docs/` content (API, architecture, configuration, deployment) to `.wiki/` for GitHub Wiki publishing. Removed stale markdown docs from repo.
+- **README cleanup** — Streamlined README with links to wiki instead of inline docs.
+- **Gitignore updates** — Added `.kiro/` and cleaned up patterns.
+
 ## v2.4.2 (2026-05-31)
 
 ### Features

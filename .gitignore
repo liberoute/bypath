@@ -27,6 +27,9 @@ Desktop.ini
 *.swo
 *~
 
+# Wiki (separate git repo)
+.wiki/
+
 # Go
 *.exe
 *.exe~

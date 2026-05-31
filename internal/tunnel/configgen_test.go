@@ -3,11 +3,14 @@ package tunnel
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/liberoute/bypath/internal/config"
 	"github.com/liberoute/bypath/internal/engine"
 	"github.com/liberoute/bypath/internal/profile"
+	"pgregory.net/rapid"
 )
 
 func TestGenerateSingBoxVmess(t *testing.T) {
@@ -577,5 +580,497 @@ func TestGenerateChainConfig_SingleHopNoDetour(t *testing.T) {
 	// Last outbound is direct
 	if outbounds[1]["type"] != "direct" {
 		t.Errorf("last outbound type: got %v, want direct", outbounds[1]["type"])
+	}
+}
+
+
+// Feature: vpn-detection-bypass, Property 3: Generated config contains correct domain bypass rule
+//
+// For any non-empty list of bypass domains (regardless of whether whitelist countries
+// are configured), the generated sing-box config SHALL contain a route rule with
+// `domain_suffix` matching those exact domains and routing to the "direct" outbound.
+//
+// **Validates: Requirements 2.1, 2.3, 2.4**
+
+// Feature: vpn-detection-bypass, Property 4: Domain bypass rule precedes geoip rules
+//
+// For any generated sing-box config that contains both domain bypass rules and geoip
+// whitelist rules, the domain bypass rule SHALL appear at a lower index in the rules
+// array than any geoip rule.
+//
+// **Validates: Requirements 2.2**
+
+func TestProperty_DomainBypassRulePrecedesGeoipRules(t *testing.T) {
+	// Generator for valid domain labels
+	labelGen := rapid.StringMatching(`[a-z][a-z0-9\-]{1,12}`)
+
+	// Generator for valid TLDs
+	tldGen := rapid.SampledFrom([]string{"com", "net", "org", "io", "ir", "info", "co"})
+
+	// Generator for a single valid domain
+	domainGen := rapid.Custom(func(t *rapid.T) string {
+		label := labelGen.Draw(t, "label")
+		tld := tldGen.Draw(t, "tld")
+		return label + "." + tld
+	})
+
+	// Generator for a non-empty list of unique bypass domains (1 to 10 domains)
+	domainsGen := rapid.Custom(func(t *rapid.T) []string {
+		count := rapid.IntRange(1, 10).Draw(t, "count")
+		seen := make(map[string]bool)
+		domains := make([]string, 0, count)
+		for len(domains) < count {
+			d := domainGen.Draw(t, "domain")
+			if !seen[d] {
+				seen[d] = true
+				domains = append(domains, d)
+			}
+		}
+		return domains
+	})
+
+	// Generator for non-empty whitelist countries (must be non-empty to produce geoip rules)
+	countriesGen := rapid.Custom(func(t *rapid.T) []string {
+		pool := []string{"ir", "cn", "ru", "tr", "ae", "de", "fr"}
+		count := rapid.IntRange(1, 4).Draw(t, "countryCount")
+		seen := make(map[string]bool)
+		countries := make([]string, 0, count)
+		for len(countries) < count {
+			c := rapid.SampledFrom(pool).Draw(t, "country")
+			if !seen[c] {
+				seen[c] = true
+				countries = append(countries, c)
+			}
+		}
+		return countries
+	})
+
+	// Generator for valid protocols supported by sing-box
+	protocolGen := rapid.SampledFrom([]string{"vmess", "vless", "trojan", "shadowsocks"})
+
+	// Generator for valid hostnames
+	hostGen := rapid.StringMatching(`[a-z][a-z0-9]{2,10}\.(com|net|org|io)`)
+
+	// Generator for valid ports
+	portGen := rapid.IntRange(1, 65535)
+
+	// Generator for UUIDs
+	uuidGen := rapid.StringMatching(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+
+	tmpDir := t.TempDir()
+
+	rapid.Check(t, func(t *rapid.T) {
+		bypassDomains := domainsGen.Draw(t, "bypassDomains")
+		countries := countriesGen.Draw(t, "countries")
+		protocol := protocolGen.Draw(t, "protocol")
+		address := hostGen.Draw(t, "address")
+		port := portGen.Draw(t, "port")
+		uuid := uuidGen.Draw(t, "uuid")
+
+		link := &profile.Link{
+			Protocol: protocol,
+			Address:  address,
+			Port:     port,
+			UUID:     uuid,
+			Security: "auto",
+			TLS:      true,
+			SNI:      address,
+		}
+
+		cg := NewConfigGenerator(tmpDir)
+		cg.BypassDomains = bypassDomains
+		cg.WhitelistCountries = countries
+
+		// Generate the full sing-box config
+		configFile, err := cg.generateSingBox(link)
+		if err != nil {
+			t.Fatalf("generateSingBox failed: %v", err)
+		}
+
+		data, err := os.ReadFile(configFile)
+		if err != nil {
+			t.Fatalf("ReadFile failed: %v", err)
+		}
+
+		var cfg map[string]interface{}
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			t.Fatalf("Invalid JSON: %v", err)
+		}
+
+		// Extract route.rules
+		routeRaw, hasRoute := cfg["route"]
+		if !hasRoute {
+			t.Fatal("expected 'route' section in config")
+		}
+		route, ok := routeRaw.(map[string]interface{})
+		if !ok {
+			t.Fatalf("route is not a map, got %T", routeRaw)
+		}
+
+		rulesRaw, hasRules := route["rules"]
+		if !hasRules {
+			t.Fatal("expected 'rules' in route section")
+		}
+		rules, ok := rulesRaw.([]interface{})
+		if !ok {
+			t.Fatalf("rules is not an array, got %T", rulesRaw)
+		}
+
+		// Find the index of the domain_suffix rule (domain bypass rule)
+		domainBypassIdx := -1
+		for i, ruleRaw := range rules {
+			rule, ok := ruleRaw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if _, hasDomainSuffix := rule["domain_suffix"]; hasDomainSuffix {
+				domainBypassIdx = i
+				break
+			}
+		}
+
+		if domainBypassIdx == -1 {
+			t.Fatal("expected a rule with 'domain_suffix' in route rules, but none found")
+		}
+
+		// Find all geoip rule indices (rules with "rule_set" containing geoip-* tags)
+		for i, ruleRaw := range rules {
+			rule, ok := ruleRaw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			ruleSetRaw, hasRuleSet := rule["rule_set"]
+			if !hasRuleSet {
+				continue
+			}
+			// Check if this rule_set contains geoip references
+			ruleSetArr, ok := ruleSetRaw.([]interface{})
+			if !ok {
+				continue
+			}
+			for _, tagRaw := range ruleSetArr {
+				tag, ok := tagRaw.(string)
+				if !ok {
+					continue
+				}
+				if strings.HasPrefix(tag, "geoip-") {
+					// Property: domain bypass rule index must be less than geoip rule index
+					if domainBypassIdx >= i {
+						t.Fatalf("domain bypass rule (index %d) does NOT precede geoip rule (index %d) with tag %q",
+							domainBypassIdx, i, tag)
+					}
+				}
+			}
+		}
+	})
+}
+
+func TestProperty_GeneratedConfigContainsCorrectDomainBypassRule(t *testing.T) {
+	// Generator for valid domain labels (e.g. "example", "my-site")
+	labelGen := rapid.StringMatching(`[a-z][a-z0-9\-]{1,12}`)
+
+	// Generator for valid TLDs
+	tldGen := rapid.SampledFrom([]string{"com", "net", "org", "io", "ir", "info", "co"})
+
+	// Generator for a single valid domain
+	domainGen := rapid.Custom(func(t *rapid.T) string {
+		label := labelGen.Draw(t, "label")
+		tld := tldGen.Draw(t, "tld")
+		return label + "." + tld
+	})
+
+	// Generator for a non-empty list of unique bypass domains (1 to 20 domains)
+	domainsGen := rapid.Custom(func(t *rapid.T) []string {
+		count := rapid.IntRange(1, 20).Draw(t, "count")
+		seen := make(map[string]bool)
+		domains := make([]string, 0, count)
+		for len(domains) < count {
+			d := domainGen.Draw(t, "domain")
+			if !seen[d] {
+				seen[d] = true
+				domains = append(domains, d)
+			}
+		}
+		return domains
+	})
+
+	// Generator for optional whitelist countries (can be empty or non-empty)
+	countriesGen := rapid.OneOf(
+		rapid.Just([]string{}),
+		rapid.Just([]string{"ir"}),
+		rapid.Just([]string{"ir", "cn"}),
+	)
+
+	// Generator for valid protocols supported by sing-box
+	protocolGen := rapid.SampledFrom([]string{"vmess", "vless", "trojan", "shadowsocks"})
+
+	// Generator for valid hostnames (for link address)
+	hostGen := rapid.StringMatching(`[a-z][a-z0-9]{2,10}\.(com|net|org|io)`)
+
+	// Generator for valid ports
+	portGen := rapid.IntRange(1, 65535)
+
+	// Generator for UUIDs
+	uuidGen := rapid.StringMatching(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+
+	tmpDir := t.TempDir()
+
+	rapid.Check(t, func(t *rapid.T) {
+		bypassDomains := domainsGen.Draw(t, "bypassDomains")
+		countries := countriesGen.Draw(t, "countries")
+		protocol := protocolGen.Draw(t, "protocol")
+		address := hostGen.Draw(t, "address")
+		port := portGen.Draw(t, "port")
+		uuid := uuidGen.Draw(t, "uuid")
+
+		link := &profile.Link{
+			Protocol: protocol,
+			Address:  address,
+			Port:     port,
+			UUID:     uuid,
+			Security: "auto",
+			TLS:      true,
+			SNI:      address,
+		}
+
+		cg := NewConfigGenerator(tmpDir)
+		cg.BypassDomains = bypassDomains
+		cg.WhitelistCountries = countries
+
+		// Generate the full sing-box config
+		configFile, err := cg.generateSingBox(link)
+		if err != nil {
+			t.Fatalf("generateSingBox failed: %v", err)
+		}
+
+		data, err := os.ReadFile(configFile)
+		if err != nil {
+			t.Fatalf("ReadFile failed: %v", err)
+		}
+
+		var cfg map[string]interface{}
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			t.Fatalf("Invalid JSON: %v", err)
+		}
+
+		// Property: route section must exist when BypassDomains is non-empty
+		routeRaw, hasRoute := cfg["route"]
+		if !hasRoute {
+			t.Fatal("expected 'route' section in config when BypassDomains is non-empty")
+		}
+		route, ok := routeRaw.(map[string]interface{})
+		if !ok {
+			t.Fatalf("route is not a map, got %T", routeRaw)
+		}
+
+		// Property: route must contain rules array
+		rulesRaw, hasRules := route["rules"]
+		if !hasRules {
+			t.Fatal("expected 'rules' in route section")
+		}
+		rules, ok := rulesRaw.([]interface{})
+		if !ok {
+			t.Fatalf("rules is not an array, got %T", rulesRaw)
+		}
+
+		// Find the domain_suffix rule
+		var domainRule map[string]interface{}
+		for _, ruleRaw := range rules {
+			rule, ok := ruleRaw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if _, hasDomainSuffix := rule["domain_suffix"]; hasDomainSuffix {
+				domainRule = rule
+				break
+			}
+		}
+
+		if domainRule == nil {
+			t.Fatal("expected a rule with 'domain_suffix' in route rules, but none found")
+		}
+
+		// Property: domain_suffix must match the exact bypass domains
+		domainSuffixRaw := domainRule["domain_suffix"]
+		domainSuffixArr, ok := domainSuffixRaw.([]interface{})
+		if !ok {
+			t.Fatalf("domain_suffix is not an array, got %T", domainSuffixRaw)
+		}
+
+		if len(domainSuffixArr) != len(bypassDomains) {
+			t.Fatalf("domain_suffix length: got %d, want %d", len(domainSuffixArr), len(bypassDomains))
+		}
+
+		for i, expected := range bypassDomains {
+			got, ok := domainSuffixArr[i].(string)
+			if !ok {
+				t.Fatalf("domain_suffix[%d] is not a string, got %T", i, domainSuffixArr[i])
+			}
+			if got != expected {
+				t.Fatalf("domain_suffix[%d]: got %q, want %q", i, got, expected)
+			}
+		}
+
+		// Property: the rule must route to "direct" outbound
+		if domainRule["outbound"] != "direct" {
+			t.Fatalf("domain bypass rule outbound: got %v, want \"direct\"", domainRule["outbound"])
+		}
+
+		// Property: the rule must have action "route"
+		if domainRule["action"] != "route" {
+			t.Fatalf("domain bypass rule action: got %v, want \"route\"", domainRule["action"])
+		}
+	})
+}
+
+
+// TestEndToEnd_ConfigLoadToSingBoxBypassDomains is an integration test that verifies
+// the full flow: load YAML config with bypass_domains → create ConfigGenerator →
+// generate sing-box config → verify domain_suffix rule is present and routes to "direct".
+//
+// **Validates: Requirements 2.1, 3.1, 3.2**
+func TestEndToEnd_ConfigLoadToSingBoxBypassDomains(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Step 1: Write a YAML config file with bypass_domains
+	yamlContent := `
+server:
+  listen: "0.0.0.0"
+  api_port: 8080
+  socks_port: 2801
+whitelist:
+  countries: ["ir"]
+  bypass_domains:
+    - "cloudflare.com"
+    - "ip-api.com"
+    - "custom-check.example.org"
+`
+	configPath := filepath.Join(tmpDir, "test-config.yaml")
+	if err := os.WriteFile(configPath, []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("failed to write test config: %v", err)
+	}
+
+	// Step 2: Load the config using config.Load()
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("config.Load failed: %v", err)
+	}
+
+	// Verify the loaded config has the expected bypass domains
+	expectedDomains := []string{"cloudflare.com", "ip-api.com", "custom-check.example.org"}
+	if len(cfg.Whitelist.BypassDomains) != len(expectedDomains) {
+		t.Fatalf("loaded bypass_domains length: got %d, want %d",
+			len(cfg.Whitelist.BypassDomains), len(expectedDomains))
+	}
+	for i, expected := range expectedDomains {
+		if cfg.Whitelist.BypassDomains[i] != expected {
+			t.Fatalf("loaded bypass_domains[%d]: got %q, want %q",
+				i, cfg.Whitelist.BypassDomains[i], expected)
+		}
+	}
+
+	// Step 3: Create a ConfigGenerator with BypassDomains from the loaded config
+	genDir := filepath.Join(tmpDir, "gen")
+	cg := NewConfigGenerator(genDir)
+	cg.BypassDomains = cfg.Whitelist.BypassDomains
+	cg.WhitelistCountries = cfg.Whitelist.Countries
+
+	// Step 4: Generate a sing-box config with a valid link
+	eng := &engine.Engine{Name: "sing-box"}
+	link := &profile.Link{
+		Protocol: "vmess",
+		Address:  "proxy.example.com",
+		Port:     443,
+		UUID:     "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+		Security: "auto",
+		Network:  "ws",
+		Path:     "/ws",
+		Host:     "cdn.example.com",
+		TLS:      true,
+		SNI:      "cdn.example.com",
+	}
+
+	configFile, err := cg.Generate(eng, link)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	// Step 5: Parse the JSON output and verify the domain_suffix rule
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+
+	var singboxCfg map[string]interface{}
+	if err := json.Unmarshal(data, &singboxCfg); err != nil {
+		t.Fatalf("Invalid JSON output: %v", err)
+	}
+
+	// Verify route section exists
+	routeRaw, hasRoute := singboxCfg["route"]
+	if !hasRoute {
+		t.Fatal("expected 'route' section in generated sing-box config")
+	}
+	route, ok := routeRaw.(map[string]interface{})
+	if !ok {
+		t.Fatalf("route is not a map, got %T", routeRaw)
+	}
+
+	// Verify rules array exists
+	rulesRaw, hasRules := route["rules"]
+	if !hasRules {
+		t.Fatal("expected 'rules' in route section")
+	}
+	rules, ok := rulesRaw.([]interface{})
+	if !ok {
+		t.Fatalf("rules is not an array, got %T", rulesRaw)
+	}
+
+	// Find the domain_suffix rule
+	var domainRule map[string]interface{}
+	for _, ruleRaw := range rules {
+		rule, ok := ruleRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if _, hasDomainSuffix := rule["domain_suffix"]; hasDomainSuffix {
+			domainRule = rule
+			break
+		}
+	}
+
+	if domainRule == nil {
+		t.Fatal("expected a rule with 'domain_suffix' in route rules, but none found")
+	}
+
+	// Verify domain_suffix contains the exact domains from config
+	domainSuffixRaw := domainRule["domain_suffix"]
+	domainSuffixArr, ok := domainSuffixRaw.([]interface{})
+	if !ok {
+		t.Fatalf("domain_suffix is not an array, got %T", domainSuffixRaw)
+	}
+
+	if len(domainSuffixArr) != len(expectedDomains) {
+		t.Fatalf("domain_suffix length: got %d, want %d", len(domainSuffixArr), len(expectedDomains))
+	}
+
+	for i, expected := range expectedDomains {
+		got, ok := domainSuffixArr[i].(string)
+		if !ok {
+			t.Fatalf("domain_suffix[%d] is not a string, got %T", i, domainSuffixArr[i])
+		}
+		if got != expected {
+			t.Fatalf("domain_suffix[%d]: got %q, want %q", i, got, expected)
+		}
+	}
+
+	// Verify the rule routes to "direct" outbound
+	if domainRule["outbound"] != "direct" {
+		t.Fatalf("domain bypass rule outbound: got %v, want \"direct\"", domainRule["outbound"])
+	}
+
+	// Verify the rule has action "route"
+	if domainRule["action"] != "route" {
+		t.Fatalf("domain bypass rule action: got %v, want \"route\"", domainRule["action"])
 	}
 }
