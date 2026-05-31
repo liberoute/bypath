@@ -46,10 +46,15 @@ type Manager struct {
 
 // NewManager creates a new tunnel manager.
 func NewManager(cfg *config.Config, engineMgr *engine.Manager) *Manager {
+	cg := NewConfigGenerator(paths.Get().TmpDir)
+	cg.WhitelistCountries = cfg.Whitelist.Countries
+	cg.BypassDomains = cfg.Whitelist.BypassDomains
+	cg.SOCKSPort = cfg.Server.SOCKSPort
+
 	return &Manager{
 		engineMgr: engineMgr,
 		config:    cfg,
-		configGen: NewConfigGenerator(paths.Get().TmpDir),
+		configGen: cg,
 		tunnels:   make(map[string]*Tunnel),
 		chains:    make(map[string]*Chain),
 	}

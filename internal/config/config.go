@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
 
 	"github.com/liberoute/bypath/internal/paths"
@@ -44,6 +45,7 @@ type EnginesConfig struct {
 
 type WhitelistConfig struct {
 	Countries      []string `yaml:"countries"`
+	BypassDomains  []string `yaml:"bypass_domains,omitempty"`
 	CustomFile     string   `yaml:"custom_file,omitempty"`
 	UpdateInterval string   `yaml:"update_interval"`
 }
@@ -102,7 +104,21 @@ func Load(path string) (*Config, error) {
 	}
 
 	applyDefaults(cfg)
+	validateBypassDomains(cfg)
 	return cfg, nil
+}
+
+// validateBypassDomains filters out empty strings from BypassDomains and logs a warning for each removed entry.
+func validateBypassDomains(cfg *Config) {
+	filtered := make([]string, 0, len(cfg.Whitelist.BypassDomains))
+	for _, d := range cfg.Whitelist.BypassDomains {
+		if d == "" {
+			log.Printf("⚠️  bypass_domains: removed empty entry")
+			continue
+		}
+		filtered = append(filtered, d)
+	}
+	cfg.Whitelist.BypassDomains = filtered
 }
 
 func applyDefaults(cfg *Config) {
@@ -129,6 +145,14 @@ func applyDefaults(cfg *Config) {
 	}
 	if len(cfg.Gateway.DNSUpstream) == 0 {
 		cfg.Gateway.DNSUpstream = []string{"1.1.1.1", "8.8.8.8"}
+	}
+	if len(cfg.Whitelist.BypassDomains) == 0 {
+		cfg.Whitelist.BypassDomains = []string{
+			"cloudflare.com",
+			"ip-api.com",
+			"ipinfo.io",
+			"api.myip.com",
+		}
 	}
 	if cfg.Whitelist.UpdateInterval == "" {
 		cfg.Whitelist.UpdateInterval = "24h"

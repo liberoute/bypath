@@ -23,6 +23,12 @@ engines:
 # Country IPs that bypass the tunnel (go direct)
 whitelist:
   countries: ["ir"]
+  # Domains to route directly (bypass tunnel) for VPN detection bypass
+  # bypass_domains:
+  #   - "cloudflare.com"
+  #   - "ip-api.com"
+  #   - "ipinfo.io"
+  #   - "api.myip.com"
   update_interval: "24h"
 
 # Network namespace isolation for tunnel processes

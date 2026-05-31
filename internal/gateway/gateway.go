@@ -405,6 +405,7 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 	// Generate config (with whitelist countries for sing-box geoip routing)
 	configGen := tunnel.NewConfigGenerator(paths.Get().TmpDir)
 	configGen.WhitelistCountries = gw.config.Whitelist.Countries
+	configGen.BypassDomains = gw.config.Whitelist.BypassDomains
 	configGen.SOCKSPort = gw.socksPort
 	if gw.config.SNISpoof.Enabled {
 		configGen.SNISpoof = gw.config.SNISpoof.SNI

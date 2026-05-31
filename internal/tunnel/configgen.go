@@ -16,6 +16,7 @@ import (
 type ConfigGenerator struct {
 	tempDir            string
 	WhitelistCountries []string // country codes (e.g. "ir") to route direct via geoip
+	BypassDomains      []string // domains to route direct (bypass tunnel)
 	SOCKSPort          int      // SOCKS5/mixed listen port (default: 2801)
 	SNISpoof           string   // fake SNI to replace real one (empty = disabled)
 }
@@ -44,6 +45,16 @@ func (cg *ConfigGenerator) Generate(eng *engine.Engine, link *profile.Link) (str
 
 // --- sing-box config generation ---
 
+// singboxBypassDomainRule returns a sing-box route rule that matches bypass domains
+// using domain_suffix and routes them to the "direct" outbound.
+func (cg *ConfigGenerator) singboxBypassDomainRule() map[string]interface{} {
+	return map[string]interface{}{
+		"domain_suffix": cg.BypassDomains,
+		"action":        "route",
+		"outbound":      "direct",
+	}
+}
+
 // singboxRoute builds the route section with geoip-based whitelist rules.
 // Traffic destined for whitelisted countries goes direct; everything else goes through proxy.
 func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface{} {
@@ -60,6 +71,11 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 		"action": "resolve",
 		"server": "dns-direct",
 	})
+
+	// Rule: domain bypass (VPN detection endpoints → direct)
+	if len(cg.BypassDomains) > 0 {
+		rules = append(rules, cg.singboxBypassDomainRule())
+	}
 
 	// Rule: private/LAN IPs → direct
 	rules = append(rules, map[string]interface{}{
@@ -109,8 +125,9 @@ func (cg *ConfigGenerator) generateSingBox(link *profile.Link) (string, error) {
 		"outbounds": cg.singboxOutbounds(link),
 	}
 
-	// Route section: geoip whitelist for bypassing tunnel on IR traffic.
-	if len(cg.WhitelistCountries) > 0 {
+	// Route section: geoip whitelist for bypassing tunnel on IR traffic,
+	// or domain bypass for VPN detection endpoints.
+	if len(cg.WhitelistCountries) > 0 || len(cg.BypassDomains) > 0 {
 		cfg["route"] = cg.singboxRoute(link)
 		// DNS for route matching: resolve directly (no tunnel)
 		cfg["dns"] = map[string]interface{}{

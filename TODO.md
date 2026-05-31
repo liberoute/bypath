@@ -43,56 +43,7 @@
 - [ ] **TUI: server details view** — Show full link info (URI, all params) on a detail page.
 - [ ] **Export/import profiles** — Share configs between devices.
 
-## ✅ Done (v2.3.0)
-
-- [x] TUI redesign — tab-based (Home / Servers / Subscriptions)
-- [x] Inline speed test in Servers tab (p=ping, s=full, t=single)
-- [x] Download speed test (KB/s via cloudflare speed endpoint)
-- [x] SOCKS5 and HTTP proxy as outbound protocol
-- [x] HTTP proxy inbound (port 8888)
-- [x] API token authentication
-- [x] PID file management (no more pkill)
-- [x] Server delete (CLI + TUI)
-- [x] Subscription delete (CLI + TUI)
-- [x] Group create/rename from TUI
-- [x] Default group protection (subs auto-create named groups)
-- [x] Active link indicator (⚡) in server list
-- [x] Auto-restart gateway on server select
-- [x] Status check (relay delay + exit IP + country)
-- [x] Sub update via proxy (for filtered sub URLs)
-- [x] Engine selection (sing-box vs xray) via config
-- [x] SNI spoofing via config
-- [x] SNI comma-separated fix in configgen
-- [x] TLS insecure for vless (CDN compatibility)
-- [x] DNS circular dependency fix (no detour on DNS server)
-- [x] Whitelist working in proxy mode (sniff + resolve + geoip)
-- [x] Gateway fallback searches correct group
-- [x] Skip info links (port<10, 0.0.0.0) everywhere
-- [x] Verify connection uses socks5h + cp.cloudflare.com
-- [x] Race condition fix in TUI (tea.Cmd instead of goroutine)
-- [x] `sub update` without -g updates all groups
-- [x] `list` shows all groups with links
-- [x] `select -g` flag support
-
-## ✅ Done (v2.2.0)
-
-- [x] Whitelist IR moved from iptables/ipset to sing-box geoip rule_set
-- [x] TUI menu (bubbletea) — start/stop/status/sub without flash
-- [x] TUI bench page — live progress, ping/relay, sort, select
-- [x] Parallel bench — all links tested simultaneously
-- [x] vless/reality/comma-SNI fix in config generation
-- [x] Column alignment with runewidth
-- [x] Subscription support (add/update/list)
-- [x] Auto-fallback — if first link fails, try others
-- [x] CLI commands: run, stop, add, list, select, bench, sub, test, engines, update
-- [x] CI/CD pipeline (GitHub Actions) — test, lint, build, release
-- [x] Docker integration test (lite + full build from scratch)
-- [x] Auto-release on push to main (dev build)
-- [x] sing-box 1.13 compatibility (route actions, local geoip, DNS over tunnel)
-- [x] Proxy mode whitelist (sniff + resolve via tunnel DNS + geoip-ir)
-- [x] Update checker with proper semver comparison
-- [x] TUI update notification
-- [x] Dead code cleanup (removed legacy fetcher, unused methods)
+## ✅ Done (moved to CHANGELOG.md)
 
 ## ⚠️ Known Issues
 
