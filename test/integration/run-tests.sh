@@ -58,8 +58,8 @@ run_variant_test() {
     mkdir -p "$WORKDIR/data/profiles" "$WORKDIR/data/tmp" "$WORKDIR/data/geo" "$WORKDIR/configs" "$WORKDIR/engines" "$WORKDIR/logs"
 
     # Setup installed mode paths (binary is in /usr/local/bin → installed mode)
+    rm -rf /etc/bypath /var/log/bypath /tmp/bypath-*
     mkdir -p /etc/bypath/profiles /etc/bypath/geo /var/log/bypath /opt/bypath/engines
-    rm -f /var/log/bypath/error.log
 
     # Copy sing-box to engines dir for installed mode
     cp /usr/local/bin/sing-box /opt/bypath/engines/sing-box 2>/dev/null || true
