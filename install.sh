@@ -341,7 +341,7 @@ EOF
 
 # ─── Download geoip-ir.srs ──────────────────────────────────
 install_geoip() {
-    local geo_dir="/var/lib/bypath/geo"
+    local geo_dir="/etc/bypath/geo"
     local geo_file="${geo_dir}/geoip-ir.srs"
 
     if [ -f "$geo_file" ]; then
@@ -431,10 +431,8 @@ main() {
     mkdir -p "${INSTALL_DIR}/engines"
 
     # Create standard Linux paths for installed mode
-    mkdir -p "/etc/bypath"
-    mkdir -p "/var/lib/bypath/profiles"
-    mkdir -p "/var/lib/bypath/tmp"
-    mkdir -p "/var/lib/bypath/geo"
+    mkdir -p "/etc/bypath/profiles"
+    mkdir -p "/etc/bypath/geo"
     mkdir -p "/var/log/bypath"
 
     # Download binary
@@ -497,7 +495,7 @@ EOF
     fi
 
     # Create default profile if not exists
-    local profile_file="/var/lib/bypath/profiles/default.json"
+    local profile_file="/etc/bypath/profiles/default.json"
     if [ ! -f "$profile_file" ]; then
         cat > "$profile_file" <<'EOF'
 {
@@ -534,7 +532,8 @@ EOF
     info "Paths:"
     echo "    Binary:   ${INSTALL_DIR}/${BINARY_NAME}"
     echo "    Config:   /etc/bypath/config.yaml"
-    echo "    Data:     /var/lib/bypath/"
+    echo "    Profiles: /etc/bypath/profiles/"
+    echo "    Geo:      /etc/bypath/geo/"
     echo "    Logs:     /var/log/bypath/"
     echo "    Engines:  ${INSTALL_DIR}/engines/"
     echo ""

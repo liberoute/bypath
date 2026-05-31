@@ -3,19 +3,24 @@
 // If bypath is installed system-wide (binary in /opt/bypath, /usr/local/bin, or /usr/bin),
 // it uses standard Linux paths:
 //   - Config:   /etc/bypath/config.yaml
-//   - Data:     /var/lib/bypath/ (profiles, geo, tmp)
-//   - Logs:     /var/log/bypath/ (access.log, error.log)
+//   - Profiles: /etc/bypath/profiles/
+//   - Geo:      /etc/bypath/geo/
+//   - Tmp:      /tmp/bypath-<random>/
+//   - Logs:     /var/log/bypath/
 //   - Engines:  /opt/bypath/engines/
 //
 // If bypath is running locally (./bypath or from a dev directory),
 // it uses relative paths:
 //   - Config:   configs/default.yaml
-//   - Data:     ./data/ (profiles, geo, tmp)
+//   - Profiles: ./data/profiles/
+//   - Geo:      ./data/geo/
+//   - Tmp:      ./data/tmp/
 //   - Logs:     (stdout only)
 //   - Engines:  ./engines/
 package paths
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,13 +58,16 @@ func Detect() *Resolved {
 	mode := detectMode()
 
 	if mode == ModeInstalled {
+		// Use /tmp/bypath-<pid> for temp files
+		tmpDir := fmt.Sprintf("/tmp/bypath-%d", os.Getpid())
+
 		current = &Resolved{
 			Mode:       ModeInstalled,
 			ConfigFile: "/etc/bypath/config.yaml",
-			DataDir:    "/var/lib/bypath",
-			ProfileDir: "/var/lib/bypath/profiles",
-			TmpDir:     "/var/lib/bypath/tmp",
-			GeoDir:     "/var/lib/bypath/geo",
+			DataDir:    "/etc/bypath",
+			ProfileDir: "/etc/bypath/profiles",
+			TmpDir:     tmpDir,
+			GeoDir:     "/etc/bypath/geo",
 			EngineDir:  "/opt/bypath/engines",
 			LogDir:     "/var/log/bypath",
 		}

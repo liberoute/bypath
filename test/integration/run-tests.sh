@@ -58,7 +58,7 @@ run_variant_test() {
     mkdir -p "$WORKDIR/data/profiles" "$WORKDIR/data/tmp" "$WORKDIR/data/geo" "$WORKDIR/configs" "$WORKDIR/engines" "$WORKDIR/logs"
 
     # Setup installed mode paths (binary is in /usr/local/bin → installed mode)
-    mkdir -p /etc/bypath /var/lib/bypath/profiles /var/lib/bypath/tmp /var/lib/bypath/geo /var/log/bypath /opt/bypath/engines
+    mkdir -p /etc/bypath/profiles /etc/bypath/geo /var/log/bypath /opt/bypath/engines
     rm -f /var/log/bypath/error.log
 
     # Copy sing-box to engines dir for installed mode
