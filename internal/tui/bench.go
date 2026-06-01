@@ -281,19 +281,22 @@ func runParallelBench(entries []benchEntry, group string) []benchEntry {
 	data, _ := os.ReadFile(filepath.Join(paths.Get().ProfileDir, group+".json"))
 	var g struct {
 		Links []struct {
-			Remark   string `json:"remark"`
-			Protocol string `json:"protocol"`
-			Address  string `json:"address"`
-			Port     int    `json:"port"`
-			UUID     string `json:"uuid"`
-			AlterId  int    `json:"alter_id"`
-			Security string `json:"security"`
-			Network  string `json:"network"`
-			TLS      bool   `json:"tls"`
-			SNI      string `json:"sni"`
-			Path     string `json:"path"`
-			Host     string `json:"host"`
-			Flow     string `json:"flow"`
+			Remark           string `json:"remark"`
+			Protocol         string `json:"protocol"`
+			Address          string `json:"address"`
+			Port             int    `json:"port"`
+			UUID             string `json:"uuid"`
+			AlterId          int    `json:"alter_id"`
+			Security         string `json:"security"`
+			Network          string `json:"network"`
+			TLS              bool   `json:"tls"`
+			SNI              string `json:"sni"`
+			Path             string `json:"path"`
+			Host             string `json:"host"`
+			Flow             string `json:"flow"`
+			RealityPublicKey string `json:"reality_pbk"`
+			RealityShortID   string `json:"reality_sid"`
+			Fingerprint      string `json:"fingerprint"`
 		} `json:"links"`
 	}
 	json.Unmarshal(data, &g)
@@ -310,6 +313,9 @@ func runParallelBench(entries []benchEntry, group string) []benchEntry {
 		sbPath = filepath.Join(paths.Get().EngineDir, "sing-box")
 	}
 
+	// Bench always uses sing-box for relay testing (more compatible with all protocols)
+	// Engine preference only affects the main gateway connection
+
 	for i, entry := range entries {
 		wg.Add(1)
 		go func(idx int, e benchEntry) {
@@ -324,9 +330,35 @@ func runParallelBench(entries []benchEntry, group string) []benchEntry {
 
 			// Find matching link in full profile
 			var outboundJSON string
+			var matchedLink struct {
+				UUID             string
+				AlterId          int
+				Security         string
+				Network          string
+				TLS              bool
+				SNI              string
+				Path             string
+				Host             string
+				Flow             string
+				RealityPublicKey string
+				RealityShortID   string
+				Fingerprint      string
+			}
 			for _, l := range g.Links {
 				if l.Address == e.address && l.Port == e.port && l.Protocol == e.protocol {
-					outboundJSON = buildOutboundJSON(l.Protocol, l.Address, l.Port, l.UUID, l.AlterId, l.Security, l.Network, l.TLS, l.SNI, l.Path, l.Host, l.Flow)
+					outboundJSON = buildOutboundJSON(l.Protocol, l.Address, l.Port, l.UUID, l.AlterId, l.Security, l.Network, l.TLS, l.SNI, l.Path, l.Host, l.Flow, l.RealityPublicKey, l.RealityShortID, l.Fingerprint)
+					matchedLink.UUID = l.UUID
+					matchedLink.AlterId = l.AlterId
+					matchedLink.Security = l.Security
+					matchedLink.Network = l.Network
+					matchedLink.TLS = l.TLS
+					matchedLink.SNI = l.SNI
+					matchedLink.Path = l.Path
+					matchedLink.Host = l.Host
+					matchedLink.Flow = l.Flow
+					matchedLink.RealityPublicKey = l.RealityPublicKey
+					matchedLink.RealityShortID = l.RealityShortID
+					matchedLink.Fingerprint = l.Fingerprint
 					break
 				}
 			}
@@ -380,13 +412,13 @@ func tcpPing(host string, port int) int {
 }
 
 func testRelay(sbPath, outboundJSON string, port int) int {
-	cfg := fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":%d}],"outbounds":[%s,{"type":"direct","tag":"direct"}]}`, port, outboundJSON)
+	cfg := fmt.Sprintf(`{"log":{"level":"error"},"dns":{"servers":[{"tag":"dns-direct","type":"udp","server":"1.1.1.1","server_port":53}],"final":"dns-direct"},"route":{"default_domain_resolver":"dns-direct"},"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":%d}],"outbounds":[%s,{"type":"direct","tag":"direct"}]}`, port, outboundJSON)
 
 	tmpFile := fmt.Sprintf(filepath.Join(paths.Get().TmpDir, "bench-%d-%d.json"), os.Getpid(), port)
 	os.WriteFile(tmpFile, []byte(cfg), 0644)
 	defer os.Remove(tmpFile)
 
-	cmdCtx, cmdCancel := context.WithTimeout(context.Background(), 12*time.Second)
+	cmdCtx, cmdCancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cmdCancel()
 
 	cmd := exec.CommandContext(cmdCtx, sbPath, "run", "-c", tmpFile)
@@ -401,7 +433,7 @@ func testRelay(sbPath, outboundJSON string, port int) int {
 	}()
 
 	// Wait for port
-	deadline := time.Now().Add(4 * time.Second)
+	deadline := time.Now().Add(6 * time.Second)
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 300*time.Millisecond)
 		if err == nil {
@@ -414,6 +446,103 @@ func testRelay(sbPath, outboundJSON string, port int) int {
 	// Test through proxy
 	start := time.Now()
 	testCmd := exec.CommandContext(cmdCtx, "curl", "-s", "-x", fmt.Sprintf("socks5h://127.0.0.1:%d", port),
+		"--connect-timeout", "8", "-o", "/dev/null", "-w", "%{http_code}", "http://cp.cloudflare.com")
+	out, err := testCmd.Output()
+	elapsed := time.Since(start)
+
+	if err != nil || strings.TrimSpace(string(out)) != "204" {
+		return -1
+	}
+
+	return int(elapsed.Milliseconds())
+}
+
+// testRelayXray tests relay through xray engine
+func testRelayXray(xrayPath, protocol, address string, port int, uuid string, alterId int, security, network string, tls bool, sni, path, host, flow, realityPbk, realitySid, fingerprint string, localPort int) int {
+	// Build xray config
+	var outbound string
+	switch protocol {
+	case "vless":
+		stream := fmt.Sprintf(`"network":"%s"`, network)
+		if security == "reality" {
+			fp := fingerprint
+			if fp == "" {
+				fp = "chrome"
+			}
+			stream += fmt.Sprintf(`,"security":"reality","realitySettings":{"serverName":"%s","publicKey":"%s","shortId":"%s","fingerprint":"%s"}`, sni, realityPbk, realitySid, fp)
+		} else if tls {
+			stream += fmt.Sprintf(`,"security":"tls","tlsSettings":{"serverName":"%s"}`, sni)
+		}
+		// Transport settings
+		if network == "ws" {
+			stream += fmt.Sprintf(`,"wsSettings":{"path":"%s","headers":{"Host":"%s"}}`, path, host)
+		} else if network == "xhttp" || network == "splithttp" {
+			xhttpSettings := `,"xhttpSettings":{`
+			if path != "" {
+				xhttpSettings += fmt.Sprintf(`"path":"%s"`, path)
+			}
+			xhttpSettings += "}"
+			stream += xhttpSettings
+		}
+		outbound = fmt.Sprintf(`{"protocol":"vless","tag":"proxy","settings":{"vnext":[{"address":"%s","port":%d,"users":[{"id":"%s","encryption":"none","flow":"%s"}]}]},"streamSettings":{%s}}`,
+			address, port, uuid, flow, stream)
+	case "vmess":
+		stream := fmt.Sprintf(`"network":"%s"`, network)
+		if tls {
+			stream += fmt.Sprintf(`,"security":"tls","tlsSettings":{"serverName":"%s"}`, sni)
+		}
+		if network == "ws" {
+			stream += fmt.Sprintf(`,"wsSettings":{"path":"%s","headers":{"Host":"%s"}}`, path, host)
+		}
+		outbound = fmt.Sprintf(`{"protocol":"vmess","tag":"proxy","settings":{"vnext":[{"address":"%s","port":%d,"users":[{"id":"%s","alterId":%d,"security":"%s"}]}]},"streamSettings":{%s}}`,
+			address, port, uuid, alterId, security, stream)
+	case "trojan":
+		outbound = fmt.Sprintf(`{"protocol":"trojan","tag":"proxy","settings":{"servers":[{"address":"%s","port":%d,"password":"%s"}]},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"%s"}}}`,
+			address, port, uuid, sni)
+	case "shadowsocks":
+		outbound = fmt.Sprintf(`{"protocol":"shadowsocks","tag":"proxy","settings":{"servers":[{"address":"%s","port":%d,"method":"%s","password":"%s"}]}}`,
+			address, port, security, uuid)
+	case "socks5", "socks":
+		outbound = fmt.Sprintf(`{"protocol":"socks","tag":"proxy","settings":{"servers":[{"address":"%s","port":%d}]}}`,
+			address, port)
+	default:
+		return -1
+	}
+
+	cfg := fmt.Sprintf(`{"log":{"loglevel":"error"},"inbounds":[{"port":%d,"listen":"127.0.0.1","protocol":"socks","settings":{"auth":"noauth","udp":true}}],"outbounds":[%s,{"protocol":"freedom","tag":"direct","settings":{}}]}`, localPort, outbound)
+
+	tmpFile := fmt.Sprintf(filepath.Join(paths.Get().TmpDir, "bench-xray-%d-%d.json"), os.Getpid(), localPort)
+	os.WriteFile(tmpFile, []byte(cfg), 0644)
+	defer os.Remove(tmpFile)
+
+	cmdCtx, cmdCancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cmdCancel()
+
+	cmd := exec.CommandContext(cmdCtx, xrayPath, "run", "-c", tmpFile)
+	if err := cmd.Start(); err != nil {
+		return -1
+	}
+	defer func() {
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+		}
+	}()
+
+	// Wait for port
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", localPort), 300*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	// Test through proxy
+	start := time.Now()
+	testCmd := exec.CommandContext(cmdCtx, "curl", "-s", "-x", fmt.Sprintf("socks5h://127.0.0.1:%d", localPort),
 		"--connect-timeout", "5", "-o", "/dev/null", "-w", "%{http_code}", "http://cp.cloudflare.com")
 	out, err := testCmd.Output()
 	elapsed := time.Since(start)
@@ -425,7 +554,7 @@ func testRelay(sbPath, outboundJSON string, port int) int {
 	return int(elapsed.Milliseconds())
 }
 
-func buildOutboundJSON(protocol, address string, port int, uuid string, alterId int, security, network string, tls bool, sni, path, host, flow string) string {
+func buildOutboundJSON(protocol, address string, port int, uuid string, alterId int, security, network string, tls bool, sni, path, host, flow, realityPbk, realitySid, fingerprint string) string {
 	// Fix SNI: if it's a comma-separated list, take the first one
 	if strings.Contains(sni, ",") {
 		sni = strings.TrimSpace(strings.Split(sni, ",")[0])
@@ -478,9 +607,19 @@ func buildOutboundJSON(protocol, address string, port int, uuid string, alterId 
 			ob += "}"
 		}
 		if security == "reality" {
-			ob += `,"tls":{"enabled":true,"reality":{"enabled":true}` 
+			ob += `,"tls":{"enabled":true,"reality":{"enabled":true`
+			if realityPbk != "" {
+				ob += fmt.Sprintf(`,"public_key":"%s"`, realityPbk)
+			}
+			if realitySid != "" {
+				ob += fmt.Sprintf(`,"short_id":"%s"`, realitySid)
+			}
+			ob += "}"
 			if sni != "" {
 				ob += fmt.Sprintf(`,"server_name":"%s"`, sni)
+			}
+			if fingerprint != "" {
+				ob += fmt.Sprintf(`,"utls":{"enabled":true,"fingerprint":"%s"}`, fingerprint)
 			}
 			ob += "}"
 		} else if tls {

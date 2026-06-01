@@ -215,6 +215,64 @@ whitelist:
 	}
 }
 
+func TestNativeTUNDefaultTrue(t *testing.T) {
+	// When native_tun is not specified, it should default to true
+	tmpDir := t.TempDir()
+	cfgFile := filepath.Join(tmpDir, "test.yaml")
+	os.WriteFile(cfgFile, []byte("server:\n  api_port: 8080\n"), 0644)
+
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	if !cfg.Gateway.NativeTUN {
+		t.Error("expected NativeTUN to default to true when not specified")
+	}
+}
+
+func TestNativeTUNExplicitFalse(t *testing.T) {
+	// When native_tun is explicitly set to false, it should be false
+	tmpDir := t.TempDir()
+	cfgFile := filepath.Join(tmpDir, "test.yaml")
+	content := `
+gateway:
+  enabled: true
+  native_tun: false
+`
+	os.WriteFile(cfgFile, []byte(content), 0644)
+
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	if cfg.Gateway.NativeTUN {
+		t.Error("expected NativeTUN to be false when explicitly set to false")
+	}
+}
+
+func TestNativeTUNExplicitTrue(t *testing.T) {
+	// When native_tun is explicitly set to true, it should be true
+	tmpDir := t.TempDir()
+	cfgFile := filepath.Join(tmpDir, "test.yaml")
+	content := `
+gateway:
+  enabled: true
+  native_tun: true
+`
+	os.WriteFile(cfgFile, []byte(content), 0644)
+
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	if !cfg.Gateway.NativeTUN {
+		t.Error("expected NativeTUN to be true when explicitly set to true")
+	}
+}
+
 
 // Feature: vpn-detection-bypass, Property 5: Config serialization round-trip preserves bypass_domains
 // **Validates: Requirements 4.1, 4.2**

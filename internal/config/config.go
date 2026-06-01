@@ -35,6 +35,7 @@ type GatewayConfig struct {
 	Enabled     bool     `yaml:"enabled"`
 	Interface   string   `yaml:"interface"`
 	DNSUpstream []string `yaml:"dns_upstream"`
+	NativeTUN   bool     `yaml:"native_tun"`
 }
 
 type EnginesConfig struct {
@@ -102,6 +103,10 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg := &Config{}
+	// Set defaults that need to be true before unmarshaling
+	// (YAML will override if explicitly set to false)
+	cfg.Gateway.NativeTUN = true
+
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}

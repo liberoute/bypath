@@ -297,7 +297,7 @@ install_systemd() {
 
     echo ""
     local answer
-    read -rp "$(echo -e "${CYAN}?${NC}  Create systemd service? [Y/n] ")" answer
+    read -rp "$(echo -e "${CYAN}?${NC}  Create systemd service? [Y/n] ")" answer </dev/tty
     answer="${answer:-y}"
 
     if [[ ! "$answer" =~ ^[Yy]$ ]]; then
@@ -351,7 +351,7 @@ install_geoip() {
 
     echo ""
     local answer
-    read -rp "$(echo -e "${CYAN}?${NC}  Download geoip-ir.srs (Iran IP list for whitelist)? [Y/n] ")" answer
+    read -rp "$(echo -e "${CYAN}?${NC}  Download geoip-ir.srs (Iran IP list for whitelist)? [Y/n] ")" answer </dev/tty
     answer="${answer:-y}"
 
     if [[ ! "$answer" =~ ^[Yy]$ ]]; then
@@ -408,7 +408,7 @@ main() {
         echo -e "  ${CYAN}2)${NC} full  — Batteries included, embeds sing-box engine"
         echo ""
         local choice
-        read -rp "$(echo -e "${CYAN}?${NC}  Select variant [1/2] (default: 1): ")" choice
+        read -rp "$(echo -e "${CYAN}?${NC}  Select variant [1/2] (default: 1): ")" choice </dev/tty
         choice="${choice:-1}"
         case "$choice" in
             1|lite)  VARIANT="lite" ;;

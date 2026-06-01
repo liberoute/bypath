@@ -20,6 +20,8 @@ type ConfigGenerator struct {
 	BypassDomains      []string // domains to route direct (bypass tunnel)
 	SOCKSPort          int      // SOCKS5/mixed listen port (default: 2801)
 	SNISpoof           string   // fake SNI to replace real one (empty = disabled)
+	GatewayMode        bool     // when true, generate TUN inbound + DNS server config
+	DNSPort            int      // DNS listen port for gateway mode (default: 53)
 }
 
 // NewConfigGenerator creates a new config generator.
@@ -71,16 +73,19 @@ func (cg *ConfigGenerator) GenerateChainConfig(chainName string, links []*profil
 	// Route: direct all inbound traffic to the last hop's outbound (exit node)
 	lastHopTag := fmt.Sprintf("chain-%s-hop-%d", chainName, len(links)-1)
 	route := map[string]interface{}{
-		"final":                lastHopTag,
-		"auto_detect_interface": true,
+		"final":                   lastHopTag,
+		"auto_detect_interface":   true,
+		"default_domain_resolver": "dns-direct",
 	}
 
-	// DNS: simple direct DNS for chain resolution
+	// DNS: simple direct DNS for chain resolution (sing-box 1.12+ format)
 	dns := map[string]interface{}{
 		"servers": []map[string]interface{}{
 			{
-				"tag":     "dns-direct",
-				"address": "udp://1.1.1.1",
+				"tag":         "dns-direct",
+				"type":        "udp",
+				"server":      "1.1.1.1",
+				"server_port": 53,
 			},
 		},
 		"final": "dns-direct",
@@ -329,58 +334,85 @@ func (cg *ConfigGenerator) buildSingboxOutbound(link *profile.Link) map[string]i
 // --- sing-box config generation ---
 
 // singboxDNS generates the DNS section for the sing-box config.
-// When GeositeCountries is non-empty, it produces split DNS:
-//   - dns-direct: resolves without tunnel (no detour)
-//   - dns-tunnel: resolves through proxy (detour: "proxy")
-//   - DNS rules: geosite rule_sets point to dns-direct
-//   - final: dns-tunnel (unmatched domains resolve through tunnel)
 //
+// In gateway mode (GatewayMode=true), it produces full split DNS with:
+//   - dns-tunnel: resolves through proxy (detour: "proxy")
+//   - dns-direct: resolves directly (detour: "direct")
+//   - DNS rules: geosite rule_sets point to dns-direct
+//   - final: "dns-tunnel" (unmatched domains resolve through tunnel)
+//   - independent_cache: true
+//   - listen: "0.0.0.0" and listen_port: cg.DNSPort
+//
+// In proxy mode with GeositeCountries configured, it produces split DNS without listen.
 // When GeositeCountries is empty, it falls back to simple DNS (direct only, no split).
-func (cg *ConfigGenerator) singboxDNS(link *profile.Link) map[string]interface{} {
-	if len(cg.GeositeCountries) == 0 {
-		// Fallback: simple DNS, direct only (current behavior)
+func (cg *ConfigGenerator) singboxDNS() map[string]interface{} {
+	// Determine which countries to use for geosite DNS rules.
+	// Prefer GeositeCountries; fall back to WhitelistCountries if empty.
+	geositeCountries := cg.GeositeCountries
+	if len(geositeCountries) == 0 {
+		geositeCountries = cg.WhitelistCountries
+	}
+
+	if !cg.GatewayMode && len(geositeCountries) == 0 {
+		// Fallback: simple DNS, direct only (current behavior for proxy-only mode)
 		return map[string]interface{}{
 			"servers": []map[string]interface{}{
 				{
-					"tag":     "dns-direct",
-					"address": "udp://1.1.1.1",
+					"tag":         "dns-direct",
+					"type":        "udp",
+					"server":      "1.1.1.1",
+					"server_port": 53,
 				},
 			},
 			"final": "dns-direct",
 		}
 	}
 
-	// Split DNS: direct + tunnel
+	// Split DNS: tunnel + direct (sing-box 1.12+ format)
 	servers := []map[string]interface{}{
 		{
-			"tag":     "dns-direct",
-			"address": "udp://1.1.1.1",
+			"tag":         "dns-tunnel",
+			"type":        "udp",
+			"server":      "1.1.1.1",
+			"server_port": 53,
+			"detour":      "proxy",
 		},
 		{
-			"tag":     "dns-tunnel",
-			"address": "udp://1.1.1.1",
-			"detour":  "proxy",
+			"tag":         "dns-direct",
+			"type":        "udp",
+			"server":      "1.1.1.1",
+			"server_port": 53,
 		},
 	}
 
-	// DNS rules: geosite rule_sets → dns-direct
-	var ruleSetTags []string
-	for _, country := range cg.GeositeCountries {
-		ruleSetTags = append(ruleSetTags, fmt.Sprintf("geosite-%s", country))
-	}
-
-	rules := []map[string]interface{}{
-		{
-			"rule_set": ruleSetTags,
-			"server":   "dns-direct",
-		},
-	}
-
-	return map[string]interface{}{
+	dns := map[string]interface{}{
 		"servers": servers,
-		"rules":   rules,
 		"final":   "dns-tunnel",
 	}
+
+	// DNS rules: geosite rule_sets → dns-direct (only if geosite files exist)
+	if len(geositeCountries) > 0 {
+		var ruleSetTags []string
+		for _, country := range geositeCountries {
+			geositePath := filepath.Join(paths.Get().GeoDir, fmt.Sprintf("geosite-%s.srs", country))
+			if _, err := os.Stat(geositePath); err == nil {
+				ruleSetTags = append(ruleSetTags, fmt.Sprintf("geosite-%s", country))
+			}
+		}
+		if len(ruleSetTags) > 0 {
+			dns["rules"] = []map[string]interface{}{
+				{
+					"rule_set": ruleSetTags,
+					"server":   "dns-direct",
+				},
+			}
+		}
+	}
+
+	// In gateway mode, DNS listen is handled via a separate inbound
+	// (sing-box 1.12+ removed dns.listen/listen_port fields)
+
+	return dns
 }
 
 // singboxBypassDomainRule returns a sing-box route rule that matches bypass domains
@@ -395,15 +427,19 @@ func (cg *ConfigGenerator) singboxBypassDomainRule() map[string]interface{} {
 
 // singboxGeositeRuleSets returns rule_set definitions for geosite files.
 // Each entry is a local binary rule set pointing to GeoDir/geosite-{country}.srs.
+// Only includes entries where the file actually exists.
 func (cg *ConfigGenerator) singboxGeositeRuleSets() []map[string]interface{} {
 	var ruleSets []map[string]interface{}
 	for _, country := range cg.GeositeCountries {
-		ruleSets = append(ruleSets, map[string]interface{}{
-			"type":   "local",
-			"tag":    fmt.Sprintf("geosite-%s", country),
-			"format": "binary",
-			"path":   filepath.Join(paths.Get().GeoDir, fmt.Sprintf("geosite-%s.srs", country)),
-		})
+		geositePath := filepath.Join(paths.Get().GeoDir, fmt.Sprintf("geosite-%s.srs", country))
+		if _, err := os.Stat(geositePath); err == nil {
+			ruleSets = append(ruleSets, map[string]interface{}{
+				"type":   "local",
+				"tag":    fmt.Sprintf("geosite-%s", country),
+				"format": "binary",
+				"path":   geositePath,
+			})
+		}
 	}
 	return ruleSets
 }
@@ -438,16 +474,22 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 	})
 
 	// Rule: geosite domain whitelist → direct (must come before geoip)
+	// Only include if geosite files actually exist
 	if len(cg.GeositeCountries) > 0 {
 		var geositeRuleSetTags []string
 		for _, country := range cg.GeositeCountries {
-			geositeRuleSetTags = append(geositeRuleSetTags, fmt.Sprintf("geosite-%s", country))
+			geositePath := filepath.Join(paths.Get().GeoDir, fmt.Sprintf("geosite-%s.srs", country))
+			if _, err := os.Stat(geositePath); err == nil {
+				geositeRuleSetTags = append(geositeRuleSetTags, fmt.Sprintf("geosite-%s", country))
+			}
 		}
-		rules = append(rules, map[string]interface{}{
-			"rule_set": geositeRuleSetTags,
-			"action":   "route",
-			"outbound": "direct",
-		})
+		if len(geositeRuleSetTags) > 0 {
+			rules = append(rules, map[string]interface{}{
+				"rule_set": geositeRuleSetTags,
+				"action":   "route",
+				"outbound": "direct",
+			})
+		}
 	}
 
 	// Rule: whitelisted countries → direct (using local geoip rule_set)
@@ -482,8 +524,9 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 	}
 
 	route := map[string]interface{}{
-		"rules": rules,
-		"final": "proxy",
+		"rules":                  rules,
+		"final":                  "proxy",
+		"default_domain_resolver": "dns-direct",
 	}
 
 	// Only include rule_set key when there are definitions
@@ -495,24 +538,77 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 }
 
 // generateSingBox generates the full sing-box config.
+//
+// In gateway mode (GatewayMode=true), it uses TUN + Mixed inbounds, always includes
+// route and DNS sections, and ensures geosite rule_sets are present alongside geoip ones.
+// In proxy-only mode (GatewayMode=false), it uses only Mixed inbound and includes
+// route/DNS only when whitelist countries or bypass domains are configured.
 func (cg *ConfigGenerator) generateSingBox(link *profile.Link) (string, error) {
+	// In gateway mode, ensure GeositeCountries is populated from WhitelistCountries
+	// so that geosite rule_sets are included alongside geoip ones for domain-based routing.
+	if cg.GatewayMode && len(cg.GeositeCountries) == 0 && len(cg.WhitelistCountries) > 0 {
+		cg.GeositeCountries = cg.WhitelistCountries
+	}
+
+	// Select inbounds based on mode
+	var inbounds []map[string]interface{}
+	if cg.GatewayMode {
+		inbounds = cg.singboxInboundsGateway(link)
+	} else {
+		inbounds = cg.singboxInbounds(link)
+	}
+
 	cfg := map[string]interface{}{
 		"log": map[string]interface{}{
 			"level": "info",
 		},
-		"inbounds":  cg.singboxInbounds(link),
+		"inbounds":  inbounds,
 		"outbounds": cg.singboxOutbounds(link),
 	}
 
-	// Route section: geoip whitelist for bypassing tunnel on IR traffic,
-	// or domain bypass for VPN detection endpoints.
-	if len(cg.WhitelistCountries) > 0 || len(cg.BypassDomains) > 0 || len(cg.GeositeCountries) > 0 {
+	// Route and DNS sections:
+	// - Gateway mode: always include (needed for TUN routing and DNS serving)
+	// - Proxy mode: include only when whitelist/bypass/geosite is configured
+	if cg.GatewayMode || len(cg.WhitelistCountries) > 0 || len(cg.BypassDomains) > 0 || len(cg.GeositeCountries) > 0 {
 		cfg["route"] = cg.singboxRoute(link)
-		// DNS: split DNS when geosite is configured, simple direct DNS otherwise
-		cfg["dns"] = cg.singboxDNS(link)
+		cfg["dns"] = cg.singboxDNS()
 	}
 
 	return cg.writeJSON("singbox", cfg)
+}
+
+// singboxInboundsGateway returns inbounds for gateway mode: a TUN inbound for
+// transparent traffic capture, a DNS inbound for LAN DNS resolution,
+// plus the standard Mixed inbound for local SOCKS5/HTTP proxy.
+func (cg *ConfigGenerator) singboxInboundsGateway(link *profile.Link) []map[string]interface{} {
+	tunInbound := map[string]interface{}{
+		"type":          "tun",
+		"tag":           "tun-in",
+		"inet4_address": "10.0.0.1/30",
+		"auto_route":    true,
+		"stack":         "system",
+		"sniff":         true,
+	}
+
+	// DNS inbound for LAN clients (sing-box 1.12+ requires separate inbound)
+	dnsPort := cg.DNSPort
+	if dnsPort == 0 {
+		dnsPort = 53
+	}
+	dnsInbound := map[string]interface{}{
+		"type":        "direct",
+		"tag":         "dns-in",
+		"listen":      "0.0.0.0",
+		"listen_port": dnsPort,
+		"network":     "udp",
+		"override_address": "1.1.1.1",
+		"override_port":    53,
+	}
+
+	// Combine TUN + DNS + Mixed inbounds
+	inbounds := []map[string]interface{}{tunInbound, dnsInbound}
+	inbounds = append(inbounds, cg.singboxInbounds(link)...)
+	return inbounds
 }
 
 func (cg *ConfigGenerator) singboxInbounds(link *profile.Link) []map[string]interface{} {
@@ -849,18 +945,60 @@ func (cg *ConfigGenerator) xrayOutbounds(link *profile.Link) []map[string]interf
 			},
 		}
 		stream := map[string]interface{}{"network": link.Network}
-		if link.TLS {
+		if link.Security == "reality" {
+			stream["security"] = "reality"
+			realitySettings := map[string]interface{}{
+				"serverName": link.SNI,
+				"publicKey":  link.RealityPublicKey,
+				"shortId":    link.RealityShortID,
+			}
+			if link.Fingerprint != "" {
+				realitySettings["fingerprint"] = link.Fingerprint
+			}
+			stream["realitySettings"] = realitySettings
+		} else if link.TLS {
 			stream["security"] = "tls"
-			stream["tlsSettings"] = map[string]interface{}{
+			tlsSettings := map[string]interface{}{
 				"serverName": link.SNI,
 			}
+			if link.Fingerprint != "" {
+				tlsSettings["fingerprint"] = link.Fingerprint
+			}
+			stream["tlsSettings"] = tlsSettings
 		}
 		outbound["streamSettings"] = stream
 
 	default:
-		outbound = map[string]interface{}{
-			"protocol": "freedom",
-			"settings": map[string]interface{}{},
+		// Handle socks5 and http protocols for xray
+		if link.Protocol == "socks5" || link.Protocol == "socks" {
+			outbound = map[string]interface{}{
+				"protocol": "socks",
+				"settings": map[string]interface{}{
+					"servers": []map[string]interface{}{
+						{
+							"address": link.Address,
+							"port":    link.Port,
+						},
+					},
+				},
+			}
+		} else if link.Protocol == "http" {
+			outbound = map[string]interface{}{
+				"protocol": "http",
+				"settings": map[string]interface{}{
+					"servers": []map[string]interface{}{
+						{
+							"address": link.Address,
+							"port":    link.Port,
+						},
+					},
+				},
+			}
+		} else {
+			outbound = map[string]interface{}{
+				"protocol": "freedom",
+				"settings": map[string]interface{}{},
+			}
 		}
 	}
 

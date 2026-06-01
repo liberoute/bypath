@@ -1,5 +1,35 @@
 # Changelog
 
+## v2.5.0 (2026-06-01)
+
+### Features
+- **TUI paste support** — Fixed text input to accept pasted content (bracket paste / multi-character input). URIs and subscription URLs can now be pasted directly in TUI.
+- **TUI engine selector** — Toggle between sing-box and xray engines from Home tab. Shows current engine status.
+- **TUI auto start toggle** — Shows systemd enabled/disabled status, toggle with one click.
+- **TUI self-update** — Real-time progress bar download, confirm dialog (Yes/No with arrow keys), auto-restart into new version after update.
+- **TUI exit button** — Added Exit item to Home tab.
+- **TUI group delete** — Press `x` in Servers tab to delete a group (with confirmation).
+- **TUI bench sort** — Press `f` to toggle sort order (fastest first / slowest first). Failed links always at bottom.
+- **TUI update notification** — Yellow highlight on "Update Bypath" when update available, changelog link in footer.
+- **Subscription proxy support** — `FetchSubscription` now respects `ALL_PROXY`/`HTTPS_PROXY` environment variables with socks5 support.
+- **Self-update with download** — `bypath update` now downloads and installs the new binary with progress bar. Supports proxy via environment variables.
+
+### Bug Fixes
+- **install.sh pipe fix** — `read` prompts now use `</dev/tty` so `curl | bash` one-liner works interactively.
+- **sing-box 1.13 compatibility** — Fixed DNS server format (new `type`/`server`/`server_port` format), removed deprecated `independent_cache` and `dns.listen`, added `route.default_domain_resolver`, DNS inbound as separate listener.
+- **Geosite file check** — Rule sets only referenced when `.srs` file actually exists on disk, preventing sing-box crash.
+- **xray Reality config** — Fixed vless Reality generation for xray (`security: "reality"` + `realitySettings` with publicKey/shortId/fingerprint).
+- **xray socks5 outbound** — Added socks5/http protocol support to xray config generation.
+- **xray xhttp transport** — Added xhttp/splithttp transport support for xray bench and config.
+- **TUI status detection** — Gateway status now checks multiple PID file paths + `pgrep` fallback for systemd-started processes.
+- **TUI bench selection** — Fixed: selecting a link from sorted bench results now picks the correct server (not wrong index).
+- **Bench DNS config** — Added proper DNS section and `default_domain_resolver` to bench sing-box configs for 1.13 compatibility.
+- **Bench reality fields** — Bench now reads `reality_pbk`, `reality_sid`, `fingerprint` from profile for proper relay testing.
+
+### Improvements
+- **Bench always uses sing-box** — Speed test uses sing-box regardless of engine preference (better protocol compatibility).
+- **Bench timeout increased** — 20s total, 6s port wait, 8s curl connect for slow reality links.
+
 ## v2.4.3 (2026-06-01)
 
 ### Improvements

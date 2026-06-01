@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -81,11 +82,17 @@ type model struct {
 	updateInfo  string
 	activeInfo  string
 	statusInfo  string
+	// Confirm dialog state
+	confirmMode   bool
+	confirmLabel  string
+	confirmYes    bool // true = Yes selected, false = No selected
+	confirmAction string
 	// Bench state (inline in servers tab)
 	benchRunning bool
 	benchDone    bool
 	benchResults []benchEntry
 	benchMode    string // "ping", "full", "single"
+	benchSortAsc bool   // true = ascending (fastest first), false = descending
 }
 
 // Messages
@@ -128,7 +135,9 @@ func (m model) Init() tea.Cmd {
 func checkUpdateCmd() tea.Msg {
 	result, err := updater.Check()
 	if err == nil && result.Available {
-		return updateCheckMsg{info: fmt.Sprintf("🆕 %s → %s", result.CurrentVersion, result.LatestVersion)}
+		info := fmt.Sprintf("🆕 %s → %s  |  https://github.com/liberoute/bypath/compare/v%s...v%s",
+			result.CurrentVersion, result.LatestVersion, result.CurrentVersion, result.LatestVersion)
+		return updateCheckMsg{info: info}
 	}
 	return updateCheckMsg{}
 }
@@ -146,12 +155,25 @@ func loadActiveInfoCmd() tea.Msg {
 }
 
 func loadStatusCmd() tea.Msg {
-	pidData, _ := os.ReadFile("./bypath.pid")
-	pidStr := strings.TrimSpace(string(pidData))
-	if pidStr != "" {
-		if _, err := os.Stat(fmt.Sprintf("/proc/%s", pidStr)); err == nil {
-			return statusMsg{info: "running"}
+	// Check PID file first
+	pidPaths := []string{
+		filepath.Join(paths.Get().DataDir, "bypath.pid"),
+		"./bypath.pid",
+		"/run/bypath.pid",
+	}
+	for _, pidPath := range pidPaths {
+		pidData, _ := os.ReadFile(pidPath)
+		pidStr := strings.TrimSpace(string(pidData))
+		if pidStr != "" {
+			if _, err := os.Stat(fmt.Sprintf("/proc/%s", pidStr)); err == nil {
+				return statusMsg{info: "running"}
+			}
 		}
+	}
+	// Fallback: check if any bypath run process exists
+	out, err := exec.Command("pgrep", "-f", "bypath run").Output()
+	if err == nil && len(strings.TrimSpace(string(out))) > 0 {
+		return statusMsg{info: "running"}
 	}
 	return statusMsg{info: "stopped"}
 }
@@ -196,6 +218,11 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
 		return m, tea.Quit
+	}
+
+	// Confirm dialog mode
+	if m.confirmMode {
+		return m.handleConfirm(msg)
 	}
 
 	// Input mode
@@ -260,30 +287,61 @@ type homeItem struct {
 }
 
 func (m model) homeItems() []homeItem {
+	// Check autostart status
+	autoLabel := "Auto Start (disabled)"
+	cmd := exec.Command("systemctl", "is-enabled", "bypath")
+	out, _ := cmd.Output()
+	if strings.TrimSpace(string(out)) == "enabled" {
+		autoLabel = "Auto Start (enabled)"
+	}
+
+	// Check current engine preference
+	engineLabel := "Engine: auto (sing-box)"
+	cfg, err := config.Load(paths.Get().ConfigFile)
+	if err == nil && cfg.Engines.PreferredEngine != "" {
+		engineLabel = fmt.Sprintf("Engine: %s", cfg.Engines.PreferredEngine)
+	}
+
+	// Update label — show version if available
+	updateLabel := "Update Bypath"
+	if m.updateInfo != "" {
+		updateLabel = "Update Bypath ⚡ UPDATE AVAILABLE"
+	}
+
 	if m.statusInfo == "running" {
 		return []homeItem{
 			{"🔄", "Restart Gateway", "restart"},
 			{"🛑", "Stop Gateway", "stop"},
 			{"📊", "Status (test connection)", "live-status"},
+			{"🔁", autoLabel, "autostart-toggle"},
+			{"⚙️", engineLabel, "change-engine"},
+			{"🆕", updateLabel, "self-update"},
 			{"📥", "Update All Subs", "sub-update"},
 			{"📡", "Add Subscription", "sub-add"},
 			{"➕", "Add Server (URI)", "add-link"},
 			{"🔧", fmt.Sprintf("Change Port (current: %d)", socksPort()), "change-port"},
 			{"ℹ️", "Version Info", "status"},
+			{"🚪", "Exit", "exit"},
 		}
 	}
 	return []homeItem{
 		{"🚀", "Start Gateway", "start"},
+		{"🔁", autoLabel, "autostart-toggle"},
+		{"⚙️", engineLabel, "change-engine"},
+		{"🆕", updateLabel, "self-update"},
 		{"📥", "Update All Subs", "sub-update"},
 		{"📡", "Add Subscription", "sub-add"},
 		{"➕", "Add Server (URI)", "add-link"},
 		{"🔧", fmt.Sprintf("Change Port (current: %d)", socksPort()), "change-port"},
 		{"ℹ️", "Version Info", "status"},
+		{"🚪", "Exit", "exit"},
 	}
 }
 
 func (m model) executeHomeAction(item homeItem) (tea.Model, tea.Cmd) {
 	switch item.action {
+	case "exit":
+		return m, tea.Quit
 	case "sub-add":
 		m.inputMode = true
 		m.inputLabel = "Subscription URL"
@@ -301,6 +359,12 @@ func (m model) executeHomeAction(item homeItem) (tea.Model, tea.Cmd) {
 		m.inputLabel = "New SOCKS/Mixed port"
 		m.inputBuf = fmt.Sprintf("%d", socksPort())
 		m.inputAction = "change-port"
+		return m, nil
+	case "self-update":
+		m.confirmMode = true
+		m.confirmLabel = "Update bypath to latest version?"
+		m.confirmYes = true // default on Yes
+		m.confirmAction = "do-update"
 		return m, nil
 	default:
 		m.running = true
@@ -333,7 +397,39 @@ func (m model) handleServersKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if count == num { m.activeGroup = i; m.cursor = 0; m.benchDone = false; m.benchResults = nil; break }
 		}
 	case "enter", " ":
-		if len(links) > 0 && m.cursor < len(links) {
+		if m.benchDone && len(m.benchResults) > 0 && m.cursor < len(m.benchResults) {
+			// When bench results are shown (sorted), use the sorted entry's idx
+			sorted := m.getSortedBenchResults()
+			if m.cursor < len(sorted) {
+				entry := sorted[m.cursor]
+				group := m.groups[m.activeGroup]
+				m.running = true
+				idx := entry.idx
+				return m, func() tea.Msg {
+					exe, _ := os.Executable()
+					result := runCmdCapture(exe, "select", fmt.Sprintf("%d", idx), "-g", group)
+					pidData, _ := os.ReadFile("./bypath.pid")
+					pidStr := strings.TrimSpace(string(pidData))
+					if pidStr != "" {
+						if _, err := os.Stat(fmt.Sprintf("/proc/%s", pidStr)); err == nil {
+							runCmdCapture(exe, "stop")
+							time.Sleep(2 * time.Second)
+							logFile, _ := os.OpenFile("./bypath.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+							cmd := exec.Command(exe, "run")
+							cmd.Stdout = logFile
+							cmd.Stderr = logFile
+							setSysProcAttr(cmd)
+							cmd.Start()
+							cmd.Process.Release()
+							logFile.Close()
+							time.Sleep(3 * time.Second)
+							result.output += "\n🔄 Gateway restarted with new server"
+						}
+					}
+					return result
+				}
+			}
+		} else if len(links) > 0 && m.cursor < len(links) {
 			link := links[m.cursor]
 			group := m.groups[m.activeGroup]
 			m.running = true
@@ -397,12 +493,19 @@ func (m model) handleServersKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.benchRunning = true
 			m.benchDone = false
 			m.benchResults = nil
+			m.benchSortAsc = true // default: fastest first
 			g := m.groups[m.activeGroup]
 			entries := loadBenchEntries(g)
 			return m, func() tea.Msg {
 				results := runParallelBench(entries, g)
 				return inlineBenchDoneMsg{results: results}
 			}
+		}
+	case "f":
+		// Flip/toggle sort order in bench results
+		if m.benchDone && len(m.benchResults) > 0 {
+			m.benchSortAsc = !m.benchSortAsc
+			m.cursor = 0
 		}
 	case "t":
 		// Test SINGLE (ping + relay)
@@ -423,6 +526,20 @@ func (m model) handleServersKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.inputLabel = "New group name"
 		m.inputBuf = ""
 		m.inputAction = "create-group"
+	case "x":
+		// Delete current group (if empty or confirm)
+		if len(m.groups) > 0 && m.activeGroup < len(m.groups) {
+			group := m.groups[m.activeGroup]
+			if group == "default" {
+				m.showOutput = true
+				m.output = "❌ Cannot delete 'default' group"
+				return m, nil
+			}
+			m.confirmMode = true
+			m.confirmLabel = fmt.Sprintf("Delete group '%s' and all its links?", group)
+			m.confirmYes = false // default No
+			m.confirmAction = "delete-group-" + group
+		}
 	case "d", "delete":
 		// Delete selected server
 		if len(links) > 0 && m.cursor < len(links) {
@@ -451,6 +568,38 @@ func tcpPingFromTUI(host string, port int) int {
 func (m model) currentLinks() []linkEntry {
 	if len(m.groups) == 0 { return nil }
 	return loadGroupLinks(m.groups[m.activeGroup])
+}
+
+// getSortedBenchResults returns bench results sorted by the current sort preference
+func (m model) getSortedBenchResults() []benchEntry {
+	sorted := make([]benchEntry, len(m.benchResults))
+	copy(sorted, m.benchResults)
+	sortAsc := m.benchSortAsc
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if sorted[i].relay > 0 && sorted[j].relay > 0 {
+			if sortAsc {
+				return sorted[i].relay < sorted[j].relay
+			}
+			return sorted[i].relay > sorted[j].relay
+		}
+		if sorted[i].relay > 0 {
+			return true
+		}
+		if sorted[j].relay > 0 {
+			return false
+		}
+		if sorted[i].ping > 0 && sorted[j].ping <= 0 {
+			return true
+		}
+		if sorted[j].ping > 0 && sorted[i].ping <= 0 {
+			return false
+		}
+		if sortAsc {
+			return sorted[i].ping < sorted[j].ping
+		}
+		return sorted[i].ping > sorted[j].ping
+	})
+	return sorted
 }
 
 // --- Subs tab keys ---
@@ -548,28 +697,86 @@ func (m model) handleSubsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// --- Confirm dialog handling ---
+
+func (m model) handleConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "left", "right", "h", "l", "tab":
+		m.confirmYes = !m.confirmYes
+	case "enter", " ":
+		m.confirmMode = false
+		if m.confirmYes {
+			// Execute confirmed action
+			switch {
+			case m.confirmAction == "do-update":
+				proxy := socksAddr()
+				exe, _ := os.Executable()
+				shellCmd := fmt.Sprintf(`clear; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo "  Bypath Self-Update"; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo; %s update; echo; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo "  ✅ Done. Press Enter to launch new version..."; read; exec %s`, exe, exe)
+				cmd := exec.Command("bash", "-c", shellCmd)
+				cmd.Env = append(os.Environ(),
+					"http_proxy="+proxy,
+					"https_proxy="+proxy,
+					"ALL_PROXY="+proxy,
+				)
+				return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+					return tea.Quit()
+				})
+			case strings.HasPrefix(m.confirmAction, "delete-group-"):
+				groupName := strings.TrimPrefix(m.confirmAction, "delete-group-")
+				groupPath := filepath.Join(paths.Get().ProfileDir, groupName+".json")
+				os.Remove(groupPath)
+				m.groups = findGroups()
+				if m.activeGroup >= len(m.groups) {
+					m.activeGroup = 0
+				}
+				m.cursor = 0
+				m.showOutput = true
+				m.output = fmt.Sprintf("✅ Group '%s' deleted", groupName)
+				return m, nil
+			}
+		}
+		return m, nil
+	case "esc", "q", "n":
+		m.confirmMode = false
+		return m, nil
+	case "y":
+		m.confirmYes = true
+	}
+	return m, nil
+}
+
 // --- Input handling ---
 
 func (m model) handleInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "enter":
+	switch msg.Type {
+	case tea.KeyEnter:
 		m.inputMode = false
 		input := strings.TrimSpace(m.inputBuf)
 		if input == "" { return m, nil }
+
 		m.running = true
 		action := m.inputAction
 		return m, func() tea.Msg { return executeActionWithInput(action, input) }
-	case "esc":
+	case tea.KeyEsc:
 		m.inputMode = false
 		m.inputBuf = ""
 		return m, nil
-	case "backspace", "ctrl+h":
-		if len(m.inputBuf) > 0 { m.inputBuf = m.inputBuf[:len(m.inputBuf)-1] }
-	case "ctrl+u":
+	case tea.KeyBackspace, tea.KeyDelete:
+		if len(m.inputBuf) > 0 {
+			// Remove last rune (handles multi-byte chars)
+			runes := []rune(m.inputBuf)
+			m.inputBuf = string(runes[:len(runes)-1])
+		}
+	case tea.KeyCtrlU:
 		m.inputBuf = ""
+	case tea.KeyRunes:
+		// Handles both single chars and pasted text (bracket paste)
+		m.inputBuf += string(msg.Runes)
 	default:
-		if len(msg.String()) == 1 || strings.HasPrefix(msg.String(), "http") {
-			m.inputBuf += msg.String()
+		// Fallback: accept any printable string representation
+		s := msg.String()
+		if len(s) > 0 && s[0] >= 32 {
+			m.inputBuf += s
 		}
 	}
 	return m, nil
@@ -607,6 +814,24 @@ func (m model) View() string {
 	b.WriteString("\n")
 	b.WriteString(dimStyle.Render(" ─────────────────────────────────────────────────"))
 	b.WriteString("\n")
+
+	// Confirm dialog overlay
+	if m.confirmMode {
+		b.WriteString(fmt.Sprintf("\n  %s\n\n", m.confirmLabel))
+		yes := "  Yes  "
+		no := "  No  "
+		if m.confirmYes {
+			yes = activeTabStyle.Render(" Yes ")
+			no = dimStyle.Render(" No ")
+		} else {
+			yes = dimStyle.Render(" Yes ")
+			no = activeTabStyle.Render(" No ")
+		}
+		b.WriteString(fmt.Sprintf("       %s     %s\n\n", yes, no))
+		b.WriteString(dimStyle.Render("  ←→ select • enter confirm • esc cancel"))
+		b.WriteString("\n")
+		return b.String()
+	}
 
 	// Input mode overlay
 	if m.inputMode {
@@ -660,10 +885,14 @@ func (m model) viewHome() string {
 	b.WriteString("\n")
 	items := m.homeItems()
 	for i, it := range items {
+		line := fmt.Sprintf("  %s %s", it.icon, it.label)
 		if i == m.cursor {
 			b.WriteString(selectedStyle.Render(fmt.Sprintf("  ▸ %s %s", it.icon, it.label)))
+		} else if it.action == "self-update" && m.updateInfo != "" {
+			// Highlight update item in yellow when update is available
+			b.WriteString(updateStyle.Render(line))
 		} else {
-			b.WriteString(itemStyle.Render(fmt.Sprintf("  %s %s", it.icon, it.label)))
+			b.WriteString(itemStyle.Render(line))
 		}
 		b.WriteString("\n")
 	}
@@ -701,7 +930,7 @@ func (m model) viewServers() string {
 	if len(links) == 0 {
 		b.WriteString("\n  (no servers in this group)\n")
 		b.WriteString("\n")
-		b.WriteString(dimStyle.Render("  n new group • 0-9 switch"))
+		b.WriteString(dimStyle.Render("  n new group • x del group • 0-9 switch"))
 		b.WriteString("\n")
 		return b.String()
 	}
@@ -718,6 +947,14 @@ func (m model) viewServers() string {
 	}
 
 	if m.benchDone && len(m.benchResults) > 0 {
+		// Sort results
+		sorted := m.getSortedBenchResults()
+
+		sortLabel := "▲ fastest"
+		if !m.benchSortAsc {
+			sortLabel = "▼ slowest"
+		}
+
 		// Show results table
 		b.WriteString(headerStyle.Render(fmt.Sprintf("  %-4s %-6s %-3s %-14s %-5s %-7s %-7s %-8s %s", "#", "Proto", "🌐", "Server", "Port", "Ping", "Relay", "Down", "Name")))
 		b.WriteString("\n")
@@ -726,10 +963,10 @@ func (m model) viewServers() string {
 		start := 0
 		if m.cursor >= maxShow { start = m.cursor - maxShow + 1 }
 		end := start + maxShow
-		if end > len(m.benchResults) { end = len(m.benchResults) }
+		if end > len(sorted) { end = len(sorted) }
 
 		for i := start; i < end; i++ {
-			e := m.benchResults[i]
+			e := sorted[i]
 			proto := e.protocol
 			if proto == "shadowsocks" { proto = "ss" }
 			server := e.address
@@ -762,7 +999,7 @@ func (m model) viewServers() string {
 		}
 
 		b.WriteString("\n")
-		b.WriteString(dimStyle.Render("  enter select • p ping • s full test • t single • d del • esc clear"))
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  enter select • p ping • s full test • t single • f sort (%s) • d del • esc clear", sortLabel)))
 		b.WriteString("\n")
 		return b.String()
 	}
@@ -806,7 +1043,7 @@ func (m model) viewServers() string {
 	}
 
 	b.WriteString("\n")
-	b.WriteString(dimStyle.Render("  0-9 group • enter select • p ping • s full test • t single • d del • n new"))
+	b.WriteString(dimStyle.Render("  0-9 group • enter select • p ping • s full test • t single • d del • x del group • n new"))
 	b.WriteString("\n")
 	return b.String()
 }
@@ -1025,6 +1262,35 @@ func executeAction(action, group string) actionDoneMsg {
 		return actionDoneMsg{output: result}
 	case "status":
 		return runCmdCapture(exe, "version")
+	case "autostart-toggle":
+		// Check if systemd service is enabled
+		cmd := exec.Command("systemctl", "is-enabled", "bypath")
+		out, _ := cmd.Output()
+		enabled := strings.TrimSpace(string(out)) == "enabled"
+		if enabled {
+			cmd = exec.Command("systemctl", "disable", "bypath")
+			var buf bytes.Buffer
+			cmd.Stdout = &buf
+			cmd.Stderr = &buf
+			err := cmd.Run()
+			if err != nil {
+				return actionDoneMsg{output: fmt.Sprintf("❌ Failed to disable: %v\n%s", err, buf.String())}
+			}
+			return actionDoneMsg{output: "✅ Auto start DISABLED (systemctl disable bypath)"}
+		}
+		cmd = exec.Command("systemctl", "enable", "bypath")
+		var buf bytes.Buffer
+		cmd.Stdout = &buf
+		cmd.Stderr = &buf
+		err := cmd.Run()
+		if err != nil {
+			return actionDoneMsg{output: fmt.Sprintf("❌ Failed to enable: %v\n%s", err, buf.String())}
+		}
+		return actionDoneMsg{output: "✅ Auto start ENABLED (systemctl enable bypath)"}
+	case "self-update":
+		return actionDoneMsg{output: "Use TUI home action for update"}
+	case "change-engine":
+		return changeEngine()
 	default:
 		return actionDoneMsg{output: "Unknown: " + action}
 	}
@@ -1144,6 +1410,76 @@ func renameGroup(oldName, newName string) error {
 	}
 
 	return nil
+}
+
+// changeEngine cycles through engine options: auto → sing-box → xray → auto
+func changeEngine() actionDoneMsg {
+	configPath := paths.Get().ConfigFile
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return actionDoneMsg{output: fmt.Sprintf("❌ Cannot read config: %v", err)}
+	}
+
+	content := string(data)
+	lines := strings.Split(content, "\n")
+
+	// Find current preferred engine
+	current := ""
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "preferred:") {
+			current = strings.TrimSpace(strings.TrimPrefix(trimmed, "preferred:"))
+			current = strings.Trim(current, "\"'")
+			break
+		}
+	}
+
+	// Cycle: "" (auto/sing-box) → "xray" → "sing-box" → "" (auto)
+	var next string
+	switch current {
+	case "", "sing-box":
+		next = "xray"
+	case "xray":
+		next = "sing-box"
+	default:
+		next = "xray"
+	}
+
+	// Update or add preferred line
+	found := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "preferred:") {
+			indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+			lines[i] = fmt.Sprintf("%spreferred: \"%s\"", indent, next)
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		// Add after "prefer_system:" or "directory:" in engines section
+		for i, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "prefer_system:") || strings.HasPrefix(trimmed, "directory:") {
+				indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+				newLine := fmt.Sprintf("%spreferred: \"%s\"", indent, next)
+				lines = append(lines[:i+1], append([]string{newLine}, lines[i+1:]...)...)
+				break
+			}
+		}
+	}
+
+	newContent := strings.Join(lines, "\n")
+	if err := os.WriteFile(configPath, []byte(newContent), 0644); err != nil {
+		return actionDoneMsg{output: fmt.Sprintf("❌ Cannot write config: %v", err)}
+	}
+
+	label := next
+	if label == "" {
+		label = "auto (sing-box)"
+	}
+	return actionDoneMsg{output: fmt.Sprintf("✅ Engine changed to: %s\nRestart gateway to apply.", label)}
 }
 
 // changeSOCKSPort updates the socks_port in the config file.

@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -1438,16 +1440,130 @@ func cmdUpdate() {
 		os.Exit(1)
 	}
 
-	if result.Available {
-		fmt.Printf("🆕 Update available: %s → %s\n", result.CurrentVersion, result.LatestVersion)
-		if result.DownloadURL != "" {
-			fmt.Printf("   Download: %s\n", result.DownloadURL)
-		}
-		if result.ReleaseNotes != "" {
-			fmt.Printf("\n   Release notes:\n%s\n", result.ReleaseNotes)
-		}
-	} else {
+	if !result.Available {
 		fmt.Printf("✅ You're on the latest version (%s)\n", result.CurrentVersion)
+		return
+	}
+
+	fmt.Printf("🆕 Update available: %s → %s\n", result.CurrentVersion, result.LatestVersion)
+
+	if result.DownloadURL == "" {
+		fmt.Println("❌ No download URL found for your platform")
+		return
+	}
+
+	fmt.Printf("📥 Downloading: %s\n", result.AssetName)
+
+	// Download to temp file
+	exe, _ := os.Executable()
+	tmpFile := exe + ".new"
+
+	transport := &http.Transport{Proxy: http.ProxyFromEnvironment}
+	client := &http.Client{Timeout: 5 * time.Minute, Transport: transport}
+	resp, err := client.Get(result.DownloadURL)
+	if err != nil {
+		fmt.Printf("❌ Download failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		fmt.Printf("❌ Download failed: HTTP %d\n", resp.StatusCode)
+		os.Exit(1)
+	}
+
+	totalSize := resp.ContentLength
+	out, err := os.Create(tmpFile)
+	if err != nil {
+		fmt.Printf("❌ Cannot create temp file: %v\n", err)
+		os.Exit(1)
+	}
+
+	var written int64
+	buf := make([]byte, 32*1024)
+	lastPrint := time.Now()
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			_, writeErr := out.Write(buf[:n])
+			if writeErr != nil {
+				out.Close()
+				os.Remove(tmpFile)
+				fmt.Printf("\n❌ Write error: %v\n", writeErr)
+				os.Exit(1)
+			}
+			written += int64(n)
+			// Print progress every 200ms
+			if time.Since(lastPrint) > 200*time.Millisecond {
+				if totalSize > 0 {
+					pct := float64(written) / float64(totalSize) * 100
+					bar := progressBar(pct, 30)
+					fmt.Printf("\r   %s %.1f%% (%s / %s)", bar, pct, humanSize(written), humanSize(totalSize))
+				} else {
+					fmt.Printf("\r   %s downloaded", humanSize(written))
+				}
+				lastPrint = time.Now()
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				break
+			}
+			out.Close()
+			os.Remove(tmpFile)
+			fmt.Printf("\n❌ Download error: %v\n", readErr)
+			os.Exit(1)
+		}
+	}
+	out.Close()
+
+	// Final progress
+	if totalSize > 0 {
+		fmt.Printf("\r   %s 100%% (%s)          \n", progressBar(100, 30), humanSize(written))
+	} else {
+		fmt.Printf("\r   Downloaded %s          \n", humanSize(written))
+	}
+
+	// Replace current binary
+	os.Chmod(tmpFile, 0755)
+	backupFile := exe + ".bak"
+	os.Remove(backupFile)
+	if err := os.Rename(exe, backupFile); err != nil {
+		os.Remove(tmpFile)
+		fmt.Printf("❌ Cannot backup current binary: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.Rename(tmpFile, exe); err != nil {
+		// Restore backup
+		os.Rename(backupFile, exe)
+		fmt.Printf("❌ Cannot install new binary: %v\n", err)
+		os.Exit(1)
+	}
+	os.Remove(backupFile)
+
+	fmt.Printf("✅ Updated to %s! Restart bypath to use new version.\n", result.LatestVersion)
+	if result.ReleaseNotes != "" {
+		fmt.Printf("\n   Release notes:\n%s\n", result.ReleaseNotes)
+	}
+	fmt.Printf("\n   Changelog: https://github.com/liberoute/bypath/compare/v%s...v%s\n", result.CurrentVersion, result.LatestVersion)
+}
+
+func progressBar(pct float64, width int) string {
+	filled := int(pct / 100 * float64(width))
+	if filled > width {
+		filled = width
+	}
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+	return "[" + bar + "]"
+}
+
+func humanSize(bytes int64) string {
+	if bytes < 1024 {
+		return fmt.Sprintf("%d B", bytes)
+	} else if bytes < 1024*1024 {
+		return fmt.Sprintf("%.1f KB", float64(bytes)/1024)
+	} else {
+		return fmt.Sprintf("%.1f MB", float64(bytes)/(1024*1024))
 	}
 }
 

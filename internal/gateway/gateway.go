@@ -37,6 +37,9 @@ type Gateway struct {
 	dnsProc     *exec.Cmd
 	tunProc     *exec.Cmd
 
+	// Native TUN state
+	nativeTUN bool // whether sing-box native TUN is active
+
 	// Network info (auto-detected)
 	iface      string // e.g., "eth0", "end0"
 	localIP    string // e.g., "172.16.11.15"
@@ -104,26 +107,55 @@ func (gw *Gateway) Start() error {
 		return fmt.Errorf("starting engine: %w", err)
 	}
 
-	// 4. Start DNS proxy
-	if err := gw.startDNS(); err != nil {
-		log.Printf("⚠️  DNS proxy failed: %v (continuing without DNS)", err)
+	// 4. Native TUN mode vs legacy mode
+	if gw.nativeTUN {
+		// sing-box handles TUN device and DNS natively — no tun2socks/dns2socks needed
+		log.Printf("🚀 Using sing-box native TUN mode (no tun2socks/dns2socks needed)")
+
+		if err := waitForTUNDevice("tun0", 10*time.Second); err != nil {
+			// TUN device didn't appear — fall back to legacy mode
+			log.Printf("⚠️ sing-box native TUN failed, falling back to legacy mode")
+			if err := gw.restartEngineAsLegacy(activeLink); err != nil {
+				return fmt.Errorf("fallback to legacy mode failed: %w", err)
+			}
+			// Continue to legacy mode setup below
+		}
 	}
 
-	// 5. Start tun2socks
-	if gw.config.Gateway.Enabled {
-		if err := gw.startTun(); err != nil {
-			log.Printf("⚠️  TUN setup failed: %v (proxy-only mode)", err)
-			log.Printf("ℹ️  Proxy available at socks5://%s:%d", gw.localIP, gw.socksPort)
-		} else {
-			// 6. Whitelist is now handled inside sing-box via geoip route rules.
-			//    No ipset/iptables needed. Just log it.
+	if gw.nativeTUN {
+		// Native TUN succeeded — configure routing
+		if gw.config.Gateway.Enabled {
 			if len(gw.config.Whitelist.Countries) > 0 {
 				log.Printf("🌍 Whitelist countries %v → routed direct via sing-box geoip rules", gw.config.Whitelist.Countries)
 			}
 
-			// 7. Setup iptables routing (simple: LAN → tun0, no fwmark whitelist)
 			if err := gw.setupRouting(); err != nil {
 				log.Printf("⚠️  Routing setup failed: %v", err)
+			}
+		}
+	} else {
+		// Legacy mode: use tun2socks + dns2socks
+		// 4a. Start DNS proxy
+		if err := gw.startDNS(); err != nil {
+			log.Printf("⚠️  DNS proxy failed: %v (continuing without DNS)", err)
+		}
+
+		// 4b. Start tun2socks
+		if gw.config.Gateway.Enabled {
+			if err := gw.startTun(); err != nil {
+				log.Printf("⚠️  TUN setup failed: %v (proxy-only mode)", err)
+				log.Printf("ℹ️  Proxy available at socks5://%s:%d", gw.localIP, gw.socksPort)
+			} else {
+				// Whitelist is now handled inside sing-box via geoip route rules.
+				// No ipset/iptables needed. Just log it.
+				if len(gw.config.Whitelist.Countries) > 0 {
+					log.Printf("🌍 Whitelist countries %v → routed direct via sing-box geoip rules", gw.config.Whitelist.Countries)
+				}
+
+				// Setup iptables routing (simple: LAN → tun0, no fwmark whitelist)
+				if err := gw.setupRouting(); err != nil {
+					log.Printf("⚠️  Routing setup failed: %v", err)
+				}
 			}
 		}
 	}
@@ -153,33 +185,29 @@ func (gw *Gateway) Stop() {
 
 	log.Println("🛑 Stopping gateway...")
 
-	// Cleanup routing
+	// Cleanup routing (mode-aware: skips TUN device/fwmark cleanup in native TUN mode)
 	gw.cleanupRouting()
 
-	// Stop tun2socks
+	// Stop tun2socks (only exists in legacy mode)
 	if gw.tunProc != nil {
 		gw.tunProc.Process.Kill()
 		gw.tunProc.Wait()
 		log.Println("  ✓ tun2socks stopped")
 	}
 
-	// Stop DNS
+	// Stop DNS (only exists in legacy mode)
 	if gw.dnsProc != nil {
 		gw.dnsProc.Process.Kill()
 		gw.dnsProc.Wait()
 		log.Println("  ✓ DNS proxy stopped")
 	}
 
-	// Stop engine
+	// Stop engine — in native TUN mode, sing-box removes its TUN device on exit
 	if gw.engineProc != nil {
 		gw.engineProc.Process.Kill()
 		gw.engineProc.Wait()
 		log.Println("  ✓ Engine stopped")
 	}
-
-	// Remove TUN device
-	run("ip", "link", "del", "tun0")
-	run("ip", "rule", "del", "fwmark", "0x1", "lookup", "100")
 
 	gw.cancel()
 	log.Println("✅ Gateway stopped")
@@ -318,6 +346,46 @@ func (gw *Gateway) getActiveLink() *profile.Link {
 }
 
 func (gw *Gateway) startEngineWithFallback(link *profile.Link) error {
+	// If NativeTUN is disabled, skip native TUN attempt entirely
+	if !gw.config.Gateway.NativeTUN {
+		gw.nativeTUN = false
+		return gw.startEngineWithLinkFallback(link)
+	}
+
+	// Attempt native TUN mode
+	err := gw.startEngineWithLinkFallback(link)
+	if err != nil {
+		// sing-box failed to start with TUN config — fall back to legacy mode
+		log.Printf("⚠️ sing-box native TUN failed, falling back to legacy mode")
+		gw.nativeTUN = false
+		return gw.restartEngineAsLegacy(link)
+	}
+
+	return nil
+}
+
+// restartEngineAsLegacy kills the current engine process (if any), regenerates config
+// with GatewayMode=false, and restarts the engine in legacy (mixed-inbound) mode.
+func (gw *Gateway) restartEngineAsLegacy(link *profile.Link) error {
+	// Kill the failed engine process
+	if gw.engineProc != nil {
+		gw.engineProc.Process.Kill()
+		gw.engineProc.Wait()
+		gw.engineProc = nil
+	}
+
+	// Temporarily disable NativeTUN so startEngine generates mixed-inbound config
+	origNativeTUN := gw.config.Gateway.NativeTUN
+	gw.config.Gateway.NativeTUN = false
+	defer func() { gw.config.Gateway.NativeTUN = origNativeTUN }()
+
+	gw.nativeTUN = false
+	return gw.startEngineWithLinkFallback(link)
+}
+
+// startEngineWithLinkFallback tries the given link first, then falls back to other links
+// in the same group if the first one fails or can't connect.
+func (gw *Gateway) startEngineWithLinkFallback(link *profile.Link) error {
 	// Try active link first
 	err := gw.startEngine(link)
 	if err == nil {
@@ -414,6 +482,10 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 	if gw.config.SNISpoof.Enabled {
 		configGen.SNISpoof = gw.config.SNISpoof.SNI
 	}
+	if gw.config.Gateway.Enabled && gw.config.Gateway.NativeTUN {
+		configGen.GatewayMode = true
+		configGen.DNSPort = gw.dnsPort
+	}
 	configFile, err := configGen.Generate(eng, link)
 	if err != nil {
 		return fmt.Errorf("generating config: %w", err)
@@ -444,6 +516,12 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 	time.Sleep(2 * time.Second)
 
 	log.Printf("  ✅ %s running on :%d (PID: %d)", eng.Name, gw.socksPort, gw.engineProc.Process.Pid)
+
+	// Mark native TUN as active if we started with gateway mode
+	if gw.config.Gateway.Enabled && gw.config.Gateway.NativeTUN {
+		gw.nativeTUN = true
+	}
+
 	return nil
 }
 
@@ -534,49 +612,76 @@ func (gw *Gateway) startTun() error {
 func (gw *Gateway) setupRouting() error {
 	log.Printf("🔧 Configuring routing...")
 
-	// Enable IP forwarding
+	// Enable IP forwarding (needed in both modes)
 	run("sysctl", "-w", "net.ipv4.ip_forward=1")
 
-	// Policy routing: mark LAN traffic → route through tun0
-	// Table 100: default via tun0 + local subnet direct
-	run("ip", "route", "flush", "table", "100")
-	run("ip", "route", "add", "default", "via", "10.0.0.1", "dev", "tun0", "table", "100")
-	run("ip", "route", "add", gw.subnet, "dev", gw.iface, "table", "100")
+	if gw.nativeTUN {
+		// Native TUN mode: sing-box's auto_route handles policy routing.
+		// We only need NAT masquerade and FORWARD rules for LAN traffic.
+		log.Printf("  ℹ️  Native TUN: skipping fwmark/policy routing (sing-box auto_route handles it)")
 
-	// Mark packets from LAN (not destined to LAN) with fwmark 0x1
-	// Whitelist (geoip IR → direct) is now handled inside sing-box, no ipset needed.
-	run("iptables", "-t", "mangle", "-F", "PREROUTING")
-	run("iptables", "-t", "mangle", "-A", "PREROUTING",
-		"-i", gw.iface,
-		"-s", gw.subnet,
-		"!", "-d", gw.subnet,
-		"-j", "MARK", "--set-mark", "0x1")
+		// NAT masquerade on LAN interface so return traffic finds its way back
+		run("iptables", "-t", "nat", "-F", "POSTROUTING")
+		run("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", gw.iface, "-j", "MASQUERADE")
 
-	// Route marked traffic through table 100
-	run("ip", "rule", "del", "fwmark", "0x1", "lookup", "100")
-	run("ip", "rule", "add", "fwmark", "0x1", "lookup", "100", "prio", "100")
+		// FORWARD rules: allow traffic between LAN interface and tun0
+		run("iptables", "-F", "FORWARD")
+		run("iptables", "-A", "FORWARD", "-i", gw.iface, "-o", "tun0", "-j", "ACCEPT")
+		run("iptables", "-A", "FORWARD", "-i", "tun0", "-o", gw.iface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
+		run("iptables", "-A", "FORWARD", "-i", gw.iface, "-o", gw.iface, "-j", "ACCEPT")
 
-	// NAT
-	run("iptables", "-t", "nat", "-F", "POSTROUTING")
-	run("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", "tun0", "-j", "MASQUERADE")
-	run("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", gw.iface, "-j", "MASQUERADE")
+		log.Printf("  ✅ Routing configured (native TUN: LAN ↔ tun0 via sing-box auto_route)")
+	} else {
+		// Legacy mode: full policy routing with fwmark + route table 100
+		// Table 100: default via tun0 + local subnet direct
+		run("ip", "route", "flush", "table", "100")
+		run("ip", "route", "add", "default", "via", "10.0.0.1", "dev", "tun0", "table", "100")
+		run("ip", "route", "add", gw.subnet, "dev", gw.iface, "table", "100")
 
-	// Forward
-	run("iptables", "-F", "FORWARD")
-	run("iptables", "-A", "FORWARD", "-i", gw.iface, "-o", "tun0", "-j", "ACCEPT")
-	run("iptables", "-A", "FORWARD", "-i", "tun0", "-o", gw.iface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
-	run("iptables", "-A", "FORWARD", "-i", gw.iface, "-o", gw.iface, "-j", "ACCEPT")
+		// Mark packets from LAN (not destined to LAN) with fwmark 0x1
+		// Whitelist (geoip IR → direct) is now handled inside sing-box, no ipset needed.
+		run("iptables", "-t", "mangle", "-F", "PREROUTING")
+		run("iptables", "-t", "mangle", "-A", "PREROUTING",
+			"-i", gw.iface,
+			"-s", gw.subnet,
+			"!", "-d", gw.subnet,
+			"-j", "MARK", "--set-mark", "0x1")
 
-	log.Printf("  ✅ Routing configured (LAN → tun0 → tunnel, whitelist via sing-box geoip)")
+		// Route marked traffic through table 100
+		run("ip", "rule", "del", "fwmark", "0x1", "lookup", "100")
+		run("ip", "rule", "add", "fwmark", "0x1", "lookup", "100", "prio", "100")
+
+		// NAT
+		run("iptables", "-t", "nat", "-F", "POSTROUTING")
+		run("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", "tun0", "-j", "MASQUERADE")
+		run("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", gw.iface, "-j", "MASQUERADE")
+
+		// Forward
+		run("iptables", "-F", "FORWARD")
+		run("iptables", "-A", "FORWARD", "-i", gw.iface, "-o", "tun0", "-j", "ACCEPT")
+		run("iptables", "-A", "FORWARD", "-i", "tun0", "-o", gw.iface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
+		run("iptables", "-A", "FORWARD", "-i", gw.iface, "-o", gw.iface, "-j", "ACCEPT")
+
+		log.Printf("  ✅ Routing configured (LAN → tun0 → tunnel, whitelist via sing-box geoip)")
+	}
+
 	return nil
 }
 
 func (gw *Gateway) cleanupRouting() {
+	// Always clean up iptables rules regardless of mode
 	run("iptables", "-t", "mangle", "-F", "PREROUTING")
 	run("iptables", "-t", "nat", "-F", "POSTROUTING")
 	run("iptables", "-F", "FORWARD")
-	run("ip", "rule", "del", "fwmark", "0x1", "lookup", "100")
-	run("ip", "route", "flush", "table", "100")
+
+	if !gw.nativeTUN {
+		// Legacy mode: also clean up policy routing and TUN device
+		run("ip", "rule", "del", "fwmark", "0x1", "lookup", "100")
+		run("ip", "route", "flush", "table", "100")
+		run("ip", "link", "del", "tun0")
+	}
+	// In native TUN mode: skip ip link del tun0 (sing-box cleans up its own device)
+	// and skip ip rule del fwmark (not used in native TUN mode)
 }
 
 func (gw *Gateway) resolveEngine(protocol string) string {
@@ -645,4 +750,18 @@ func waitForPort(port int, timeout time.Duration) error {
 		time.Sleep(500 * time.Millisecond)
 	}
 	return fmt.Errorf("port %d not ready after %v", port, timeout)
+}
+
+// waitForTUNDevice polls for a network interface to appear within the given timeout.
+// It checks every 500ms using net.InterfaceByName until the interface exists or timeout is reached.
+func waitForTUNDevice(name string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_, err := net.InterfaceByName(name)
+		if err == nil {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("TUN device %q not found after %v", name, timeout)
 }

@@ -9,6 +9,7 @@ server:
 # Gateway mode — clients set DNS/GW to this machine
 gateway:
   enabled: true
+  native_tun: true        # use sing-box native TUN inbound (no tun2socks/dns2socks)
   interface: ""           # auto-detect
   dns_upstream:
     - "1.1.1.1"

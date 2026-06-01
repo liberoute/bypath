@@ -6,14 +6,39 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 )
 
 // FetchSubscription downloads and parses a subscription URL.
 // Returns a list of parsed links.
+// It respects HTTP_PROXY/HTTPS_PROXY/ALL_PROXY environment variables (supports socks5).
 func FetchSubscription(subURL string) ([]*Link, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Check for proxy from environment (supports socks5h:// via ALL_PROXY)
+	proxyURL := os.Getenv("ALL_PROXY")
+	if proxyURL == "" {
+		proxyURL = os.Getenv("all_proxy")
+	}
+	if proxyURL == "" {
+		proxyURL = os.Getenv("https_proxy")
+	}
+	if proxyURL == "" {
+		proxyURL = os.Getenv("HTTPS_PROXY")
+	}
+	if proxyURL != "" {
+		// Convert socks5h:// to socks5:// for Go's proxy support
+		proxyURL = strings.Replace(proxyURL, "socks5h://", "socks5://", 1)
+		if u, err := url.Parse(proxyURL); err == nil {
+			transport.Proxy = http.ProxyURL(u)
+		}
+	}
+	client := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: transport,
+	}
 
 	resp, err := client.Get(subURL)
 	if err != nil {
