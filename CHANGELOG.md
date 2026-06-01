@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.5.1 (2026-06-01)
+
+### Bug Fixes
+- **Updater variant match** — lite build now downloads lite asset, full downloads full (was always downloading full)
+- **Updater proxy retry** — if direct download fails, automatically retries via local SOCKS proxy (gateway connection)
+- **TUI server selection** — uses `systemctl restart` when running under systemd, prevents stale engine processes
+- **TUI gateway status** — properly detects running state via systemd + pgrep fallback
+
 ## v2.5.0 (2026-06-01)
 
 ### Features
