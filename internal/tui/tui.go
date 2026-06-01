@@ -408,23 +408,10 @@ func (m model) handleServersKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, func() tea.Msg {
 					exe, _ := os.Executable()
 					result := runCmdCapture(exe, "select", fmt.Sprintf("%d", idx), "-g", group)
-					pidData, _ := os.ReadFile("./bypath.pid")
-					pidStr := strings.TrimSpace(string(pidData))
-					if pidStr != "" {
-						if _, err := os.Stat(fmt.Sprintf("/proc/%s", pidStr)); err == nil {
-							runCmdCapture(exe, "stop")
-							time.Sleep(2 * time.Second)
-							logFile, _ := os.OpenFile("./bypath.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-							cmd := exec.Command(exe, "run")
-							cmd.Stdout = logFile
-							cmd.Stderr = logFile
-							setSysProcAttr(cmd)
-							cmd.Start()
-							cmd.Process.Release()
-							logFile.Close()
-							time.Sleep(3 * time.Second)
-							result.output += "\n🔄 Gateway restarted with new server"
-						}
+					// Restart gateway if running
+					if isGatewayRunning() {
+						restartGateway(exe)
+						result.output += "\n🔄 Gateway restarted with new server"
 					}
 					return result
 				}
@@ -435,27 +422,10 @@ func (m model) handleServersKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.running = true
 			return m, func() tea.Msg {
 				exe, _ := os.Executable()
-				// Select the link
 				result := runCmdCapture(exe, "select", fmt.Sprintf("%d", link.idx), "-g", group)
-				// If gateway is running, restart it with new link
-				pidData, _ := os.ReadFile("./bypath.pid")
-				pidStr := strings.TrimSpace(string(pidData))
-				if pidStr != "" {
-					if _, err := os.Stat(fmt.Sprintf("/proc/%s", pidStr)); err == nil {
-						// Gateway is running — restart
-						runCmdCapture(exe, "stop")
-						time.Sleep(2 * time.Second)
-						logFile, _ := os.OpenFile("./bypath.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-						cmd := exec.Command(exe, "run")
-						cmd.Stdout = logFile
-						cmd.Stderr = logFile
-						setSysProcAttr(cmd)
-						cmd.Start()
-						cmd.Process.Release()
-						logFile.Close()
-						time.Sleep(3 * time.Second)
-						result.output += "\n🔄 Gateway restarted with new server"
-					}
+				if isGatewayRunning() {
+					restartGateway(exe)
+					result.output += "\n🔄 Gateway restarted with new server"
 				}
 				return result
 			}
@@ -1353,6 +1323,45 @@ func runCmdCapture(name string, args ...string) actionDoneMsg {
 func isProcessRunning(pid int) bool {
 	if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); err == nil { return true }
 	return false
+}
+
+// isGatewayRunning checks if bypath gateway is currently running
+func isGatewayRunning() bool {
+	// Check systemd first
+	out, err := exec.Command("systemctl", "is-active", "bypath").Output()
+	if err == nil && strings.TrimSpace(string(out)) == "active" {
+		return true
+	}
+	// Check pgrep
+	out, err = exec.Command("pgrep", "-f", "bypath run").Output()
+	if err == nil && len(strings.TrimSpace(string(out))) > 0 {
+		return true
+	}
+	return false
+}
+
+// restartGateway restarts the gateway (prefers systemctl, falls back to manual)
+func restartGateway(exe string) {
+	// Try systemctl restart first
+	cmd := exec.Command("systemctl", "is-active", "bypath")
+	out, _ := cmd.Output()
+	if strings.TrimSpace(string(out)) == "active" {
+		exec.Command("systemctl", "restart", "bypath").Run()
+		time.Sleep(3 * time.Second)
+		return
+	}
+	// Manual restart
+	runCmdCapture(exe, "stop")
+	time.Sleep(2 * time.Second)
+	logFile, _ := os.OpenFile("./bypath.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	cmd2 := exec.Command(exe, "run")
+	cmd2.Stdout = logFile
+	cmd2.Stderr = logFile
+	setSysProcAttr(cmd2)
+	cmd2.Start()
+	cmd2.Process.Release()
+	logFile.Close()
+	time.Sleep(3 * time.Second)
 }
 
 func removeSubscription(group string, idx int) error {
