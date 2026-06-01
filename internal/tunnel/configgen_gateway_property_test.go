@@ -292,8 +292,19 @@ func TestProperty_TUNInboundHasCorrectConstantFields(t *testing.T) {
 		}
 
 		// Verify constant fields
-		if tunInbound["inet4_address"] != "10.0.0.1/30" {
-			t.Fatalf("TUN inet4_address: got %v, want \"10.0.0.1/30\"", tunInbound["inet4_address"])
+		addrRaw, ok := tunInbound["address"]
+		if !ok {
+			t.Fatalf("TUN address field missing")
+		}
+		addrOK := false
+		switch v := addrRaw.(type) {
+		case []string:
+			addrOK = len(v) > 0 && v[0] == "10.0.0.1/30"
+		case []interface{}:
+			addrOK = len(v) > 0 && fmt.Sprint(v[0]) == "10.0.0.1/30"
+		}
+		if !addrOK {
+			t.Fatalf("TUN address: got %v, want [\"10.0.0.1/30\"]", addrRaw)
 		}
 		if tunInbound["stack"] != "system" {
 			t.Fatalf("TUN stack: got %v, want \"system\"", tunInbound["stack"])

@@ -146,14 +146,9 @@ func TestBypassDomainsDefaultsApplied(t *testing.T) {
 		t.Fatalf("Load failed: %v", err)
 	}
 
-	expected := []string{"cloudflare.com", "ip-api.com", "ipinfo.io", "api.myip.com"}
+	expected := []string{}
 	if len(cfg.Whitelist.BypassDomains) != len(expected) {
-		t.Fatalf("expected %d bypass domains, got %d", len(expected), len(cfg.Whitelist.BypassDomains))
-	}
-	for i, d := range expected {
-		if cfg.Whitelist.BypassDomains[i] != d {
-			t.Errorf("bypass_domains[%d]: expected %q, got %q", i, d, cfg.Whitelist.BypassDomains[i])
-		}
+		t.Fatalf("expected %d bypass domains (no hardcoded defaults), got %d", len(expected), len(cfg.Whitelist.BypassDomains))
 	}
 }
 

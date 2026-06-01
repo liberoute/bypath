@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"testing"
 
@@ -137,8 +138,20 @@ func TestRoundTrip_GatewayMode_AllProtocols(t *testing.T) {
 			}
 
 			// Verify TUN constant fields (Req 1.4, 1.5, 1.6)
-			if tunInbound["inet4_address"] != "10.0.0.1/30" {
-				t.Errorf("TUN inet4_address: got %v, want \"10.0.0.1/30\"", tunInbound["inet4_address"])
+			addrRaw, ok := tunInbound["address"]
+			if !ok {
+				t.Errorf("TUN address field missing")
+			} else {
+				addrOK := false
+				switch v := addrRaw.(type) {
+				case []string:
+					addrOK = len(v) > 0 && v[0] == "10.0.0.1/30"
+				case []interface{}:
+					addrOK = len(v) > 0 && fmt.Sprint(v[0]) == "10.0.0.1/30"
+				}
+				if !addrOK {
+					t.Errorf("TUN address: got %v, want [\"10.0.0.1/30\"]", addrRaw)
+				}
 			}
 			if tunInbound["stack"] != "system" {
 				t.Errorf("TUN stack: got %v, want \"system\"", tunInbound["stack"])
