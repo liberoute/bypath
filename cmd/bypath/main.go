@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -1436,8 +1437,20 @@ func cmdEngines(args []string) {
 func cmdUpdate() {
 	result, err := updater.Check()
 	if err != nil {
-		fmt.Printf("❌ Update check failed: %v\n", err)
-		os.Exit(1)
+		// Retry check via local SOCKS proxy
+		cfg, cfgErr := config.Load(paths.Get().ConfigFile)
+		socksPort := 2801
+		if cfgErr == nil && cfg.Server.SOCKSPort > 0 {
+			socksPort = cfg.Server.SOCKSPort
+		}
+		proxyAddr := fmt.Sprintf("socks5://127.0.0.1:%d", socksPort)
+		os.Setenv("ALL_PROXY", proxyAddr)
+		result, err = updater.Check()
+		os.Unsetenv("ALL_PROXY")
+		if err != nil {
+			fmt.Printf("❌ Update check failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if !result.Available {
@@ -1458,11 +1471,35 @@ func cmdUpdate() {
 	exe, _ := os.Executable()
 	tmpFile := exe + ".new"
 
+	// Try download: first with env proxy, if fails try via local SOCKS proxy
+	var resp *http.Response
+	var downloadErr error
+
+	// Attempt 1: use environment proxy (or direct)
 	transport := &http.Transport{Proxy: http.ProxyFromEnvironment}
-	client := &http.Client{Timeout: 5 * time.Minute, Transport: transport}
-	resp, err := client.Get(result.DownloadURL)
-	if err != nil {
-		fmt.Printf("❌ Download failed: %v\n", err)
+	client := &http.Client{Timeout: 2 * time.Minute, Transport: transport}
+	resp, downloadErr = client.Get(result.DownloadURL)
+	if downloadErr != nil || (resp != nil && resp.StatusCode != 200) {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		// Attempt 2: try via local SOCKS proxy (gateway connection)
+		fmt.Printf("   ⚠️  Direct download failed, trying via proxy...\n")
+		cfg, cfgErr := config.Load(paths.Get().ConfigFile)
+		socksPort := 2801
+		if cfgErr == nil && cfg.Server.SOCKSPort > 0 {
+			socksPort = cfg.Server.SOCKSPort
+		}
+		proxyURL := fmt.Sprintf("socks5://127.0.0.1:%d", socksPort)
+		if u, parseErr := url.Parse(proxyURL); parseErr == nil {
+			transport2 := &http.Transport{Proxy: http.ProxyURL(u)}
+			client2 := &http.Client{Timeout: 5 * time.Minute, Transport: transport2}
+			resp, downloadErr = client2.Get(result.DownloadURL)
+		}
+	}
+
+	if downloadErr != nil {
+		fmt.Printf("❌ Download failed: %v\n", downloadErr)
 		os.Exit(1)
 	}
 	defer resp.Body.Close()

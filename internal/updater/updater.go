@@ -46,7 +46,8 @@ func Check() (*CheckResult, error) {
 		return &CheckResult{Available: false, CurrentVersion: build.Version}, nil
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	transport := &http.Transport{Proxy: http.ProxyFromEnvironment}
+	client := &http.Client{Timeout: 15 * time.Second, Transport: transport}
 	req, err := http.NewRequest("GET", build.UpdateURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
