@@ -29,11 +29,11 @@ whitelist:
   # Custom geosite download URL (empty = default SagerNet/sing-geosite GitHub releases)
   # geosite_url: ""
   # Domains to route directly (bypass tunnel) for VPN detection bypass
-  # bypass_domains:
-  #   - "cloudflare.com"
-  #   - "ip-api.com"
-  #   - "ipinfo.io"
-  #   - "api.myip.com"
+  bypass_domains:
+    - "cloudflare.com"
+    - "ip-api.com"
+    - "ipinfo.io"
+    - "api.myip.com"
   update_interval: "24h"
 
 # Network namespace isolation for tunnel processes

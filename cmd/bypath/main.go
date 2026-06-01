@@ -1409,6 +1409,7 @@ func cmdStop() {
 
 	// Always cleanup child processes and network
 	exec.Command("pkill", "sing-box").Run()
+	exec.Command("pkill", "-f", "xray run -c /tmp/bypath").Run()
 	exec.Command("pkill", "dns2socks").Run()
 	exec.Command("pkill", "tun2socks").Run()
 	// Cleanup network
@@ -1435,18 +1436,38 @@ func cmdEngines(args []string) {
 }
 
 func cmdUpdate() {
-	result, err := updater.Check()
-	if err != nil {
-		// Retry check via local SOCKS proxy
-		cfg, cfgErr := config.Load(paths.Get().ConfigFile)
-		socksPort := 2801
-		if cfgErr == nil && cfg.Server.SOCKSPort > 0 {
-			socksPort = cfg.Server.SOCKSPort
+	cfg, cfgErr := config.Load(paths.Get().ConfigFile)
+	socksPort := 2801
+	if cfgErr == nil && cfg.Server.SOCKSPort > 0 {
+		socksPort = cfg.Server.SOCKSPort
+	}
+
+	// Check flags
+	useProxy := false
+	for _, arg := range os.Args[2:] {
+		if arg == "--proxy" {
+			useProxy = true
 		}
+		if arg == "--direct" {
+			useProxy = false
+		}
+	}
+
+	if useProxy {
 		proxyAddr := fmt.Sprintf("socks5://127.0.0.1:%d", socksPort)
 		os.Setenv("ALL_PROXY", proxyAddr)
-		result, err = updater.Check()
-		os.Unsetenv("ALL_PROXY")
+		defer os.Unsetenv("ALL_PROXY")
+	}
+
+	result, err := updater.Check()
+	if err != nil {
+		// If direct failed, auto-retry via proxy
+		if !useProxy {
+			proxyAddr := fmt.Sprintf("socks5://127.0.0.1:%d", socksPort)
+			os.Setenv("ALL_PROXY", proxyAddr)
+			result, err = updater.Check()
+			os.Unsetenv("ALL_PROXY")
+		}
 		if err != nil {
 			fmt.Printf("❌ Update check failed: %v\n", err)
 			os.Exit(1)
@@ -1471,30 +1492,23 @@ func cmdUpdate() {
 	exe, _ := os.Executable()
 	tmpFile := exe + ".new"
 
-	// Try download: first with env proxy, if fails try via local SOCKS proxy
-	var resp *http.Response
-	var downloadErr error
-
-	// Attempt 1: use environment proxy (or direct)
+	// Use proxy if user chose it (ALL_PROXY is already set)
 	transport := &http.Transport{Proxy: http.ProxyFromEnvironment}
-	client := &http.Client{Timeout: 2 * time.Minute, Transport: transport}
-	resp, downloadErr = client.Get(result.DownloadURL)
+	client := &http.Client{Timeout: 5 * time.Minute, Transport: transport}
+	resp, downloadErr := client.Get(result.DownloadURL)
 	if downloadErr != nil || (resp != nil && resp.StatusCode != 200) {
 		if resp != nil {
 			resp.Body.Close()
 		}
-		// Attempt 2: try via local SOCKS proxy (gateway connection)
-		fmt.Printf("   ⚠️  Direct download failed, trying via proxy...\n")
-		cfg, cfgErr := config.Load(paths.Get().ConfigFile)
-		socksPort := 2801
-		if cfgErr == nil && cfg.Server.SOCKSPort > 0 {
-			socksPort = cfg.Server.SOCKSPort
-		}
-		proxyURL := fmt.Sprintf("socks5://127.0.0.1:%d", socksPort)
-		if u, parseErr := url.Parse(proxyURL); parseErr == nil {
-			transport2 := &http.Transport{Proxy: http.ProxyURL(u)}
-			client2 := &http.Client{Timeout: 5 * time.Minute, Transport: transport2}
-			resp, downloadErr = client2.Get(result.DownloadURL)
+		// If direct failed and proxy not already set, try proxy as fallback
+		if !useProxy {
+			fmt.Printf("   ⚠️  Direct download failed, trying via proxy...\n")
+			proxyURL := fmt.Sprintf("socks5://127.0.0.1:%d", socksPort)
+			if u, parseErr := url.Parse(proxyURL); parseErr == nil {
+				transport2 := &http.Transport{Proxy: http.ProxyURL(u)}
+				client2 := &http.Client{Timeout: 5 * time.Minute, Transport: transport2}
+				resp, downloadErr = client2.Get(result.DownloadURL)
+			}
 		}
 	}
 
@@ -1785,4 +1799,21 @@ func tmpDir() string {
 // engineDir returns the engine directory for the current installation mode.
 func engineDir() string {
 	return paths.Get().EngineDir
+}
+
+// makeRaw sets terminal to raw mode for arrow key reading (Linux only).
+func makeRaw() ([]byte, error) {
+	// Save current terminal settings
+	out, err := exec.Command("stty", "-g").Output()
+	if err != nil {
+		return nil, err
+	}
+	// Set raw mode (no echo, no canonical)
+	exec.Command("stty", "raw", "-echo").Run()
+	return out, nil
+}
+
+// restoreTerminal restores terminal settings.
+func restoreTerminal(state []byte) {
+	exec.Command("stty", strings.TrimSpace(string(state))).Run()
 }

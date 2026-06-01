@@ -45,5 +45,6 @@ vendor/
 
 # Temporary
 tmp/
+.tmp/
 *.tmp
 *.bak

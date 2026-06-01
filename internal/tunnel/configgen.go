@@ -582,12 +582,12 @@ func (cg *ConfigGenerator) generateSingBox(link *profile.Link) (string, error) {
 // plus the standard Mixed inbound for local SOCKS5/HTTP proxy.
 func (cg *ConfigGenerator) singboxInboundsGateway(link *profile.Link) []map[string]interface{} {
 	tunInbound := map[string]interface{}{
-		"type":          "tun",
-		"tag":           "tun-in",
-		"inet4_address": "10.0.0.1/30",
-		"auto_route":    true,
-		"stack":         "system",
-		"sniff":         true,
+		"type":       "tun",
+		"tag":        "tun-in",
+		"address":    []string{"10.0.0.1/30"},
+		"auto_route": true,
+		"stack":      "system",
+		"sniff":      true,
 	}
 
 	// DNS inbound for LAN clients (sing-box 1.12+ requires separate inbound)
@@ -868,6 +868,12 @@ func (cg *ConfigGenerator) generateXray(link *profile.Link) (string, error) {
 		"log": map[string]interface{}{
 			"loglevel": "warning",
 		},
+		"dns": map[string]interface{}{
+			"servers": []interface{}{
+				"localhost",
+			},
+			"queryStrategy": "UseIPv4",
+		},
 		"inbounds": []map[string]interface{}{
 			{
 				"port":     listenPort,
@@ -877,9 +883,49 @@ func (cg *ConfigGenerator) generateXray(link *profile.Link) (string, error) {
 					"auth": "noauth",
 					"udp":  true,
 				},
+				"sniffing": map[string]interface{}{
+					"enabled":      true,
+					"destOverride": []string{"http", "tls"},
+					"routeOnly":    true,
+				},
 			},
 		},
 		"outbounds": cg.xrayOutbounds(link),
+	}
+
+	// Add routing rules for whitelist countries (geoip-based direct routing)
+	if len(cg.WhitelistCountries) > 0 || len(cg.BypassDomains) > 0 {
+		var rules []map[string]interface{}
+
+		// Private/LAN IPs → direct
+		rules = append(rules, map[string]interface{}{
+			"type":        "field",
+			"ip":          []string{"geoip:private"},
+			"outboundTag": "direct",
+		})
+
+		// Bypass domains → direct
+		if len(cg.BypassDomains) > 0 {
+			rules = append(rules, map[string]interface{}{
+				"type":        "field",
+				"domain":      cg.BypassDomains,
+				"outboundTag": "direct",
+			})
+		}
+
+		// Whitelisted countries → direct (geoip for IP-based matching)
+		for _, country := range cg.WhitelistCountries {
+			rules = append(rules, map[string]interface{}{
+				"type":        "field",
+				"ip":          []string{fmt.Sprintf("geoip:%s", country)},
+				"outboundTag": "direct",
+			})
+		}
+
+		cfg["routing"] = map[string]interface{}{
+			"domainStrategy": "IPOnDemand",
+			"rules":          rules,
+		}
 	}
 
 	return cg.writeJSON("xray", cfg)

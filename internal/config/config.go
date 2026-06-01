@@ -155,12 +155,7 @@ func applyDefaults(cfg *Config) {
 		cfg.Gateway.DNSUpstream = []string{"1.1.1.1", "8.8.8.8"}
 	}
 	if len(cfg.Whitelist.BypassDomains) == 0 {
-		cfg.Whitelist.BypassDomains = []string{
-			"cloudflare.com",
-			"ip-api.com",
-			"ipinfo.io",
-			"api.myip.com",
-		}
+		// No hardcoded defaults — user configures bypass_domains in config.yaml
 	}
 	if cfg.Whitelist.GeositeURL == "" {
 		cfg.Whitelist.GeositeURL = "https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite-{country}.srs"

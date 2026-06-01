@@ -247,7 +247,7 @@ func (m *Manager) GetActiveLink() *Link {
 		return nil
 	}
 	for _, link := range g.Links {
-		if link.Remark == remark {
+		if strings.TrimSpace(link.Remark) == remark {
 			return link
 		}
 	}

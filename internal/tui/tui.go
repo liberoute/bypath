@@ -87,6 +87,8 @@ type model struct {
 	confirmLabel  string
 	confirmYes    bool // true = Yes selected, false = No selected
 	confirmAction string
+	confirmYesLabel string // custom label for Yes button (empty = "Yes")
+	confirmNoLabel  string // custom label for No button (empty = "No")
 	// Bench state (inline in servers tab)
 	benchRunning bool
 	benchDone    bool
@@ -364,7 +366,7 @@ func (m model) executeHomeAction(item homeItem) (tea.Model, tea.Cmd) {
 		m.confirmMode = true
 		m.confirmLabel = "Update bypath to latest version?"
 		m.confirmYes = true // default on Yes
-		m.confirmAction = "do-update"
+		m.confirmAction = "do-update-ask-method"
 		return m, nil
 	default:
 		m.running = true
@@ -675,19 +677,32 @@ func (m model) handleConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.confirmYes = !m.confirmYes
 	case "enter", " ":
 		m.confirmMode = false
+		m.confirmYesLabel = ""
+		m.confirmNoLabel = ""
 		if m.confirmYes {
 			// Execute confirmed action
 			switch {
+			case m.confirmAction == "do-update-ask-method":
+				// Ask download method: Direct or Over Bypath
+				m.confirmMode = true
+				m.confirmLabel = "Download method?"
+				m.confirmYes = false // default on "Over Bypath"
+				m.confirmAction = "do-update-method"
+				m.confirmYesLabel = "Direct"
+				m.confirmNoLabel = "Over Bypath"
+				return m, nil
+			case m.confirmAction == "do-update-method":
+				// "Direct" selected (Yes)
+				exe, _ := os.Executable()
+				shellCmd := fmt.Sprintf(`clear; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo "  Bypath Self-Update (Direct)"; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo; %s update --direct; echo; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo "  ✅ Done. Press Enter to launch new version..."; read; exec %s`, exe, exe)
+				cmd := exec.Command("bash", "-c", shellCmd)
+				return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+					return tea.Quit()
+				})
 			case m.confirmAction == "do-update":
-				proxy := socksAddr()
 				exe, _ := os.Executable()
 				shellCmd := fmt.Sprintf(`clear; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo "  Bypath Self-Update"; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo; %s update; echo; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo "  ✅ Done. Press Enter to launch new version..."; read; exec %s`, exe, exe)
 				cmd := exec.Command("bash", "-c", shellCmd)
-				cmd.Env = append(os.Environ(),
-					"http_proxy="+proxy,
-					"https_proxy="+proxy,
-					"ALL_PROXY="+proxy,
-				)
 				return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
 					return tea.Quit()
 				})
@@ -704,10 +719,35 @@ func (m model) handleConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.output = fmt.Sprintf("✅ Group '%s' deleted", groupName)
 				return m, nil
 			}
+		} else {
+			// "No" selected
+			if m.confirmAction == "do-update-method" {
+				// "Over Bypath" selected (No)
+				exe, _ := os.Executable()
+				proxy := socksAddr()
+				shellCmd := fmt.Sprintf(`clear; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo "  Bypath Self-Update (Over Bypath)"; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo; ALL_PROXY=%s %s update --proxy; echo; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo "  ✅ Done. Press Enter to launch new version..."; read; exec %s`, proxy, exe, exe)
+				cmd := exec.Command("bash", "-c", shellCmd)
+				return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+					return tea.Quit()
+				})
+			}
 		}
 		return m, nil
-	case "esc", "q", "n":
+	case "esc", "q":
 		m.confirmMode = false
+		m.confirmYesLabel = ""
+		m.confirmNoLabel = ""
+		return m, nil
+	case "n":
+		// For download method dialog, "n" should not cancel — use esc for that
+		if m.confirmAction == "do-update-method" {
+			// Toggle to No (Over Bypath) and treat as selection
+			m.confirmYes = false
+			return m, nil
+		}
+		m.confirmMode = false
+		m.confirmYesLabel = ""
+		m.confirmNoLabel = ""
 		return m, nil
 	case "y":
 		m.confirmYes = true
@@ -788,14 +828,21 @@ func (m model) View() string {
 	// Confirm dialog overlay
 	if m.confirmMode {
 		b.WriteString(fmt.Sprintf("\n  %s\n\n", m.confirmLabel))
-		yes := "  Yes  "
-		no := "  No  "
+		yesLabel := "  Yes  "
+		noLabel := "  No  "
+		if m.confirmYesLabel != "" {
+			yesLabel = "  " + m.confirmYesLabel + "  "
+		}
+		if m.confirmNoLabel != "" {
+			noLabel = "  " + m.confirmNoLabel + "  "
+		}
+		var yes, no string
 		if m.confirmYes {
-			yes = activeTabStyle.Render(" Yes ")
-			no = dimStyle.Render(" No ")
+			yes = activeTabStyle.Render(yesLabel)
+			no = dimStyle.Render(noLabel)
 		} else {
-			yes = dimStyle.Render(" Yes ")
-			no = activeTabStyle.Render(" No ")
+			yes = dimStyle.Render(yesLabel)
+			no = activeTabStyle.Render(noLabel)
 		}
 		b.WriteString(fmt.Sprintf("       %s     %s\n\n", yes, no))
 		b.WriteString(dimStyle.Render("  ←→ select • enter confirm • esc cancel"))
@@ -1196,23 +1243,31 @@ func executeAction(action, group string) actionDoneMsg {
 	case "stop":
 		return runCmdCapture(exe, "stop")
 	case "live-status":
-		// Test current connection: relay delay + exit IP
+		// Test current connection: get exit IP from icanhazip, then geo data from ip-api
 		start := time.Now()
 		cmd := exec.Command("curl", "-s", "-x", socksAddr(),
-			"--connect-timeout", "8", "http://ip-api.com/json")
+			"--connect-timeout", "8", "http://icanhazip.com")
 		out, err := cmd.Output()
 		elapsed := time.Since(start).Milliseconds()
-		if err != nil {
+		if err != nil || len(strings.TrimSpace(string(out))) == 0 {
 			return actionDoneMsg{output: "❌ Connection failed (no relay)"}
 		}
-		// Parse response
+		exitIP := strings.TrimSpace(string(out))
+
+		// Get geo data for the exit IP
 		var resp struct {
 			Query   string `json:"query"`
 			Country string `json:"country"`
 			City    string `json:"city"`
 			ISP     string `json:"isp"`
 		}
-		json.Unmarshal(out, &resp)
+		resp.Query = exitIP
+		geoCmd := exec.Command("curl", "-s", "-x", socksAddr(),
+			"--connect-timeout", "5", fmt.Sprintf("http://ip-api.com/json/%s", exitIP))
+		geoOut, geoErr := geoCmd.Output()
+		if geoErr == nil {
+			json.Unmarshal(geoOut, &resp)
+		}
 
 		// Read active link
 		activeData, _ := os.ReadFile(filepath.Join(paths.Get().ProfileDir, ".active"))

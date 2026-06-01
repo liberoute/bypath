@@ -1,5 +1,22 @@
 # Changelog
 
+## v2.5.3 (2026-06-01)
+
+### Bug Fixes
+- **Active link matching** — Fixed trailing whitespace in subscription link remarks causing `GetActiveLink()` to fail silently, falling back to wrong servers
+- **xray stop cleanup** — `bypath stop` now kills xray processes (previously only killed sing-box)
+- **sing-box 1.13 TUN** — Fixed `inet4_address` → `address` field for sing-box 1.10+ compatibility
+
+### Features
+- **xray routing** — xray config now includes `geoip:ir` direct routing and bypass_domains support with sniffing
+- **xray DNS** — Added DNS section and sniffing to xray config for proper domain resolution
+- **Update download choice** — TUI self-update now asks "Direct / Over Bypath" before downloading
+- **Status IP fix** — Live status now uses `icanhazip.com` for IP detection (not affected by bypass_domains)
+- **bypass_domains configurable** — Removed hardcoded bypass_domains defaults; users configure in config.yaml
+
+### Improvements
+- **Build output** — Cross-compile output goes to `.tmp/` (gitignored)
+
 ## v2.5.1 (2026-06-01)
 
 ### Bug Fixes
