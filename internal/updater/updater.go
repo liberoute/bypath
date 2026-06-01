@@ -151,6 +151,7 @@ func CheckAndLog() {
 
 // findAsset determines the expected asset filename for the current platform.
 // Format: bypath-{lite|full}-{os}-{arch}[.exe]
+// Prefers the same variant as the running binary.
 func findAsset(assets []Asset) string {
 	os := runtime.GOOS
 	arch := runtime.GOARCH
@@ -159,11 +160,20 @@ func findAsset(assets []Asset) string {
 		ext = ".exe"
 	}
 
-	// Try full first, then lite
-	patterns := []string{
-		fmt.Sprintf("%s-full-%s-%s%s", strings.ToLower(build.Name), os, arch, ext),
-		fmt.Sprintf("%s-lite-%s-%s%s", strings.ToLower(build.Name), os, arch, ext),
-		fmt.Sprintf("%s-%s-%s%s", strings.ToLower(build.Name), os, arch, ext),
+	// Prefer same variant as current build, then fallback to other
+	var patterns []string
+	if build.Variant == "full" {
+		patterns = []string{
+			fmt.Sprintf("%s-full-%s-%s%s", strings.ToLower(build.Name), os, arch, ext),
+			fmt.Sprintf("%s-lite-%s-%s%s", strings.ToLower(build.Name), os, arch, ext),
+			fmt.Sprintf("%s-%s-%s%s", strings.ToLower(build.Name), os, arch, ext),
+		}
+	} else {
+		patterns = []string{
+			fmt.Sprintf("%s-lite-%s-%s%s", strings.ToLower(build.Name), os, arch, ext),
+			fmt.Sprintf("%s-full-%s-%s%s", strings.ToLower(build.Name), os, arch, ext),
+			fmt.Sprintf("%s-%s-%s%s", strings.ToLower(build.Name), os, arch, ext),
+		}
 	}
 
 	for _, pattern := range patterns {
