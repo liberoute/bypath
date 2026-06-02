@@ -481,6 +481,7 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 	configGen.WhitelistCountries = gw.config.Whitelist.Countries
 	configGen.GeositeCountries = gw.config.Whitelist.GeositeCountries
 	configGen.BypassDomains = gw.config.Whitelist.BypassDomains
+	configGen.DNSUpstream = gw.config.Gateway.DNSUpstream
 	configGen.SOCKSPort = gw.socksPort
 	if gw.config.SNISpoof.Enabled {
 		configGen.SNISpoof = gw.config.SNISpoof.SNI

@@ -1800,20 +1800,3 @@ func tmpDir() string {
 func engineDir() string {
 	return paths.Get().EngineDir
 }
-
-// makeRaw sets terminal to raw mode for arrow key reading (Linux only).
-func makeRaw() ([]byte, error) {
-	// Save current terminal settings
-	out, err := exec.Command("stty", "-g").Output()
-	if err != nil {
-		return nil, err
-	}
-	// Set raw mode (no echo, no canonical)
-	exec.Command("stty", "raw", "-echo").Run()
-	return out, nil
-}
-
-// restoreTerminal restores terminal settings.
-func restoreTerminal(state []byte) {
-	exec.Command("stty", strings.TrimSpace(string(state))).Run()
-}

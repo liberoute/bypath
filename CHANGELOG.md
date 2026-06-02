@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.5.4 (2026-06-02)
+
+### Features
+- **DNSUpstream config** — `gateway.dns_upstream` config field is now passed through to `ConfigGenerator`, enabling custom upstream DNS servers in generated tunnel configs
+
+### Improvements
+- **Code cleanup** — Removed dead code from `internal/tui/bench.go`: unused `benchModel` Tea interface, `testRelayXray()`, `testUpload()`, `sortMode` type and constants (bench UI is embedded in main TUI model; xray bench was never called)
+- **Code cleanup** — Removed unused `makeRaw()` / `restoreTerminal()` helper functions from `cmd/bypath/main.go`
+- **Remove unused files** — Deleted stub/unused files: `internal/gateway/dhcp.go`, `internal/gateway/dns.go`, `internal/gateway/router.go`, `internal/health/health.go`, `internal/isolation/netns.go`
+
 ## v2.5.3 (2026-06-01)
 
 ### Bug Fixes

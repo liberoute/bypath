@@ -18,6 +18,7 @@ type ConfigGenerator struct {
 	WhitelistCountries []string // country codes (e.g. "ir") to route direct via geoip
 	GeositeCountries   []string // country codes (e.g. "ir") to route direct via geosite (domain-based)
 	BypassDomains      []string // domains to route direct (bypass tunnel)
+	DNSUpstream        []string // upstream DNS servers to use in tunnel config
 	SOCKSPort          int      // SOCKS5/mixed listen port (default: 2801)
 	SNISpoof           string   // fake SNI to replace real one (empty = disabled)
 	GatewayMode        bool     // when true, generate TUN inbound + DNS server config
