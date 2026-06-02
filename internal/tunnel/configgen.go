@@ -587,7 +587,6 @@ func (cg *ConfigGenerator) singboxInboundsGateway(link *profile.Link) []map[stri
 		"address":    []string{"10.0.0.1/30"},
 		"auto_route": true,
 		"stack":      "system",
-		"sniff":      true,
 	}
 
 	// DNS inbound for LAN clients (sing-box 1.12+ requires separate inbound)

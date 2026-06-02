@@ -449,12 +449,15 @@ func (gw *Gateway) startEngineWithLinkFallback(link *profile.Link) error {
 }
 
 // verifyConnection checks if the SOCKS proxy actually works.
+// Uses socks5:// (not socks5h://) with a known IP to avoid DNS dependency.
 func (gw *Gateway) verifyConnection() bool {
-	addr := fmt.Sprintf("socks5h://127.0.0.1:%d", gw.socksPort)
-	// Simple TCP test through proxy (socks5h = DNS resolved by proxy)
+	addr := fmt.Sprintf("socks5://127.0.0.1:%d", gw.socksPort)
+	// Use IP directly to avoid DNS dependency (dns2socks may not be up yet)
+	// 1.1.1.1:80 is Cloudflare's reliable public IP
 	cmd := exec.CommandContext(gw.ctx, "curl", "-s", "-x", addr,
 		"--connect-timeout", "10", "-o", "/dev/null", "-w", "%{http_code}",
-		"http://cp.cloudflare.com")
+		"-H", "Host: cp.cloudflare.com",
+		"http://1.1.1.1")
 	out, err := cmd.Output()
 	if err != nil {
 		return false

@@ -5,7 +5,9 @@
 ### Bug Fixes
 - **Active link matching** — Fixed trailing whitespace in subscription link remarks causing `GetActiveLink()` to fail silently, falling back to wrong servers
 - **xray stop cleanup** — `bypath stop` now kills xray processes (previously only killed sing-box)
-- **sing-box 1.13 TUN** — Fixed `inet4_address` → `address` field for sing-box 1.10+ compatibility
+- **sing-box 1.13 TUN** — Fixed `inet4_address` → `address` field and removed deprecated `sniff` from TUN inbound
+- **verifyConnection DNS** — Uses direct IP (`1.1.1.1`) instead of hostname to avoid DNS bootstrap race condition
+- **active link persistence** — Gateway now correctly loads active link from persisted group/remark
 
 ### Features
 - **xray routing** — xray config now includes `geoip:ir` direct routing and bypass_domains support with sniffing
