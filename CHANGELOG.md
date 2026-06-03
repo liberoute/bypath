@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.5.5 (2026-06-03)
+
+### Bug Fixes
+- **Legacy mode DNS poisoning** — In legacy mode (`native_tun: false`), `setupRouting()` now sets `/etc/resolv.conf` to `127.0.0.1` (dns2socks) so processes on the gateway host itself get unblocked DNS. Previously `8.8.8.8` was used directly, which returns poisoned IPs (e.g. `10.10.34.36`) for blocked sites in Iran, causing xray to route them direct via `geoip:ir` instead of through the tunnel.
+- **Chicken-and-egg DNS bootstrap** — Before switching `resolv.conf`, the tunnel server's hostname is pre-resolved and pinned to `/etc/hosts` (tagged `# bypath-pin`). This ensures xray can connect to its server even after DNS is redirected through itself. Entries are cleaned up on `bypath stop`.
+- **systemd-networkd overwriting resolv.conf** — After writing `resolv.conf`, `chattr +i` makes the file immutable so `systemd-networkd` and `dhclient` cannot overwrite it while bypath is running. Removed on cleanup.
+- **xray bypass_domains not working** — `domainStrategy` in xray routing was `IPOnDemand`, which resolves domains to IPs before routing — so domain-based bypass rules never matched. Changed to `AsIs` so SNI-sniffed domain names are matched against bypass rules first.
+
 ## v2.5.4 (2026-06-02)
 
 ### Features

@@ -115,7 +115,7 @@ func (cg *ConfigGenerator) buildChainOutbounds(chainName string, links []*profil
 	outbounds := make([]map[string]interface{}, 0, len(links)+1)
 
 	for i, link := range links {
-		outbound := cg.buildSingboxOutbound(link)
+		outbound := cg.BuildSingboxOutbound(link)
 
 		// Assign unique tag: chain-<chainName>-hop-<index>
 		tag := fmt.Sprintf("chain-%s-hop-%d", chainName, i)
@@ -143,11 +143,11 @@ func (cg *ConfigGenerator) buildChainOutbounds(chainName string, links []*profil
 	return outbounds
 }
 
-// buildSingboxOutbound builds a single sing-box outbound map for a link.
+// BuildSingboxOutbound builds a single sing-box outbound map for a link.
 // This extracts the protocol-specific outbound generation logic so it can be
 // reused by both singboxOutbounds (single-hop) and buildChainOutbounds (multi-hop).
 // The returned map does NOT include "tag" or "detour" — callers set those.
-func (cg *ConfigGenerator) buildSingboxOutbound(link *profile.Link) map[string]interface{} {
+func (cg *ConfigGenerator) BuildSingboxOutbound(link *profile.Link) map[string]interface{} {
 	// Fix comma-separated SNI/Host — take first entry
 	sni := link.SNI
 	host := link.Host
@@ -923,7 +923,11 @@ func (cg *ConfigGenerator) generateXray(link *profile.Link) (string, error) {
 		}
 
 		cfg["routing"] = map[string]interface{}{
-			"domainStrategy": "IPOnDemand",
+			// AsIs: xray routes by domain name first (from sniffed SNI/host),
+			// falling back to IP. This is required for bypass_domains to work —
+			// with IPOnDemand the domain gets resolved to an IP before routing,
+			// so domain-based rules never match.
+			"domainStrategy": "AsIs",
 			"rules":          rules,
 		}
 	}

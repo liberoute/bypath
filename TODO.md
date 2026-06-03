@@ -9,11 +9,11 @@
 - [x] **Remove separate HTTP proxy** — Mixed inbound handles both SOCKS5 and HTTP
 - [x] **TUI port change** — Change SOCKS port from TUI Home tab
 - [x] **sing-box 1.11 DNS fix** — Use `address: "udp://1.1.1.1"` format
-- [ ] **VPN detection bypass** — Mobile carrier apps (Irancell, Hamrah-e-Aval) call `cloudflare.com/cdn-cgi/trace` and detect VPN from the `loc` field. Force these endpoints direct so they always return `loc=IR`. Known domains: `cloudflare.com/cdn-cgi/trace`, `ip-api.com`, `ipinfo.io`, `api.myip.com`.
-- [ ] **sing-box TUN inbound** — Remove tun2socks and dns2socks. Let sing-box create TUN device + handle DNS. Result: one less process, lower latency.
-- [ ] **xray fallback** — If sing-box fails with a config, automatically try xray + tun2socks.
-- [ ] **Reality support** — Read pbk, sid, fingerprint from profile and put in sing-box config. Currently reality links fail silently.
-- [ ] **digikala proxy mode** — digikala.com times out because DNS resolves to non-IR CDN IP via tunnel DNS. Need geosite-ir or domain-based whitelist rules.
+- [x] **VPN detection bypass** — Mobile carrier apps (Irancell, Hamrah-e-Aval) call `cloudflare.com/cdn-cgi/trace` and detect VPN from the `loc` field. Force these endpoints direct so they always return `loc=IR`. Known domains: `cloudflare.com/cdn-cgi/trace`, `ip-api.com`, `ipinfo.io`, `api.myip.com`.
+- [x] **sing-box TUN inbound** — Remove tun2socks and dns2socks. Let sing-box create TUN device + handle DNS. Result: one less process, lower latency.
+- [x] **xray fallback** — If sing-box fails with a config, automatically try xray. `preferred_engine: "xray"` in config. Full xray config generation in configgen.go.
+- [x] **Reality support** — Read pbk, sid, fingerprint from profile and put in sing-box/xray config. Both engines supported.
+- [x] **digikala proxy mode** — Fixed via `domainStrategy: AsIs` in xray config + bypass_domains domain rules now match correctly before IP resolution.
 - [ ] **CDN links HTTPS issue** — CDN-based vless links (Cloudflare Workers, port 443) only relay HTTP, not HTTPS. Need to detect and warn user, or auto-skip for HTTPS-required use.
 
 ## 🟡 Medium
@@ -34,7 +34,7 @@
 - [ ] **Metrics (Prometheus)** — `/metrics` endpoint for monitoring.
 - [ ] **Windows gateway** — WinDivert for routing without TUN.
 - [ ] **mTLS for API** — API accessible only with certificate.
-- [ ] **Multi-hop chain** — hop1 (vmess) → hop2 (wireguard) → internet.
+- [ ] **Multi-hop chain** (In Progress) — hop1 (vmess) → hop2 (wireguard) → internet. (Core configgen & CLI 'add' implemented, API/TUI/Status pending)
 - [ ] **sing-box as Go library** — Instead of spawning process, run in-process (full build).
 - [ ] **xray as Go library** — Same as above for xray.
 - [ ] **Config hot-reload** — Change config without restart.
@@ -45,10 +45,11 @@
 
 ## ✅ Done (moved to CHANGELOG.md)
 
+- VLDR bug with comma-separated SNI lists fixed in configgen and main.go bench.
+
 ## ⚠️ Known Issues
 
 - CDN-based vless links (Cloudflare Workers, port 443 with TLS) only relay HTTP traffic, not HTTPS. These links work for bench (short HTTP test) but fail for real browsing.
-- `VLDR` type links with comma-separated SNI lists need the first-entry fix (done in configgen, but bench uses different code path in main.go — both fixed now).
 - sing-box 1.13 rejects `detour: "direct"` on DNS servers — must use no detour.
 - Gateway verify needs 2s delay after sing-box start (port ready ≠ outbound ready).
 - Some subscription URLs are only accessible via proxy (use `o`/`p` in TUI to update via tunnel).

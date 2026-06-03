@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -667,9 +668,105 @@ func (gw *Gateway) setupRouting() error {
 		run("iptables", "-A", "FORWARD", "-i", gw.iface, "-o", gw.iface, "-j", "ACCEPT")
 
 		log.Printf("  ✅ Routing configured (LAN → tun0 → tunnel, whitelist via sing-box geoip)")
+
+		// Pin the tunnel server's hostname in /etc/hosts BEFORE switching DNS.
+		// This prevents a chicken-and-egg problem: after resolv.conf points to
+		// dns2socks (127.0.0.1), xray needs to resolve the server hostname but
+		// can't do so until xray itself is up and forwarding DNS queries.
+		if gw.engineProc != nil {
+			// engineProc is the xray/sing-box process; find the link that was used
+			if link := gw.profileMgr.GetActiveLink(); link != nil && link.Address != "" {
+				gw.pinHostToEtcHosts(link.Address)
+			}
+		}
+
+		// Point the host's own DNS resolver to dns2socks (127.0.0.1) so that
+		// processes on Orange Pi itself (xray, curl, etc.) get unblocked DNS.
+		// Without this, /etc/resolv.conf points to 8.8.8.8 which is DNS-poisoned
+		// in Iran and returns fake IPs (e.g. 10.10.34.36) for blocked sites.
+		gw.setResolvConf("127.0.0.1")
 	}
 
 	return nil
+}
+
+// pinHostToEtcHosts resolves hostname using the current (pre-switch) DNS and
+// writes a static entry to /etc/hosts. This ensures xray can resolve the
+// tunnel server address even after resolv.conf is switched to 127.0.0.1.
+func (gw *Gateway) pinHostToEtcHosts(hostname string) {
+	// Skip if it's already an IP
+	if net.ParseIP(hostname) != nil {
+		return
+	}
+
+	addrs, err := net.LookupHost(hostname)
+	if err != nil || len(addrs) == 0 {
+		log.Printf("⚠️  Could not pre-resolve %s for /etc/hosts: %v", hostname, err)
+		return
+	}
+	ip := addrs[0]
+
+	marker := "# bypath-pin"
+	entry := fmt.Sprintf("%s %s %s\n", ip, hostname, marker)
+
+	current, _ := os.ReadFile("/etc/hosts")
+	// Remove any existing bypath-pin lines for this host
+	var filtered []string
+	for _, line := range strings.Split(string(current), "\n") {
+		if strings.Contains(line, marker) && strings.Contains(line, hostname) {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	newContent := strings.Join(filtered, "\n")
+	if !strings.HasSuffix(newContent, "\n") {
+		newContent += "\n"
+	}
+	newContent += entry
+
+	if err := os.WriteFile("/etc/hosts", []byte(newContent), 0644); err != nil {
+		log.Printf("⚠️  Could not pin %s to /etc/hosts: %v", hostname, err)
+		return
+	}
+	log.Printf("🔧 Pinned %s → %s in /etc/hosts", hostname, ip)
+}
+
+// unpinHostsFromEtcHosts removes all bypath-pin entries added by pinHostToEtcHosts.
+func (gw *Gateway) unpinHostsFromEtcHosts() {
+	marker := "# bypath-pin"
+	current, err := os.ReadFile("/etc/hosts")
+	if err != nil {
+		return
+	}
+	var filtered []string
+	for _, line := range strings.Split(string(current), "\n") {
+		if strings.Contains(line, marker) {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	os.WriteFile("/etc/hosts", []byte(strings.Join(filtered, "\n")), 0644)
+}
+
+// setResolvConf overwrites /etc/resolv.conf with a single nameserver line.
+// It also makes the file immutable (chattr +i) so systemd-networkd/dhclient
+// cannot overwrite it while bypath is running. On restore, immutability is removed first.
+func (gw *Gateway) setResolvConf(nameserver string) {
+	// Remove immutable flag first (in case it was set from a previous run)
+	exec.Command("chattr", "-i", "/etc/resolv.conf").Run()
+
+	content := fmt.Sprintf("nameserver %s\n", nameserver)
+	if err := os.WriteFile("/etc/resolv.conf", []byte(content), 0644); err != nil {
+		log.Printf("⚠️  Could not update /etc/resolv.conf: %v", err)
+		return
+	}
+
+	// Make immutable so networkd/dhclient can't overwrite it
+	if err := exec.Command("chattr", "+i", "/etc/resolv.conf").Run(); err != nil {
+		log.Printf("⚠️  chattr +i failed (non-ext4?): %v", err)
+	}
+
+	log.Printf("🔧 /etc/resolv.conf → nameserver %s (immutable)", nameserver)
 }
 
 func (gw *Gateway) cleanupRouting() {
@@ -683,6 +780,12 @@ func (gw *Gateway) cleanupRouting() {
 		run("ip", "rule", "del", "fwmark", "0x1", "lookup", "100")
 		run("ip", "route", "flush", "table", "100")
 		run("ip", "link", "del", "tun0")
+
+		// Restore DNS to the real upstream so the system works after bypath stops.
+		gw.setResolvConf("8.8.8.8")
+
+		// Remove pinned hosts entries
+		gw.unpinHostsFromEtcHosts()
 	}
 	// In native TUN mode: skip ip link del tun0 (sing-box cleans up its own device)
 	// and skip ip rule del fwmark (not used in native TUN mode)
