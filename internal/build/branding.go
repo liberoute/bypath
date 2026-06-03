@@ -66,11 +66,26 @@ func PrintVersionInfo() string {
 		}
 	}
 
+	// Gateway helpers (only relevant for lite builds — full build uses native TUN)
+	if Variant == "lite" {
+		sb.WriteString("\nGateway Helpers:\n")
+		helpers := detectHelpers()
+		for _, h := range helpers {
+			sb.WriteString(fmt.Sprintf("  %s\n", h))
+		}
+	}
+
 	// Geo data
 	sb.WriteString("\nGeo Data:\n")
 	geoFiles := detectGeoData()
 	for _, gf := range geoFiles {
-		sb.WriteString(fmt.Sprintf("  %s %s\n", gf.Status, gf.Info))
+		if gf.Status == "" && gf.Info == "" {
+			sb.WriteString("\n")
+		} else if gf.Status == " " {
+			sb.WriteString(fmt.Sprintf("  %s\n", gf.Info))
+		} else {
+			sb.WriteString(fmt.Sprintf("  %s %s\n", gf.Status, gf.Info))
+		}
 	}
 
 	return sb.String()
@@ -89,6 +104,7 @@ func detectEngines() []EngineInfo {
 		{"xray", []string{"xray"}, "version"},
 		{"wireguard-go", []string{"wireguard-go"}, "--version"},
 		{"openvpn", []string{"openvpn"}, "--version"},
+		{"openconnect", []string{"openconnect"}, "--version"},
 		{"clash-meta", []string{"mihomo", "clash-meta"}, "-v"},
 	}
 
@@ -143,19 +159,23 @@ type geoFileInfo struct {
 	Info   string
 }
 
+// KnownCountries is the list of country codes that bypath supports for geo-based routing.
+var KnownCountries = []string{"ir", "cn", "us", "ru", "tr", "de", "fr", "gb", "ae"}
+
 func detectGeoData() []geoFileInfo {
-	paths := []struct {
+	// Standard .db/.dat files (used by sing-box/xray from system packages)
+	stdFiles := []struct {
 		name string
 		locs []string
 	}{
-		{"geoip.db", []string{"./data/geo/geoip.db", "./engines/geoip.db", "/etc/bypath/geo/geoip.db", "/usr/share/sing-box/geoip.db"}},
-		{"geosite.db", []string{"./data/geo/geosite.db", "./engines/geosite.db", "/etc/bypath/geo/geosite.db", "/usr/share/sing-box/geosite.db"}},
-		{"geoip.dat", []string{"./data/geo/geoip.dat", "./engines/geoip.dat", "/etc/bypath/geo/geoip.dat", "/usr/share/xray/geoip.dat"}},
-		{"geosite.dat", []string{"./data/geo/geosite.dat", "./engines/geosite.dat", "/etc/bypath/geo/geosite.dat", "/usr/share/xray/geosite.dat"}},
+		{"geoip.db", []string{"/etc/bypath/geo/geoip.db", "/usr/share/sing-box/geoip.db", "./data/geo/geoip.db"}},
+		{"geosite.db", []string{"/etc/bypath/geo/geosite.db", "/usr/share/sing-box/geosite.db", "./data/geo/geosite.db"}},
+		{"geoip.dat", []string{"/etc/bypath/geo/geoip.dat", "/usr/local/share/xray/geoip.dat", "/usr/share/xray/geoip.dat", "./data/geo/geoip.dat"}},
+		{"geosite.dat", []string{"/etc/bypath/geo/geosite.dat", "/usr/local/share/xray/geosite.dat", "/usr/share/xray/geosite.dat", "./data/geo/geosite.dat"}},
 	}
 
 	var results []geoFileInfo
-	for _, p := range paths {
+	for _, p := range stdFiles {
 		found := false
 		for _, loc := range p.locs {
 			if fileExists(loc) {
@@ -168,7 +188,102 @@ func detectGeoData() []geoFileInfo {
 			results = append(results, geoFileInfo{"❌", fmt.Sprintf("%-14s not found", p.name)})
 		}
 	}
+
+	// Per-country .srs files (used by sing-box rule sets)
+	srsDirs := []string{"/etc/bypath/geo", "./data/geo"}
+	results = append(results, geoFileInfo{"", ""}) // separator
+	results = append(results, geoFileInfo{" ", "Rule Sets (.srs) — per country:"})
+	for _, country := range KnownCountries {
+		geoipFile := fmt.Sprintf("geoip-%s.srs", country)
+		geositeFile := fmt.Sprintf("geosite-%s.srs", country)
+		geoipFound, geositeFound := false, false
+		geoipPath, geositePath := "", ""
+
+		for _, dir := range srsDirs {
+			p := dir + "/" + geoipFile
+			if fileExists(p) {
+				geoipFound = true
+				geoipPath = p
+				break
+			}
+		}
+		for _, dir := range srsDirs {
+			p := dir + "/" + geositeFile
+			if fileExists(p) {
+				geositeFound = true
+				geositePath = p
+				break
+			}
+		}
+
+		_ = geositePath
+		_ = geoipPath
+
+		var status, info string
+		switch {
+		case geoipFound && geositeFound:
+			status = "✅"
+			info = fmt.Sprintf("%-6s geoip ✅  geosite ✅", country)
+		case geoipFound:
+			status = "🟡"
+			info = fmt.Sprintf("%-6s geoip ✅  geosite ❌", country)
+		case geositeFound:
+			status = "🟡"
+			info = fmt.Sprintf("%-6s geoip ❌  geosite ✅", country)
+		default:
+			status = "❌"
+			info = fmt.Sprintf("%-6s not downloaded", country)
+		}
+		results = append(results, geoFileInfo{status, info})
+	}
+
 	return results
+}
+
+// detectHelpers checks for gateway helper binaries (tun2socks, dns2socks).
+// Also validates that found binaries are actually executable on this arch.
+func detectHelpers() []string {
+	type helperDef struct {
+		name    string
+		bins    []string
+		purpose string
+	}
+	defs := []helperDef{
+		{"tun2socks", []string{"tun2socks"}, "TUN gateway (legacy mode)"},
+		{"dns2socks", []string{"dns2socks"}, "DNS-over-SOCKS (legacy mode)"},
+	}
+
+	var results []string
+	for _, def := range defs {
+		found := false
+		for _, bin := range def.bins {
+			path, err := exec.LookPath(bin)
+			if err != nil {
+				continue
+			}
+			// Validate it's actually executable (correct arch)
+			cmd := exec.Command(path, "--version")
+			if err2 := cmd.Run(); err2 != nil {
+				// Check if it's an exec format error (wrong arch)
+				if isExecFormatError(err2) {
+					results = append(results, fmt.Sprintf("⚠️  %-14s found at %s but wrong architecture (exec format error)", def.name, path))
+					found = true
+					break
+				}
+			}
+			results = append(results, fmt.Sprintf("✅ %-14s %s", def.name, path))
+			found = true
+			break
+		}
+		if !found {
+			results = append(results, fmt.Sprintf("❌ %-14s not found — %s won't work", def.name, def.purpose))
+		}
+	}
+	return results
+}
+
+func isExecFormatError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "exec format error")
 }
 
 func getEngineVersion(path, flag string) string {
@@ -193,7 +308,8 @@ func fileExists(path string) bool {
 	if err != nil {
 		return false
 	}
-	return !info.IsDir()
+	// A file with 0 or very few bytes is likely a stub or failed download
+	return !info.IsDir() && info.Size() > 16
 }
 
 func shortCommit() string {

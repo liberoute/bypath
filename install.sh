@@ -4,10 +4,11 @@
 # Interactive installer for Bypath network gateway.
 #
 # Usage:
-#   ./install.sh                    # Interactive (latest, lite)
-#   ./install.sh v2.3.0             # Specific version, lite
-#   ./install.sh v2.3.0 full        # Specific version, full
-#   ./install.sh latest full        # Latest version, full
+#   ./install.sh                                    # Interactive (latest, lite)
+#   ./install.sh v2.3.0                             # Specific version, lite
+#   ./install.sh v2.3.0 full                        # Specific version, full
+#   ./install.sh latest full                        # Latest version, full
+#   ./install.sh latest lite socks5://1.2.3.4:1080  # Use proxy for downloads
 #
 # Environment variables:
 #   BYPATH_INSTALL_DIR   Override install directory (default: /opt/bypath)
@@ -23,6 +24,7 @@ GITHUB_DL="https://github.com/${REPO}/releases/download"
 INSTALL_DIR="${BYPATH_INSTALL_DIR:-/opt/bypath}"
 BINARY_NAME="bypath"
 GEOIP_URL="https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geoip-ir.srs"
+PROXY_ENV=""  # Will be set if --proxy argument is provided
 
 # ─── Colors ──────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -97,9 +99,17 @@ download() {
     local url="$1" dest="$2"
     info "Downloading: $url"
     if command -v curl &>/dev/null; then
-        curl -fSL --progress-bar -o "$dest" "$url" || return 1
+        if [ -n "$PROXY_ENV" ]; then
+            curl -fSL --progress-bar ${PROXY_ENV:+-x "$PROXY_ENV"} -o "$dest" "$url" || return 1
+        else
+            curl -fSL --progress-bar -o "$dest" "$url" || return 1
+        fi
     elif command -v wget &>/dev/null; then
-        wget --show-progress -qO "$dest" "$url" || return 1
+        if [ -n "$PROXY_ENV" ]; then
+            https_proxy="$PROXY_ENV" http_proxy="$PROXY_ENV" wget --show-progress -qO "$dest" "$url" || return 1
+        else
+            wget --show-progress -qO "$dest" "$url" || return 1
+        fi
     fi
 }
 
@@ -135,7 +145,12 @@ pkg_install() {
 
 # ─── Install sing-box ────────────────────────────────────────
 install_sing_box() {
-    local sb_version="1.11.0"
+    # Use latest stable sing-box (1.12+)
+    local sb_version
+    sb_version=$(curl -fsSL ${PROXY_ENV:+-x "$PROXY_ENV"} "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
+        | grep '"tag_name"' | head -1 | sed -E 's/.*"v([^"]+)".*/\1/') || true
+    [ -z "$sb_version" ] && sb_version="1.13.0"
+
     local sb_arch="$ARCH"
     [ "$sb_arch" = "arm" ] && sb_arch="armv7"
 
@@ -171,38 +186,87 @@ install_tun2socks() {
     esac
 
     local t2s_url="https://github.com/xjasonlyu/tun2socks/releases/download/v${t2s_version}/tun2socks-linux-${t2s_arch}.zip"
-    local tmp_zip
+    local tmp_zip tmp_dir
     tmp_zip=$(mktemp)
+    tmp_dir=$(mktemp -d)
 
-    info "Downloading tun2socks v${t2s_version}..."
+    info "Downloading tun2socks v${t2s_version} (${t2s_arch})..."
     if download "$t2s_url" "$tmp_zip"; then
         # Ensure unzip is available
         if ! command -v unzip &>/dev/null; then
             pkg_install unzip >/dev/null 2>&1
         fi
         if command -v unzip &>/dev/null; then
-            unzip -o -q "$tmp_zip" -d /usr/local/bin/ 2>/dev/null
+            unzip -o -q "$tmp_zip" -d "$tmp_dir" 2>/dev/null
         elif command -v python3 &>/dev/null; then
-            python3 -c "import zipfile; zipfile.ZipFile('$tmp_zip').extractall('/usr/local/bin/')" 2>/dev/null
+            python3 -c "import zipfile; zipfile.ZipFile('$tmp_zip').extractall('$tmp_dir')" 2>/dev/null
         else
-            rm -f "$tmp_zip"
+            rm -f "$tmp_zip"; rm -rf "$tmp_dir"
             warn "Cannot extract zip (no unzip or python3)"
             return 1
         fi
-        chmod +x /usr/local/bin/tun2socks-linux-${t2s_arch} 2>/dev/null
-        # Rename to tun2socks
-        if [ -f "/usr/local/bin/tun2socks-linux-${t2s_arch}" ]; then
-            mv /usr/local/bin/tun2socks-linux-${t2s_arch} /usr/local/bin/tun2socks
+
+        # Find the extracted binary (name varies by release)
+        local extracted
+        extracted=$(find "$tmp_dir" -type f -name 'tun2socks*' | head -1)
+        if [ -n "$extracted" ]; then
+            cp "$extracted" /usr/local/bin/tun2socks
+            chmod +x /usr/local/bin/tun2socks
         fi
-        rm -f "$tmp_zip"
+
+        rm -f "$tmp_zip"; rm -rf "$tmp_dir"
+
+        # Validate arch
         if command -v tun2socks &>/dev/null; then
-            ok "tun2socks v${t2s_version} installed"
-            return 0
+            if tun2socks --version >/dev/null 2>&1 || tun2socks -version >/dev/null 2>&1; then
+                ok "tun2socks v${t2s_version} installed (${t2s_arch})"
+                return 0
+            else
+                warn "tun2socks installed but may have arch issues (verify with: tun2socks --version)"
+                ok "tun2socks v${t2s_version} installed (${t2s_arch})"
+                return 0
+            fi
         fi
     fi
-    rm -f "$tmp_zip"
+    rm -f "$tmp_zip"; rm -rf "$tmp_dir"
     warn "Failed to install tun2socks automatically"
     return 1
+}
+
+# ─── Install xray geo data ──────────────────────────────────
+install_xray_geo() {
+    # Download geoip.dat and geosite.dat for xray routing rules
+    local xray_geo_dir="/usr/local/share/xray"
+    mkdir -p "$xray_geo_dir"
+
+    local geoip_url="https://github.com/v2fly/geoip/releases/latest/download/geoip.dat"
+    local geosite_url="https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat"
+
+    if [ ! -f "${xray_geo_dir}/geoip.dat" ]; then
+        info "Downloading xray geoip.dat..."
+        if download "$geoip_url" "${xray_geo_dir}/geoip.dat"; then
+            local size
+            size=$(stat -c%s "${xray_geo_dir}/geoip.dat" 2>/dev/null || echo 0)
+            [ "$size" -gt 1000 ] && ok "xray geoip.dat downloaded" || { rm -f "${xray_geo_dir}/geoip.dat"; warn "xray geoip.dat: download failed"; }
+        else
+            warn "xray geoip.dat: download failed (routing rules may not work)"
+        fi
+    else
+        ok "xray geoip.dat already exists"
+    fi
+
+    if [ ! -f "${xray_geo_dir}/geosite.dat" ]; then
+        info "Downloading xray geosite.dat..."
+        if download "$geosite_url" "${xray_geo_dir}/geosite.dat"; then
+            local size
+            size=$(stat -c%s "${xray_geo_dir}/geosite.dat" 2>/dev/null || echo 0)
+            [ "$size" -gt 1000 ] && ok "xray geosite.dat downloaded" || { rm -f "${xray_geo_dir}/geosite.dat"; warn "xray geosite.dat: download failed"; }
+        else
+            warn "xray geosite.dat: download failed (domain routing may not work)"
+        fi
+    else
+        ok "xray geosite.dat already exists"
+    fi
 }
 
 # ─── Check and install runtime dependencies ──────────────────
@@ -261,7 +325,14 @@ check_deps() {
     # tun2socks (required for gateway mode in lite build)
     if [ "$VARIANT" = "lite" ]; then
         if command -v tun2socks &>/dev/null; then
-            ok "tun2socks found"
+            # Validate arch
+            if tun2socks --version >/dev/null 2>&1 || tun2socks -version >/dev/null 2>&1; then
+                ok "tun2socks found"
+            else
+                warn "tun2socks found but wrong architecture — reinstalling..."
+                rm -f "$(command -v tun2socks)"
+                install_tun2socks || warn "tun2socks reinstall failed"
+            fi
         else
             install_tun2socks || warn "tun2socks not installed — gateway mode won't work without it"
         fi
@@ -274,6 +345,29 @@ check_deps() {
         ok "dns2socks found"
     else
         info "dns2socks not found (optional — DNS will use sing-box built-in)"
+    fi
+
+    # xray (optional but recommended as fallback engine)
+    if command -v xray &>/dev/null; then
+        local xray_ver
+        xray_ver=$(xray version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9.]+' | head -1 || echo "unknown")
+        ok "xray found (v${xray_ver})"
+        # Check xray geo data
+        local xray_geo_dir=""
+        for d in /usr/local/share/xray /usr/share/xray /etc/bypath/geo; do
+            if [ -f "${d}/geoip.dat" ]; then
+                xray_geo_dir="$d"
+                break
+            fi
+        done
+        if [ -n "$xray_geo_dir" ]; then
+            ok "xray geo data found (${xray_geo_dir})"
+        else
+            info "xray geo data not found — downloading..."
+            install_xray_geo
+        fi
+    else
+        info "xray not found (optional — sing-box is the primary engine)"
     fi
 
     echo ""
@@ -295,9 +389,15 @@ install_systemd() {
         return
     fi
 
+    # Skip interactive prompt if no TTY (e.g. piped install)
+    if [ ! -t 0 ] && [ ! -e /dev/tty ]; then
+        info "No TTY detected, skipping systemd service (run with BYPATH_NO_SYSTEMD=0 to force)."
+        return
+    fi
+
     echo ""
     local answer
-    read -rp "$(echo -e "${CYAN}?${NC}  Create systemd service? [Y/n] ")" answer </dev/tty
+    read -rp "$(echo -e "${CYAN}?${NC}  Create systemd service? [Y/n] ")" answer </dev/tty 2>/dev/null || answer="y"
     answer="${answer:-y}"
 
     if [[ ! "$answer" =~ ^[Yy]$ ]]; then
@@ -339,32 +439,94 @@ EOF
     info "Start with:  systemctl start bypath"
 }
 
-# ─── Download geoip-ir.srs ──────────────────────────────────
-install_geoip() {
+# ─── Download geoip/geosite .srs files ──────────────────────
+install_geo() {
     local geo_dir="/etc/bypath/geo"
-    local geo_file="${geo_dir}/geoip-ir.srs"
+    mkdir -p "$geo_dir"
 
-    if [ -f "$geo_file" ]; then
-        info "geoip-ir.srs already exists, skipping."
+    # Countries to download (matches KnownCountries in branding.go)
+    local countries=("ir" "cn" "us" "ru" "tr" "de" "fr" "gb" "ae")
+    # geoip: Chocolate4U (raw GitHub, no redirect issues, covers all countries)
+    local geoip_url_tmpl="https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geoip-COUNTRY.srs"
+    # geosite: Chocolate4U for what they have, SagerNet as fallback
+    # SagerNet geosite uses a specific release tag format
+    local geosite_chocolate_tmpl="https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-COUNTRY.srs"
+    local geosite_sagernet_tmpl="https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-COUNTRY.srs"
+
+    # Check if we already have a valid ir file
+    local ir_size
+    ir_size=$(stat -c%s "${geo_dir}/geoip-ir.srs" 2>/dev/null || echo 0)
+    if [ "$ir_size" -gt 100 ]; then
+        info "Geo files already present, skipping download."
         return
     fi
+
+    # Prompt if TTY available
+    local answer="y"
+    if [ -t 0 ] || [ -e /dev/tty ]; then
+        echo ""
+        read -rp "$(echo -e "${CYAN}?${NC}  Download geo rule sets (geoip+geosite for IR + common countries)? [Y/n] ")" answer </dev/tty 2>/dev/null || answer="y"
+    else
+        info "No TTY — auto-downloading geo rule sets..."
+    fi
+    answer="${answer:-y}"
+    [[ ! "$answer" =~ ^[Yy]$ ]] && { info "Skipping geo download."; return; }
 
     echo ""
-    local answer
-    read -rp "$(echo -e "${CYAN}?${NC}  Download geoip-ir.srs (Iran IP list for whitelist)? [Y/n] ")" answer </dev/tty
-    answer="${answer:-y}"
+    info "Downloading geo rule sets for: ${countries[*]}"
+    local failed=0
 
-    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
-        info "Skipping geoip download."
-        return
-    fi
+    for country in "${countries[@]}"; do
+        local geoip_file="${geo_dir}/geoip-${country}.srs"
+        local geosite_file="${geo_dir}/geosite-${country}.srs"
+        local url size
 
-    mkdir -p "$geo_dir"
-    if download "$GEOIP_URL" "$geo_file"; then
-        ok "geoip-ir.srs downloaded to ${geo_file}"
-    else
-        warn "Failed to download geoip-ir.srs. You can download it manually later."
-    fi
+        # geoip
+        url="${geoip_url_tmpl/COUNTRY/$country}"
+        if download "$url" "$geoip_file" 2>/dev/null; then
+            size=$(stat -c%s "$geoip_file" 2>/dev/null || echo 0)
+            if [ "$size" -gt 100 ]; then
+                ok "geoip-${country}.srs"
+            else
+                rm -f "$geoip_file"
+                warn "geoip-${country}.srs: empty response"
+                failed=$((failed+1))
+            fi
+        else
+            warn "geoip-${country}.srs: download failed"
+            failed=$((failed+1))
+        fi
+
+        # geosite — try Chocolate4U first, fallback to SagerNet raw
+        url="${geosite_chocolate_tmpl/COUNTRY/$country}"
+        local geosite_ok=0
+        if download "$url" "$geosite_file" 2>/dev/null; then
+            size=$(stat -c%s "$geosite_file" 2>/dev/null || echo 0)
+            if [ "$size" -gt 100 ]; then
+                ok "geosite-${country}.srs"
+                geosite_ok=1
+            else
+                rm -f "$geosite_file"
+            fi
+        fi
+        # Fallback to SagerNet raw
+        if [ "$geosite_ok" -eq 0 ]; then
+            url="${geosite_sagernet_tmpl/COUNTRY/$country}"
+            if download "$url" "$geosite_file" 2>/dev/null; then
+                size=$(stat -c%s "$geosite_file" 2>/dev/null || echo 0)
+                if [ "$size" -gt 100 ]; then
+                    ok "geosite-${country}.srs"
+                    geosite_ok=1
+                else
+                    rm -f "$geosite_file"
+                fi
+            fi
+        fi
+        [ "$geosite_ok" -eq 0 ] && warn "geosite-${country}.srs: not available (geoip only)"
+    done
+
+    [ "$failed" -gt 0 ] && warn "${failed} geo files failed — run 'bypath geo update' later to retry"
+    echo ""
 }
 
 # ─── Main ────────────────────────────────────────────────────
@@ -383,6 +545,22 @@ main() {
     # Parse arguments
     local arg_version="${1:-}"
     local arg_variant="${2:-}"
+    local arg_proxy="${3:-}"
+
+    # Check for --proxy flag anywhere in args
+    for arg in "$@"; do
+        if [[ "$arg" == --proxy=* ]]; then
+            arg_proxy="${arg#--proxy=}"
+        elif [[ "$arg" == "--proxy" ]]; then
+            : # handled by next arg, skip
+        fi
+    done
+    # Simple positional: install.sh [version] [variant] [proxy]
+    [ -n "$arg_proxy" ] && PROXY_ENV="$arg_proxy"
+
+    if [ -n "$PROXY_ENV" ]; then
+        ok "Using proxy: ${PROXY_ENV}"
+    fi
 
     # Detect platform
     detect_platform
@@ -402,13 +580,16 @@ main() {
     # Determine variant
     if [ -n "$arg_variant" ]; then
         VARIANT="$arg_variant"
+    elif [ ! -t 0 ] && [ ! -e /dev/tty ]; then
+        VARIANT="lite"
+        info "No TTY, defaulting to lite variant"
     else
         echo ""
         echo -e "  ${CYAN}1)${NC} lite  — Lightweight, requires external sing-box/tun2socks"
         echo -e "  ${CYAN}2)${NC} full  — Batteries included, embeds sing-box engine"
         echo ""
         local choice
-        read -rp "$(echo -e "${CYAN}?${NC}  Select variant [1/2] (default: 1): ")" choice </dev/tty
+        read -rp "$(echo -e "${CYAN}?${NC}  Select variant [1/2] (default: 1): ")" choice </dev/tty 2>/dev/null || choice="1"
         choice="${choice:-1}"
         case "$choice" in
             1|lite)  VARIANT="lite" ;;
@@ -468,6 +649,7 @@ server:
 
 gateway:
   enabled: true
+  native_tun: true
   interface: ""
   dns_upstream:
     - "1.1.1.1"
@@ -480,6 +662,11 @@ engines:
 
 whitelist:
   countries: ["ir"]
+  bypass_domains:
+    - "cloudflare.com"
+    - "ip-api.com"
+    - "ipinfo.io"
+    - "api.myip.com"
   update_interval: "24h"
 
 isolation:
@@ -514,8 +701,8 @@ EOF
         ok "Default profile created: ${profile_file}"
     fi
 
-    # Download geoip
-    install_geoip
+    # Download geo rule sets
+    install_geo
 
     # Check runtime deps
     check_deps

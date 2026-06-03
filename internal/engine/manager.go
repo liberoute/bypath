@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/liberoute/bypath/internal/config"
 )
@@ -146,12 +147,31 @@ func (m *Manager) download(name string) (*Engine, error) {
 		return nil, fmt.Errorf("downloading %s: %w", name, err)
 	}
 
-	// Make executable on Unix
-	if runtime.GOOS != "windows" {
-		os.Chmod(destPath, 0755)
+	// For archives (.zip, .tar.gz), the actual binary was extracted to the engines
+	// directory. Find it by the engine name, not the archive filename.
+	binaryPath := destPath
+	if strings.HasSuffix(destName, ".zip") || strings.HasSuffix(destName, ".tar.gz") || strings.HasSuffix(destName, ".tgz") {
+		// Binary name is the engine name (e.g. "xray", "sing-box")
+		binaryName := name
+		if runtime.GOOS == "windows" {
+			binaryName += ".exe"
+		}
+		binaryPath = filepath.Join(m.config.Directory, binaryName)
+		// Clean up the archive file
+		os.Remove(destPath)
 	}
 
-	return &Engine{Name: name, Path: destPath, Source: "downloaded"}, nil
+	// Make executable on Unix
+	if runtime.GOOS != "windows" {
+		os.Chmod(binaryPath, 0755)
+	}
+
+	// Verify the binary exists and is executable
+	if _, err := os.Stat(binaryPath); err != nil {
+		return nil, fmt.Errorf("binary not found after download/extract at %s: %w", binaryPath, err)
+	}
+
+	return &Engine{Name: name, Path: binaryPath, Source: "downloaded"}, nil
 }
 
 // getDownloadURL returns the download URL for an engine based on OS/Arch.
@@ -161,8 +181,12 @@ func (m *Manager) getDownloadURL(name string) (url string, filename string, err 
 
 	switch name {
 	case "sing-box":
-		ver := "1.11.0"
-		platform := fmt.Sprintf("%s-%s", goos, goarch)
+		ver := "1.13.0"
+		arch := goarch
+		if goarch == "arm" {
+			arch = "armv7"
+		}
+		platform := fmt.Sprintf("%s-%s", goos, arch)
 		ext := ".tar.gz"
 		if goos == "windows" {
 			ext = ".zip"

@@ -386,23 +386,12 @@ func (gw *Gateway) restartEngineAsLegacy(link *profile.Link) error {
 
 // startEngineWithLinkFallback tries the given link first, then falls back to other links
 // in the same group if the first one fails or can't connect.
+// For each link it tries the preferred engine first, then falls back to the alternative
+// engine (sing-box ↔ xray) before moving to the next link.
 func (gw *Gateway) startEngineWithLinkFallback(link *profile.Link) error {
-	// Try active link first
-	err := gw.startEngine(link)
-	if err == nil {
-		// Verify it actually connects
-		if gw.verifyConnection() {
-			return nil
-		}
-		// Connection failed, stop and try next
-		log.Printf("⚠️  Link '%s' started but can't connect, trying next...", link.Remark)
-		if gw.engineProc != nil {
-			gw.engineProc.Process.Kill()
-			gw.engineProc.Wait()
-			gw.engineProc = nil
-		}
-	} else {
-		log.Printf("⚠️  Link '%s' failed to start: %v", link.Remark, err)
+	// Try active link first (with per-link engine fallback)
+	if gw.startEngineWithEngineFallback(link) {
+		return nil
 	}
 
 	// Try other links in the group (use the active link's group, not config default)
@@ -412,7 +401,7 @@ func (gw *Gateway) startEngineWithLinkFallback(link *profile.Link) error {
 	}
 	g, gerr := gw.profileMgr.GetGroup(fallbackGroup)
 	if gerr != nil {
-		return fmt.Errorf("no working link found (original error: %w)", err)
+		return fmt.Errorf("no working link found in group '%s'", fallbackGroup)
 	}
 
 	for _, candidate := range g.Links {
@@ -426,39 +415,114 @@ func (gw *Gateway) startEngineWithLinkFallback(link *profile.Link) error {
 
 		log.Printf("🔄 Trying link: [%s] %s → %s:%d", candidate.Protocol, candidate.Remark, candidate.Address, candidate.Port)
 
-		if startErr := gw.startEngine(candidate); startErr != nil {
-			log.Printf("  ❌ Failed: %v", startErr)
-			continue
-		}
-
-		if gw.verifyConnection() {
-			log.Printf("  ✅ Connected!")
+		if gw.startEngineWithEngineFallback(candidate) {
 			gw.profileMgr.SetActiveLink(candidate)
 			return nil
-		}
-
-		// Didn't work, kill and try next
-		log.Printf("  ❌ No connectivity")
-		if gw.engineProc != nil {
-			gw.engineProc.Process.Kill()
-			gw.engineProc.Wait()
-			gw.engineProc = nil
 		}
 	}
 
 	return fmt.Errorf("no working link found in group '%s'", fallbackGroup)
 }
 
+// startEngineWithEngineFallback tries a link with its preferred engine, then falls back
+// to the alternative engine (sing-box ↔ xray) if the first attempt fails.
+// Returns true if the link is running and verified, false otherwise.
+func (gw *Gateway) startEngineWithEngineFallback(link *profile.Link) bool {
+	primaryEngine := gw.resolveEngine(link.Protocol)
+
+	// Try primary engine
+	if err := gw.startEngine(link); err == nil {
+		if gw.verifyConnection() {
+			return true
+		}
+		log.Printf("  ⚠️  %s started but no connectivity, trying alternative engine...", primaryEngine)
+		if gw.engineProc != nil {
+			gw.engineProc.Process.Kill()
+			gw.engineProc.Wait()
+			gw.engineProc = nil
+		}
+	} else {
+		log.Printf("  ⚠️  %s failed: %v", primaryEngine, err)
+	}
+
+	// Determine alternative engine
+	altEngine := gw.alternativeEngine(primaryEngine, link.Protocol)
+	if altEngine == "" {
+		return false
+	}
+
+	log.Printf("  🔀 Trying alternative engine: %s", altEngine)
+
+	// Temporarily override preferred engine for this attempt
+	origPreferred := gw.config.Engines.PreferredEngine
+	gw.config.Engines.PreferredEngine = altEngine
+	defer func() { gw.config.Engines.PreferredEngine = origPreferred }()
+
+	if err := gw.startEngine(link); err == nil {
+		if gw.verifyConnection() {
+			log.Printf("  ✅ Connected with %s!", altEngine)
+			return true
+		}
+		log.Printf("  ❌ %s also no connectivity", altEngine)
+		if gw.engineProc != nil {
+			gw.engineProc.Process.Kill()
+			gw.engineProc.Wait()
+			gw.engineProc = nil
+		}
+	} else {
+		log.Printf("  ❌ %s also failed: %v", altEngine, err)
+	}
+
+	return false
+}
+
+// alternativeEngine returns the fallback engine for a given primary engine and protocol.
+// Only switches between sing-box and xray for supported protocols.
+// Returns "" if no alternative is available.
+func (gw *Gateway) alternativeEngine(primaryEngine, protocol string) string {
+	// Only sing-box ↔ xray fallback makes sense for these protocols
+	switch protocol {
+	case "vmess", "vless", "trojan", "shadowsocks":
+		// ok to try alternative
+	default:
+		return ""
+	}
+	switch primaryEngine {
+	case "sing-box":
+		if _, err := gw.engineMgr.Get("xray"); err == nil {
+			return "xray"
+		}
+	case "xray":
+		if _, err := gw.engineMgr.Get("sing-box"); err == nil {
+			return "sing-box"
+		}
+	}
+	return ""
+}
+
 // verifyConnection checks if the SOCKS proxy actually works.
 // Uses socks5:// (not socks5h://) with a known IP to avoid DNS dependency.
+// The curl command explicitly uses --interface to bypass any TUN auto_route
+// that might intercept loopback traffic in native TUN mode.
 func (gw *Gateway) verifyConnection() bool {
 	addr := fmt.Sprintf("socks5://127.0.0.1:%d", gw.socksPort)
 	// Use IP directly to avoid DNS dependency (dns2socks may not be up yet)
 	// 1.1.1.1:80 is Cloudflare's reliable public IP
-	cmd := exec.CommandContext(gw.ctx, "curl", "-s", "-x", addr,
-		"--connect-timeout", "10", "-o", "/dev/null", "-w", "%{http_code}",
+	args := []string{
+		"-s", "-x", addr,
+		"--connect-timeout", "10",
+		"--max-time", "15",
+		"-o", "/dev/null", "-w", "%{http_code}",
 		"-H", "Host: cp.cloudflare.com",
-		"http://1.1.1.1")
+	}
+	// In native TUN mode, sing-box auto_route intercepts all traffic including
+	// loopback curl. Bind to the physical interface IP to avoid the TUN.
+	if gw.nativeTUN && gw.localIP != "" {
+		args = append(args, "--interface", gw.localIP)
+	}
+	args = append(args, "http://1.1.1.1")
+
+	cmd := exec.CommandContext(gw.ctx, "curl", args...)
 	out, err := cmd.Output()
 	if err != nil {
 		return false
@@ -482,6 +546,7 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 	configGen.WhitelistCountries = gw.config.Whitelist.Countries
 	configGen.GeositeCountries = gw.config.Whitelist.GeositeCountries
 	configGen.BypassDomains = gw.config.Whitelist.BypassDomains
+	configGen.ForceProxyDomains = gw.config.Whitelist.ForceProxyDomains
 	configGen.DNSUpstream = gw.config.Gateway.DNSUpstream
 	configGen.SOCKSPort = gw.socksPort
 	if gw.config.SNISpoof.Enabled {

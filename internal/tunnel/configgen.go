@@ -18,6 +18,7 @@ type ConfigGenerator struct {
 	WhitelistCountries []string // country codes (e.g. "ir") to route direct via geoip
 	GeositeCountries   []string // country codes (e.g. "ir") to route direct via geosite (domain-based)
 	BypassDomains      []string // domains to route direct (bypass tunnel)
+	ForceProxyDomains  []string // domains to always route through tunnel (override geoip/geosite direct rules)
 	DNSUpstream        []string // upstream DNS servers to use in tunnel config
 	SOCKSPort          int      // SOCKS5/mixed listen port (default: 2801)
 	SNISpoof           string   // fake SNI to replace real one (empty = disabled)
@@ -391,10 +392,16 @@ func (cg *ConfigGenerator) singboxDNS() map[string]interface{} {
 		"final":   "dns-tunnel",
 	}
 
-	// DNS rules: geosite rule_sets → dns-direct (only if geosite files exist)
-	if len(geositeCountries) > 0 {
+	// DNS rules: geosite rule_sets → dns-direct
+	// IMPORTANT: only add DNS rules for geosite files that are actually defined
+	// in the route rule_set section. In legacy mode (GatewayMode=false),
+	// GeositeCountries is empty so we use WhitelistCountries, but we must only
+	// reference tags that will have corresponding rule_set definitions in route.
+	// Route only defines geosite rule_sets when GeositeCountries is non-empty,
+	// so we must be consistent here.
+	if len(cg.GeositeCountries) > 0 {
 		var ruleSetTags []string
-		for _, country := range geositeCountries {
+		for _, country := range cg.GeositeCountries {
 			geositePath := filepath.Join(paths.Get().GeoDir, fmt.Sprintf("geosite-%s.srs", country))
 			if _, err := os.Stat(geositePath); err == nil {
 				ruleSetTags = append(ruleSetTags, fmt.Sprintf("geosite-%s", country))
@@ -461,6 +468,16 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 		"action": "resolve",
 		"server": "dns-direct",
 	})
+
+	// Rule: force proxy domains — always tunnel these, even if IP is in a whitelisted country.
+	// Must come before bypass_domains and geoip/geosite direct rules.
+	if len(cg.ForceProxyDomains) > 0 {
+		rules = append(rules, map[string]interface{}{
+			"domain_suffix": cg.ForceProxyDomains,
+			"action":        "route",
+			"outbound":      "proxy",
+		})
+	}
 
 	// Rule: domain bypass (VPN detection endpoints → direct)
 	if len(cg.BypassDomains) > 0 {
@@ -894,7 +911,7 @@ func (cg *ConfigGenerator) generateXray(link *profile.Link) (string, error) {
 	}
 
 	// Add routing rules for whitelist countries (geoip-based direct routing)
-	if len(cg.WhitelistCountries) > 0 || len(cg.BypassDomains) > 0 {
+	if len(cg.WhitelistCountries) > 0 || len(cg.BypassDomains) > 0 || len(cg.ForceProxyDomains) > 0 {
 		var rules []map[string]interface{}
 
 		// Private/LAN IPs → direct
@@ -903,6 +920,17 @@ func (cg *ConfigGenerator) generateXray(link *profile.Link) (string, error) {
 			"ip":          []string{"geoip:private"},
 			"outboundTag": "direct",
 		})
+
+		// Force proxy domains → proxy (must come before geoip direct rules).
+		// These domains always go through the tunnel even if their IP is in a
+		// whitelisted country (e.g. Iranian sites that are ISP-blocked).
+		if len(cg.ForceProxyDomains) > 0 {
+			rules = append(rules, map[string]interface{}{
+				"type":        "field",
+				"domain":      cg.ForceProxyDomains,
+				"outboundTag": "proxy",
+			})
+		}
 
 		// Bypass domains → direct
 		if len(cg.BypassDomains) > 0 {
@@ -923,11 +951,14 @@ func (cg *ConfigGenerator) generateXray(link *profile.Link) (string, error) {
 		}
 
 		cfg["routing"] = map[string]interface{}{
-			// AsIs: xray routes by domain name first (from sniffed SNI/host),
-			// falling back to IP. This is required for bypass_domains to work —
-			// with IPOnDemand the domain gets resolved to an IP before routing,
-			// so domain-based rules never match.
-			"domainStrategy": "AsIs",
+			// IPIfNonMatch: xray tries domain rules first. If no domain rule matches,
+			// it resolves the IP and tries IP rules (geoip:ir → direct).
+			// This is better than AsIs for socks5h (remote DNS) use case:
+			// - bypass_domains still match by domain name ✓
+			// - force_proxy_domains still match by domain name ✓
+			// - Iranian sites without explicit domain rules get resolved and matched by geoip:ir ✓
+			// Better than IPOnDemand because domain rules (bypass/force) still work.
+			"domainStrategy": "IPIfNonMatch",
 			"rules":          rules,
 		}
 	}

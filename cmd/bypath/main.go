@@ -29,6 +29,7 @@ import (
 	"github.com/liberoute/bypath/internal/pidfile"
 	"github.com/liberoute/bypath/internal/profile"
 	"github.com/liberoute/bypath/internal/tui"
+	"github.com/liberoute/bypath/internal/tunnel"
 	"github.com/liberoute/bypath/internal/updater"
 	"gopkg.in/yaml.v3"
 )
@@ -968,90 +969,23 @@ func buildSSHBenchCmd(ctx context.Context, link *profile.Link, port int) *exec.C
 }
 
 func buildOutbound(link *profile.Link) string {
-	sni := link.SNI
-	host := link.Host
-	// Fix comma-separated SNI/host lists — take first entry
-	if strings.Contains(sni, ",") {
-		sni = strings.TrimSpace(strings.Split(sni, ",")[0])
-	}
-	if strings.Contains(host, ",") {
-		host = strings.TrimSpace(strings.Split(host, ",")[0])
-	}
-
-	switch link.Protocol {
-	case "ssh":
+	if link.Protocol == "ssh" {
 		// SSH doesn't use sing-box outbound config — it runs as a direct process
 		return `{"type":"direct","tag":"proxy"}`
-	case "shadowsocks":
-		return fmt.Sprintf(`{"type":"shadowsocks","tag":"proxy","server":"%s","server_port":%d,"method":"%s","password":"%s"}`,
-			link.Address, link.Port, link.Security, link.UUID)
-	case "vmess":
-		ob := fmt.Sprintf(`{"type":"vmess","tag":"proxy","server":"%s","server_port":%d,"uuid":"%s","alter_id":%d,"security":"%s"`,
-			link.Address, link.Port, link.UUID, link.AlterId, link.Security)
-		if link.Network != "" && link.Network != "tcp" {
-			ob += fmt.Sprintf(`,"transport":{"type":"%s"`, link.Network)
-			if link.Path != "" {
-				ob += fmt.Sprintf(`,"path":"%s"`, link.Path)
-			}
-			if host != "" {
-				ob += fmt.Sprintf(`,"headers":{"Host":"%s"}`, host)
-			}
-			ob += "}"
-		}
-		if link.TLS {
-			ob += `,"tls":{"enabled":true`
-			if sni != "" {
-				ob += fmt.Sprintf(`,"server_name":"%s"`, sni)
-			}
-			ob += "}"
-		}
-		ob += "}"
-		return ob
-	case "vless":
-		ob := fmt.Sprintf(`{"type":"vless","tag":"proxy","server":"%s","server_port":%d,"uuid":"%s"`,
-			link.Address, link.Port, link.UUID)
-		if link.Flow != "" {
-			ob += fmt.Sprintf(`,"flow":"%s"`, link.Flow)
-		}
-		if link.Network != "" && link.Network != "tcp" {
-			ob += fmt.Sprintf(`,"transport":{"type":"%s"`, link.Network)
-			if link.Path != "" {
-				ob += fmt.Sprintf(`,"path":"%s"`, link.Path)
-			}
-			if host != "" {
-				ob += fmt.Sprintf(`,"headers":{"Host":"%s"}`, host)
-			}
-			ob += "}"
-		}
-		if link.Security == "reality" {
-			ob += `,"tls":{"enabled":true`
-			if sni != "" {
-				ob += fmt.Sprintf(`,"server_name":"%s"`, sni)
-			}
-			ob += `,"reality":{"enabled":true`
-			if link.RealityPublicKey != "" {
-				ob += fmt.Sprintf(`,"public_key":"%s"`, link.RealityPublicKey)
-			}
-			if link.RealityShortID != "" {
-				ob += fmt.Sprintf(`,"short_id":"%s"`, link.RealityShortID)
-			}
-			ob += "}"
-			if link.Fingerprint != "" {
-				ob += fmt.Sprintf(`,"utls":{"enabled":true,"fingerprint":"%s"}`, link.Fingerprint)
-			}
-			ob += "}"
-		} else if link.TLS {
-			ob += `,"tls":{"enabled":true,"insecure":true`
-			if sni != "" {
-				ob += fmt.Sprintf(`,"server_name":"%s"`, sni)
-			}
-			ob += "}"
-		}
-		ob += "}"
-		return ob
-	default:
+	}
+
+	cg := &tunnel.ConfigGenerator{}
+	ob := cg.BuildSingboxOutbound(link)
+	if ob == nil {
 		return `{"type":"direct","tag":"proxy"}`
 	}
+	ob["tag"] = "proxy"
+
+	b, err := json.Marshal(ob)
+	if err != nil {
+		return `{"type":"direct","tag":"proxy"}`
+	}
+	return string(b)
 }
 
 func parseMs(s string) int {

@@ -49,6 +49,10 @@ type WhitelistConfig struct {
 	GeositeCountries []string `yaml:"geosite_countries,omitempty"`
 	GeositeURL       string   `yaml:"geosite_url,omitempty"`
 	BypassDomains    []string `yaml:"bypass_domains,omitempty"`
+	// ForceProxyDomains are domains that must always go through the tunnel,
+	// even if their resolved IP falls within a whitelisted country (e.g. geoip:ir).
+	// These rules are evaluated before any geoip/geosite direct rules.
+	ForceProxyDomains []string `yaml:"force_proxy_domains,omitempty"`
 	CustomFile       string   `yaml:"custom_file,omitempty"`
 	UpdateInterval   string   `yaml:"update_interval"`
 }
