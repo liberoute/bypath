@@ -12,7 +12,7 @@ import (
 // These variables are set at build time via ldflags.
 var (
 	Name      = "Bypath"
-	Version   = "2.5.5"
+	Version   = "2.5.6"
 	Org       = "Liberoute"
 	Commit    = "unknown"
 	BuildDate = "unknown"
