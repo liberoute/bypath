@@ -158,18 +158,15 @@ func cmdRun(args []string) {
 		log.Printf("✅ Default config created: %s", configPath)
 	}
 
-	// Check if already running
-	if pid, running := pidfile.IsRunningFromFile(""); running {
-		log.Fatalf("❌ Gateway already running (PID: %d). Use 'bypath stop' first.", pid)
+	pidPath := paths.Get().PidFile
+
+	// Atomically acquire the pidfile — only one instance can run at a time.
+	if existingPID, err := pidfile.TryAcquire(pidPath); err != nil {
+		log.Fatalf("❌ Gateway already running (PID: %d). Use 'bypath stop' first.", existingPID)
 	}
+	defer pidfile.Remove(pidPath)
 
 	log.Printf("🚀 %s starting...", build.FullVersion())
-
-	// Write PID file
-	if err := pidfile.Write(""); err != nil {
-		log.Printf("⚠️  Could not write PID file: %v", err)
-	}
-	defer pidfile.Remove("")
 
 	// Background update check
 	go updater.CheckAndLog()
@@ -1327,11 +1324,13 @@ func cmdChainStatus(args []string) {
 func cmdStop() {
 	fmt.Println("🛑 Stopping gateway...")
 
+	pidPath := paths.Get().PidFile
+
 	// Try PID file first
-	pid, running := pidfile.IsRunningFromFile("")
+	pid, running := pidfile.IsRunningFromFile(pidPath)
 	if running {
 		fmt.Printf("  Stopping bypath (PID: %d)...\n", pid)
-		if err := pidfile.StopFromFile(""); err != nil {
+		if err := pidfile.StopFromFile(pidPath); err != nil {
 			fmt.Printf("  ⚠️  Could not kill process: %v\n", err)
 		} else {
 			fmt.Println("  ✓ bypath stopped")

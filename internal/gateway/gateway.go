@@ -167,8 +167,11 @@ func (gw *Gateway) Start() error {
 	log.Printf("   SOCKS:      :%d", gw.socksPort)
 	log.Printf("   DNS:        :%d", gw.dnsPort)
 	log.Printf("   Tunnel:     %s → %s:%d", activeLink.Protocol, activeLink.Address, activeLink.Port)
-	if gw.config.Gateway.Enabled {
+	gatewayActive := gw.nativeTUN || gw.tunProc != nil
+	if gatewayActive {
 		log.Printf("   Mode:       GATEWAY (set clients GW+DNS to %s)", gw.localIP)
+	} else if gw.config.Gateway.Enabled {
+		log.Printf("   Mode:       PROXY ONLY ⚠️  (gateway requested but TUN unavailable — use socks5://%s:%d)", gw.localIP, gw.socksPort)
 	} else {
 		log.Printf("   Mode:       PROXY ONLY (use socks5://%s:%d)", gw.localIP, gw.socksPort)
 	}
@@ -587,8 +590,9 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 
 	log.Printf("  ✅ %s running on :%d (PID: %d)", eng.Name, gw.socksPort, gw.engineProc.Process.Pid)
 
-	// Mark native TUN as active if we started with gateway mode
-	if gw.config.Gateway.Enabled && gw.config.Gateway.NativeTUN {
+	// Mark native TUN as active only when sing-box started with gateway mode.
+	// xray does not create a TUN device — it provides SOCKS only.
+	if gw.config.Gateway.Enabled && gw.config.Gateway.NativeTUN && eng.Name == "sing-box" {
 		gw.nativeTUN = true
 	}
 

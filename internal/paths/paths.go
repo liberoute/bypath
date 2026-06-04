@@ -44,6 +44,7 @@ type Resolved struct {
 	GeoDir     string
 	EngineDir  string
 	LogDir     string
+	PidFile    string
 }
 
 var current *Resolved
@@ -70,6 +71,7 @@ func Detect() *Resolved {
 			GeoDir:     "/etc/bypath/geo",
 			EngineDir:  "/opt/bypath/engines",
 			LogDir:     "/var/log/bypath",
+			PidFile:    "/var/run/bypath.pid",
 		}
 	} else {
 		current = &Resolved{
@@ -81,6 +83,7 @@ func Detect() *Resolved {
 			GeoDir:     "./data/geo",
 			EngineDir:  "./engines",
 			LogDir:     "",
+			PidFile:    "./bypath.pid",
 		}
 	}
 

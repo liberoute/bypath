@@ -286,8 +286,10 @@ func TestXray_IPIfNonMatch_domainStrategy(t *testing.T) {
 	}
 
 	routing := loadJSON(t, configFile)["routing"].(map[string]interface{})
-	if routing["domainStrategy"] != "IPIfNonMatch" {
-		t.Errorf("domainStrategy = %v, want IPIfNonMatch", routing["domainStrategy"])
+	// AsIs prevents local DNS resolution so ISP-poisoned IPs (e.g. youtube→10.x.x.x)
+	// don't route direct; geosite rules handle domain-based country routing instead.
+	if routing["domainStrategy"] != "AsIs" {
+		t.Errorf("domainStrategy = %v, want AsIs", routing["domainStrategy"])
 	}
 }
 
@@ -459,17 +461,19 @@ func TestXray_PrivateLAN_RoutedDirect(t *testing.T) {
 	for _, r := range rules {
 		if ips, ok := r["ip"].([]interface{}); ok {
 			for _, ip := range ips {
-				if ip == "geoip:private" {
+				// Private IPs now use explicit RFC1918 ranges instead of geoip:private
+				// (geoip:private is not present in all geoip.dat builds)
+				if ip == "10.0.0.0/8" || ip == "192.168.0.0/16" {
 					found = true
 					if r["outboundTag"] != "direct" {
-						t.Errorf("geoip:private outboundTag = %v, want direct", r["outboundTag"])
+						t.Errorf("private IP rule outboundTag = %v, want direct", r["outboundTag"])
 					}
 				}
 			}
 		}
 	}
 	if !found {
-		t.Error("no geoip:private rule — LAN traffic will go through tunnel")
+		t.Error("no private IP rule — LAN traffic will go through tunnel")
 	}
 }
 

@@ -17,6 +17,17 @@
 
 set -euo pipefail
 
+# ─── Interactive mode detection ──────────────────────────────
+# Reliable check: stdin is a real TTY, OR /dev/tty is usable.
+# Avoid [ -e /dev/tty ] alone — the file may exist but be inaccessible
+# (e.g. inside containers or when piped from curl over SSH).
+IS_INTERACTIVE=0
+if [ -t 0 ]; then
+    IS_INTERACTIVE=1
+elif (exec 0</dev/tty) 2>/dev/null; then
+    IS_INTERACTIVE=1
+fi
+
 # ─── Constants ───────────────────────────────────────────────
 REPO="liberoute/bypath"
 GITHUB_API="https://api.github.com/repos/${REPO}/releases"
@@ -234,16 +245,16 @@ install_tun2socks() {
 }
 
 # ─── Install xray geo data ──────────────────────────────────
-install_xray_geo() {
-    # Download geoip.dat and geosite.dat for xray routing rules
-    local xray_geo_dir="/usr/local/share/xray"
+install_xray_geo_dir() {
+    # Download geoip.dat and geosite.dat for xray routing rules into the given directory
+    local xray_geo_dir="${1:-/usr/local/share/xray}"
     mkdir -p "$xray_geo_dir"
 
     local geoip_url="https://github.com/v2fly/geoip/releases/latest/download/geoip.dat"
     local geosite_url="https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat"
 
     if [ ! -f "${xray_geo_dir}/geoip.dat" ]; then
-        info "Downloading xray geoip.dat..."
+        info "Downloading xray geoip.dat to ${xray_geo_dir}..."
         if download "$geoip_url" "${xray_geo_dir}/geoip.dat"; then
             local size
             size=$(stat -c%s "${xray_geo_dir}/geoip.dat" 2>/dev/null || echo 0)
@@ -252,11 +263,11 @@ install_xray_geo() {
             warn "xray geoip.dat: download failed (routing rules may not work)"
         fi
     else
-        ok "xray geoip.dat already exists"
+        ok "xray geoip.dat already exists (${xray_geo_dir})"
     fi
 
     if [ ! -f "${xray_geo_dir}/geosite.dat" ]; then
-        info "Downloading xray geosite.dat..."
+        info "Downloading xray geosite.dat to ${xray_geo_dir}..."
         if download "$geosite_url" "${xray_geo_dir}/geosite.dat"; then
             local size
             size=$(stat -c%s "${xray_geo_dir}/geosite.dat" 2>/dev/null || echo 0)
@@ -265,8 +276,12 @@ install_xray_geo() {
             warn "xray geosite.dat: download failed (domain routing may not work)"
         fi
     else
-        ok "xray geosite.dat already exists"
+        ok "xray geosite.dat already exists (${xray_geo_dir})"
     fi
+}
+
+install_xray_geo() {
+    install_xray_geo_dir "/usr/local/share/xray"
 }
 
 # ─── Check and install runtime dependencies ──────────────────
@@ -348,13 +363,14 @@ check_deps() {
     fi
 
     # xray (optional but recommended as fallback engine)
+    local embedded_xray="${INSTALL_DIR}/engines/xray"
     if command -v xray &>/dev/null; then
         local xray_ver
         xray_ver=$(xray version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9.]+' | head -1 || echo "unknown")
         ok "xray found (v${xray_ver})"
-        # Check xray geo data
+        # Check xray geo data in standard locations
         local xray_geo_dir=""
-        for d in /usr/local/share/xray /usr/share/xray /etc/bypath/geo; do
+        for d in /usr/local/share/xray /usr/share/xray; do
             if [ -f "${d}/geoip.dat" ]; then
                 xray_geo_dir="$d"
                 break
@@ -366,8 +382,19 @@ check_deps() {
             info "xray geo data not found — downloading..."
             install_xray_geo
         fi
+    elif [ -x "$embedded_xray" ]; then
+        local xray_ver
+        xray_ver=$("$embedded_xray" version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9.]+' | head -1 || echo "unknown")
+        ok "xray found (embedded, v${xray_ver})"
     else
         info "xray not found (optional — sing-box is the primary engine)"
+    fi
+
+    # For embedded xray, always ensure geo data exists next to the binary
+    # (xray looks for geoip.dat in its own directory when XRAY_LOCATION_ASSET is not set)
+    if [ -x "$embedded_xray" ] && [ ! -f "${INSTALL_DIR}/engines/geoip.dat" ]; then
+        info "Downloading xray geo data for embedded engine..."
+        install_xray_geo_dir "${INSTALL_DIR}/engines"
     fi
 
     echo ""
@@ -390,7 +417,7 @@ install_systemd() {
     fi
 
     # Skip interactive prompt if no TTY (e.g. piped install)
-    if [ ! -t 0 ] && [ ! -e /dev/tty ]; then
+    if [ "$IS_INTERACTIVE" = "0" ]; then
         info "No TTY detected, skipping systemd service (run with BYPATH_NO_SYSTEMD=0 to force)."
         return
     fi
@@ -463,7 +490,7 @@ install_geo() {
 
     # Prompt if TTY available
     local answer="y"
-    if [ -t 0 ] || [ -e /dev/tty ]; then
+    if [ "$IS_INTERACTIVE" = "1" ]; then
         echo ""
         read -rp "$(echo -e "${CYAN}?${NC}  Download geo rule sets (geoip+geosite for IR + common countries)? [Y/n] ")" answer </dev/tty 2>/dev/null || answer="y"
     else
@@ -580,7 +607,7 @@ main() {
     # Determine variant
     if [ -n "$arg_variant" ]; then
         VARIANT="$arg_variant"
-    elif [ ! -t 0 ] && [ ! -e /dev/tty ]; then
+    elif [ "$IS_INTERACTIVE" = "0" ]; then
         VARIANT="lite"
         info "No TTY, defaulting to lite variant"
     else

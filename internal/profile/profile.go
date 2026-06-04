@@ -24,6 +24,7 @@ type Link struct {
 	Security   string `json:"security,omitempty"`
 	Network    string `json:"network,omitempty"` // tcp, ws, grpc, etc.
 	TLS        bool   `json:"tls,omitempty"`
+	Insecure   bool   `json:"insecure,omitempty"` // skip TLS certificate verification
 	SNI        string `json:"sni,omitempty"`
 	Path       string `json:"path,omitempty"`
 	Host       string `json:"host,omitempty"`

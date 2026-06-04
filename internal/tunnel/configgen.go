@@ -463,12 +463,6 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 		"timeout": "300ms",
 	})
 
-	// Rule: resolve destination IP using direct DNS (for geoip matching)
-	rules = append(rules, map[string]interface{}{
-		"action": "resolve",
-		"server": "dns-direct",
-	})
-
 	// Rule: force proxy domains — always tunnel these, even if IP is in a whitelisted country.
 	// Must come before bypass_domains and geoip/geosite direct rules.
 	if len(cg.ForceProxyDomains) > 0 {
@@ -544,7 +538,7 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 	route := map[string]interface{}{
 		"rules":                  rules,
 		"final":                  "proxy",
-		"default_domain_resolver": "dns-direct",
+		"default_domain_resolver": "dns-tunnel",
 	}
 
 	// Only include rule_set key when there are definitions
@@ -872,6 +866,63 @@ func (cg *ConfigGenerator) singboxOutbounds(link *profile.Link) []map[string]int
 
 // --- xray config generation ---
 
+// xrayDNSConfig builds the xray DNS section.
+//
+// Problem: Iranian ISPs poison DNS for censored sites (youtube.com → 10.x.x.x).
+// That fake IP is in the private range, so xray routes it DIRECT → hits the
+// censorship server → SSL_ERROR_SYSCALL.
+//
+// Fix: route DNS through the proxy outbound (proxyTag) so that youtube.com
+// resolves to a real IP at the exit node, not the local poisoned one.
+//
+// Bootstrap exception: the proxy server itself (link.Address, link.SNI, link.Host)
+// must resolve via localhost — otherwise xray can't connect to the proxy at all,
+// creating a circular dependency.
+func (cg *ConfigGenerator) xrayDNSConfig(link *profile.Link) map[string]interface{} {
+	// Collect hostnames that must resolve locally (proxy server bootstrapping)
+	bootstrapDomains := []string{}
+	seen := map[string]bool{}
+	for _, h := range []string{link.Address, link.SNI, link.Host} {
+		h = strings.TrimSpace(h)
+		if h != "" && !seen[h] {
+			bootstrapDomains = append(bootstrapDomains, "full:"+h)
+			seen[h] = true
+		}
+	}
+	// bypass_domains also resolve locally (they go direct, no need for remote DNS)
+	for _, d := range cg.BypassDomains {
+		d = strings.TrimSpace(d)
+		if d != "" && !seen[d] {
+			bootstrapDomains = append(bootstrapDomains, "domain:"+d)
+			seen[d] = true
+		}
+	}
+
+	servers := []interface{}{}
+
+	// First: proxy-server & direct domains → use local resolver (no proxyTag)
+	if len(bootstrapDomains) > 0 {
+		servers = append(servers, map[string]interface{}{
+			"address": "localhost",
+			"domains": bootstrapDomains,
+		})
+	}
+
+	// Then: everything else → 1.1.1.1 via proxy, so censored domains get real IPs
+	servers = append(servers, map[string]interface{}{
+		"address":  "1.1.1.1",
+		"proxyTag": "proxy",
+	})
+
+	// Fallback
+	servers = append(servers, "localhost")
+
+	return map[string]interface{}{
+		"servers":       servers,
+		"queryStrategy": "UseIPv4",
+	}
+}
+
 func (cg *ConfigGenerator) generateXray(link *profile.Link) (string, error) {
 	listenPort := link.ListenPort
 	if listenPort == 0 {
@@ -886,9 +937,7 @@ func (cg *ConfigGenerator) generateXray(link *profile.Link) (string, error) {
 			"loglevel": "warning",
 		},
 		"dns": map[string]interface{}{
-			"servers": []interface{}{
-				"localhost",
-			},
+			"servers":       []interface{}{"localhost"},
 			"queryStrategy": "UseIPv4",
 		},
 		"inbounds": []map[string]interface{}{
@@ -914,10 +963,11 @@ func (cg *ConfigGenerator) generateXray(link *profile.Link) (string, error) {
 	if len(cg.WhitelistCountries) > 0 || len(cg.BypassDomains) > 0 || len(cg.ForceProxyDomains) > 0 {
 		var rules []map[string]interface{}
 
-		// Private/LAN IPs → direct
+		// Private/LAN IPs → direct (use explicit RFC1918 ranges; geoip:private is not
+		// guaranteed to exist in all geoip.dat builds used by xray)
 		rules = append(rules, map[string]interface{}{
 			"type":        "field",
-			"ip":          []string{"geoip:private"},
+			"ip":          []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "fc00::/7", "::1/128"},
 			"outboundTag": "direct",
 		})
 
@@ -941,7 +991,22 @@ func (cg *ConfigGenerator) generateXray(link *profile.Link) (string, error) {
 			})
 		}
 
-		// Whitelisted countries → direct (geoip for IP-based matching)
+		// Whitelisted countries → direct.
+		//
+		// Strategy: AsIs (no local DNS resolution for routing).
+		//
+		// WHY AsIs: Iranian ISPs poison DNS for blocked sites (youtube.com → 10.x.x.x).
+		// With IPIfNonMatch, xray resolves youtube.com locally → gets 10.x.x.x →
+		// private IP rule routes it DIRECT → hits ISP censorship server.
+		// With AsIs, domains are never resolved locally; the VLESS outbound sends the
+		// original domain to the CDN server which resolves it at the exit node → real IP.
+		//
+		// To compensate for losing geoip-based domain routing, add geosite rules:
+		// - geosite:<country>: domain-based direct routing (AsIs-compatible)
+		// - geoip:<country>: IP-based direct routing (still works for bare-IP traffic)
+		// IP-based whitelist: still works with AsIs for bare-IP connections.
+		// Domain traffic (e.g. youtube.com) bypasses this entirely with AsIs,
+		// which is the point — ISP-poisoned IPs never get routed direct.
 		for _, country := range cg.WhitelistCountries {
 			rules = append(rules, map[string]interface{}{
 				"type":        "field",
@@ -951,14 +1016,7 @@ func (cg *ConfigGenerator) generateXray(link *profile.Link) (string, error) {
 		}
 
 		cfg["routing"] = map[string]interface{}{
-			// IPIfNonMatch: xray tries domain rules first. If no domain rule matches,
-			// it resolves the IP and tries IP rules (geoip:ir → direct).
-			// This is better than AsIs for socks5h (remote DNS) use case:
-			// - bypass_domains still match by domain name ✓
-			// - force_proxy_domains still match by domain name ✓
-			// - Iranian sites without explicit domain rules get resolved and matched by geoip:ir ✓
-			// Better than IPOnDemand because domain rules (bypass/force) still work.
-			"domainStrategy": "IPIfNonMatch",
+			"domainStrategy": "AsIs",
 			"rules":          rules,
 		}
 	}
@@ -992,17 +1050,18 @@ func (cg *ConfigGenerator) xrayOutbounds(link *profile.Link) []map[string]interf
 		// Stream settings
 		stream := map[string]interface{}{"network": link.Network}
 		if link.Network == "ws" {
-			stream["wsSettings"] = map[string]interface{}{
-				"path": link.Path,
-				"headers": map[string]interface{}{
-					"Host": link.Host,
-				},
+			ws := map[string]interface{}{"path": link.Path}
+			if link.Host != "" {
+				// xray 25.x: Host moved to top-level field (headers.Host is deprecated)
+				ws["host"] = link.Host
 			}
+			stream["wsSettings"] = ws
 		}
 		if link.TLS {
 			stream["security"] = "tls"
 			stream["tlsSettings"] = map[string]interface{}{
-				"serverName": link.SNI,
+				"serverName":    link.SNI,
+				"allowInsecure": link.Insecure,
 			}
 		}
 		outbound["streamSettings"] = stream
@@ -1026,6 +1085,13 @@ func (cg *ConfigGenerator) xrayOutbounds(link *profile.Link) []map[string]interf
 			},
 		}
 		stream := map[string]interface{}{"network": link.Network}
+		if link.Network == "ws" {
+			ws := map[string]interface{}{"path": link.Path}
+			if link.Host != "" {
+				ws["host"] = link.Host
+			}
+			stream["wsSettings"] = ws
+		}
 		if link.Security == "reality" {
 			stream["security"] = "reality"
 			realitySettings := map[string]interface{}{
@@ -1040,7 +1106,8 @@ func (cg *ConfigGenerator) xrayOutbounds(link *profile.Link) []map[string]interf
 		} else if link.TLS {
 			stream["security"] = "tls"
 			tlsSettings := map[string]interface{}{
-				"serverName": link.SNI,
+				"serverName":   link.SNI,
+				"allowInsecure": link.Insecure,
 			}
 			if link.Fingerprint != "" {
 				tlsSettings["fingerprint"] = link.Fingerprint

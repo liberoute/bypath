@@ -22,7 +22,6 @@ Desktop.ini
 # IDE
 .idea/
 .vscode/
-.kiro/
 *.swp
 *.swo
 *~
@@ -48,3 +47,9 @@ tmp/
 .tmp/
 *.tmp
 *.bak
+
+# AI Assistants
+.continue/
+.gemini/
+.kiro/
+.claude/

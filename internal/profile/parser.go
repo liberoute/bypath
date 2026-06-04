@@ -136,6 +136,7 @@ func parseVless(uri string) (*Link, error) {
 	}
 	link.Security = params.Get("security")
 	link.TLS = params.Get("security") == "tls" || params.Get("security") == "reality"
+	link.Insecure = params.Get("insecure") == "1" || params.Get("allowInsecure") == "1"
 	link.SNI = params.Get("sni")
 	link.Path = params.Get("path")
 	link.Host = params.Get("host")
