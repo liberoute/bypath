@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 )
@@ -132,14 +133,20 @@ func detectEngines() []EngineInfo {
 			}
 		}
 
-		// Check local ./engines/ directory
+		// Check engines/ directory relative to binary (works for both local and installed modes)
 		if info.Source == "not found" {
+			enginesDir := "./engines"
+			if exePath, err := os.Executable(); err == nil {
+				if resolved, err := filepath.EvalSymlinks(exePath); err == nil {
+					enginesDir = filepath.Join(filepath.Dir(resolved), "engines")
+				}
+			}
 			for _, bin := range def.bins {
-				localPath := "./engines/" + bin
+				localPath := filepath.Join(enginesDir, bin)
 				if runtime.GOOS == "windows" {
 					localPath += ".exe"
 				}
-				if _, err := exec.LookPath(localPath); err == nil {
+				if _, err := os.Stat(localPath); err == nil {
 					info.Path = localPath
 					info.Source = "local"
 					info.Version = getEngineVersion(localPath, def.verFlag)

@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/gorilla/mux"
+	"github.com/liberoute/bypath/internal/build"
 	"github.com/liberoute/bypath/internal/profile"
 )
 
@@ -17,7 +18,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	whitelistStats := s.gateway.GetWhitelistManager().GetStats()
 
 	status := map[string]interface{}{
-		"version":   "2.0.0",
+		"version":   build.Version,
 		"tunnels":   tunnelStatus,
 		"chains":    chainStatus,
 		"whitelist": whitelistStats,
