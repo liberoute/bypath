@@ -242,6 +242,12 @@ func (cg *ConfigGenerator) BuildSingboxOutbound(link *profile.Link) map[string]i
 			if sni != "" {
 				tls["server_name"] = sni
 			}
+			if link.Fingerprint != "" {
+				tls["utls"] = map[string]interface{}{
+					"enabled":     true,
+					"fingerprint": link.Fingerprint,
+				}
+			}
 			outbound["tls"] = tls
 		}
 
@@ -644,214 +650,20 @@ func (cg *ConfigGenerator) singboxInbounds(link *profile.Link) []map[string]inte
 }
 
 func (cg *ConfigGenerator) singboxOutbounds(link *profile.Link) []map[string]interface{} {
-	var outbound map[string]interface{}
-
-	// Fix comma-separated SNI/Host — take first entry
-	sni := link.SNI
-	host := link.Host
-	if strings.Contains(sni, ",") {
-		sni = strings.TrimSpace(strings.Split(sni, ",")[0])
+	outbound := cg.BuildSingboxOutbound(link)
+	if outbound == nil {
+		outbound = map[string]interface{}{"type": "direct"}
 	}
-	if strings.Contains(host, ",") {
-		host = strings.TrimSpace(strings.Split(host, ",")[0])
-	}
-	// Apply SNI spoof if configured
-	if cg.SNISpoof != "" && sni != "" {
-		sni = cg.SNISpoof
-	}
+	outbound["tag"] = "proxy"
 
-	switch link.Protocol {
-	case "vmess":
-		outbound = map[string]interface{}{
-			"type":       "vmess",
-			"tag":        "proxy",
-			"server":     link.Address,
-			"server_port": link.Port,
-			"uuid":       link.UUID,
-			"alter_id":   link.AlterId,
-			"security":   link.Security,
-		}
-		// Transport
-		if link.Network != "" && link.Network != "tcp" {
-			transport := map[string]interface{}{"type": link.Network}
-			if link.Path != "" {
-				transport["path"] = link.Path
-			}
-			if host != "" {
-				transport["headers"] = map[string]interface{}{
-					"Host": host,
-				}
-			}
-			outbound["transport"] = transport
-		}
-		// TLS
-		if link.TLS {
-			tls := map[string]interface{}{"enabled": true}
-			if sni != "" {
-				tls["server_name"] = sni
-			}
-			outbound["tls"] = tls
-		}
-
-	case "vless":
-		outbound = map[string]interface{}{
-			"type":       "vless",
-			"tag":        "proxy",
-			"server":     link.Address,
-			"server_port": link.Port,
-			"uuid":       link.UUID,
-		}
-		if link.Flow != "" {
-			outbound["flow"] = link.Flow
-		}
-		// Transport
-		if link.Network != "" && link.Network != "tcp" {
-			transport := map[string]interface{}{"type": link.Network}
-			if link.Path != "" {
-				transport["path"] = link.Path
-			}
-			if host != "" {
-				transport["headers"] = map[string]interface{}{
-					"Host": host,
-				}
-			}
-			outbound["transport"] = transport
-		}
-		// TLS
-		if link.TLS {
-			tls := map[string]interface{}{"enabled": true}
-			if sni != "" {
-				tls["server_name"] = sni
-			}
-
-			if link.Security == "reality" {
-				// Reality-specific TLS config
-				reality := map[string]interface{}{"enabled": true}
-				if link.RealityPublicKey != "" {
-					reality["public_key"] = link.RealityPublicKey
-				}
-				if link.RealityShortID != "" {
-					reality["short_id"] = link.RealityShortID
-				}
-				tls["reality"] = reality
-			} else {
-				tls["insecure"] = true
-			}
-
-			if link.Fingerprint != "" {
-				tls["utls"] = map[string]interface{}{
-					"enabled":     true,
-					"fingerprint": link.Fingerprint,
-				}
-			}
-
-			outbound["tls"] = tls
-		}
-
-	case "trojan":
-		outbound = map[string]interface{}{
-			"type":       "trojan",
-			"tag":        "proxy",
-			"server":     link.Address,
-			"server_port": link.Port,
-			"password":   link.UUID,
-		}
-		// TLS (always enabled for trojan)
-		tls := map[string]interface{}{"enabled": true}
-		if sni != "" {
-			tls["server_name"] = sni
-		}
-		outbound["tls"] = tls
-		// Transport
-		if link.Network != "" && link.Network != "tcp" {
-			transport := map[string]interface{}{"type": link.Network}
-			if link.Path != "" {
-				transport["path"] = link.Path
-			}
-			outbound["transport"] = transport
-		}
-
-	case "shadowsocks":
-		outbound = map[string]interface{}{
-			"type":       "shadowsocks",
-			"tag":        "proxy",
-			"server":     link.Address,
-			"server_port": link.Port,
-			"method":     link.Security,
-			"password":   link.UUID,
-		}
-
-	case "wireguard":
-		outbound = map[string]interface{}{
-			"type":        "wireguard",
-			"tag":         "proxy",
-			"server":      link.Address,
-			"server_port": link.Port,
-			"private_key": link.PrivateKey,
-			"peer_public_key": link.PublicKey,
-			"local_address": []string{"10.0.0.2/32"},
-		}
-
-	case "socks5":
-		outbound = map[string]interface{}{
-			"type":       "socks",
-			"tag":        "proxy",
-			"server":     link.Address,
-			"server_port": link.Port,
-			"version":    "5",
-		}
-		if link.UUID != "" {
-			outbound["username"] = link.UUID
-			outbound["password"] = link.Security
-		}
-
-	case "http":
-		outbound = map[string]interface{}{
-			"type":       "http",
-			"tag":        "proxy",
-			"server":     link.Address,
-			"server_port": link.Port,
-		}
-		if link.UUID != "" {
-			outbound["username"] = link.UUID
-			outbound["password"] = link.Security
-		}
-		if link.TLS {
-			outbound["tls"] = map[string]interface{}{"enabled": true}
-		}
-
-	case "ssh":
-		// SSH tunnels run as a local SOCKS5 proxy (ssh -D). In chain/detour
-		// scenarios, reference the SSH hop via its local listen port.
-		port := link.ListenPort
-		if port == 0 {
-			port = 10800 // default chain port
-		}
-		outbound = map[string]interface{}{
-			"type":       "socks",
-			"tag":        "proxy",
-			"server":     "127.0.0.1",
-			"server_port": port,
-			"version":    "5",
-		}
-
-	default:
-		outbound = map[string]interface{}{
-			"type": "direct",
-			"tag":  "proxy",
-		}
-	}
-
-	// If this hop is chained, add detour through previous hop's SOCKS
 	if link.ChainProxy != "" {
 		outbound["detour"] = "chain-out"
-		// Add a SOCKS outbound for the chain
 		return []map[string]interface{}{
 			outbound,
 			{
-				"type":       "socks",
-				"tag":        "chain-out",
-				"server":     "127.0.0.1",
+				"type":        "socks",
+				"tag":         "chain-out",
+				"server":      "127.0.0.1",
 				"server_port": extractPort(link.ChainProxy),
 			},
 			{"type": "direct", "tag": "direct"},
