@@ -48,6 +48,9 @@ tmp/
 *.tmp
 *.bak
 
+# Test artifacts
+**/testdata/rapid/
+
 # AI Assistants
 .continue/
 .gemini/
