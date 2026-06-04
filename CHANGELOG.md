@@ -1,5 +1,20 @@
 # Changelog
 
+## v2.5.7 (2026-06-04)
+
+### Bug Fixes
+- **xray DNS poisoning (native TUN)** — `domainStrategy` changed from `IPIfNonMatch` to `AsIs`. Iranian ISPs poison DNS (e.g. `youtube.com → 10.10.34.36`); with `IPIfNonMatch`, that fake private IP was routed direct to the censorship server. With `AsIs`, domains are never resolved locally before routing.
+- **xray VLESS/WS** — Added `wsSettings` with `host` header to xray outbound config; added `allowInsecure: true` to `tlsSettings`. Previously missing, causing WS transport connections to fail.
+- **xray geoip** — Replaced `geoip:private` rule with explicit RFC1918 ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`). Standalone xray does not include `geoip:private` in its built-in database.
+- **Engine detection** — `detectEngines()` in `bypath version` now resolves the `engines/` directory relative to the binary path (via `os.Executable()`). Previously used `./engines/` (CWD-relative), so xray appeared as "not found" in installed mode even when present at `/opt/bypath/engines/xray`.
+- **Multiple instances** — Pidfile now uses atomic `O_EXCL` creation + `syscall.Signal(0)` liveness check. A `nil` dereference bug caused the stale-PID check to always fail, allowing multiple concurrent daemon instances.
+- **API version** — `/api/v1/status` endpoint now returns the real build version instead of hardcoded `"2.0.0"`.
+- **VLESS fingerprint** — Non-reality VLESS TLS was missing `utls`/`fingerprint` support in `BuildSingboxOutbound`. Fixed; property test now covers both reality and standard-TLS fingerprint paths.
+
+### Improvements
+- **`singboxOutbounds` refactor** — Removed ~200 lines of duplicated protocol switch; now delegates to `BuildSingboxOutbound` and adds tag + chain proxy logic.
+- **`install.sh`** — Downloads `geoip.dat`/`geosite.dat` for xray engine if xray is installed but geo data is missing. Fixed `/dev/tty` access in non-interactive (piped curl) installs.
+
 ## v2.5.5 (2026-06-03)
 
 ### Bug Fixes
