@@ -12,6 +12,7 @@ Iranian IPs go direct (no tunnel). Everything else goes through your proxy serve
 - **Subscription support** — add URL, auto-fetch links, auto-group by domain
 - **Parallel speed test** — test all servers simultaneously, auto-select best
 - **Interactive TUI** — tab-based terminal UI (Home / Servers / Subscriptions)
+- **Dual engine** — sing-box (default) + xray as fallback; configurable per-deployment
 - **Auto-fallback** — if a link fails, tries the next one
 - **Mixed proxy** — SOCKS5 + HTTP on configurable port (default: 2801)
 - **API authentication** — token-based auth for REST API
@@ -152,11 +153,11 @@ Bypath auto-detects its installation mode:
 | | Local (./bypath) | Installed (system) |
 |---|---|---|
 | Config | `configs/default.yaml` | `/etc/bypath/config.yaml` |
-| Profiles | `./data/profiles/` | `/var/lib/bypath/profiles/` |
-| Temp | `./data/tmp/` | `/var/lib/bypath/tmp/` |
-| Geo data | `./data/geo/` | `/var/lib/bypath/geo/` |
+| Profiles | `./data/profiles/` | `/etc/bypath/profiles/` |
+| Temp | `./data/tmp/` | `/tmp/bypath-<pid>/` |
+| Geo data | `./data/geo/` | `/etc/bypath/geo/` |
 | Engines | `./engines/` | `/opt/bypath/engines/` |
-| Logs | stdout | `/var/log/bypath/error.log` |
+| Logs | stdout | `/var/log/bypath/` |
 
 Detection: if binary is in `/opt/bypath/`, `/usr/local/bin/`, or `/usr/bin/`, or `/etc/bypath/config.yaml` exists → installed mode.
 
@@ -223,10 +224,11 @@ All dependencies are auto-installed by `install.sh`. For manual setup:
 |---|---|---|
 | Linux (arm/arm64/amd64) | ✅ | OS |
 | Root | ✅ | iptables, TUN, port 53 |
-| sing-box ≥1.10 | ✅ | Tunnel engine |
+| sing-box ≥1.12 | ✅ | Primary tunnel engine |
 | tun2socks | ✅ | TUN → SOCKS5 (gateway mode) |
 | iptables + iproute2 | ✅ | Routing (gateway mode) |
 | curl | recommended | Bench + health check |
+| xray | optional | Fallback engine (`engines.preferred: xray` in config) |
 
 ## License
 
