@@ -156,11 +156,11 @@ pkg_install() {
 
 # ─── Install sing-box ────────────────────────────────────────
 install_sing_box() {
-    # Use latest stable sing-box (1.12+)
+    # Use latest stable sing-box (1.14+)
     local sb_version
     sb_version=$(curl -fsSL ${PROXY_ENV:+-x "$PROXY_ENV"} "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
         | grep '"tag_name"' | head -1 | sed -E 's/.*"v([^"]+)".*/\1/') || true
-    [ -z "$sb_version" ] && sb_version="1.13.0"
+    [ -z "$sb_version" ] && sb_version="1.14.5"
 
     local sb_arch="$ARCH"
     [ "$sb_arch" = "arm" ] && sb_arch="armv7"

@@ -28,7 +28,7 @@
 - [x] **sub update while running** — Routes subscription HTTP through local SOCKS proxy when bypath is active (avoids stale resolv.conf → 127.0.0.1).
 - [x] **bench all groups** — `bypath bench` (no `-g`) tests every group, shows per-group results, selects best across all groups.
 - [x] **systemd crash loop** — `StartLimitIntervalSec=0` + `PrivateTmp=false` in service unit.
-- [ ] **CDN links HTTPS issue** — CDN-based vless links only relay HTTP, not HTTPS. Detect and warn user.
+- [x] **CDN links HTTPS issue** — CDN-based vless links only relay HTTP, not HTTPS. Gateway now async-tests HTTPS after start and warns if CDN link can't relay it.
 
 ## 🟡 Medium
 

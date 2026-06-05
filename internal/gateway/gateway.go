@@ -184,6 +184,20 @@ func (gw *Gateway) Start() error {
 		log.Printf("   Mode:       PROXY ONLY (use socks5://%s:%d)", gw.localIP, gw.socksPort)
 	}
 
+	// CDN-based links only relay HTTP, not HTTPS. Test asynchronously so Start() returns fast.
+	if profile.IsCDNPattern(activeLink) {
+		socksPort := gw.socksPort
+		ctx := gw.ctx
+		go func() {
+			checkCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+			defer cancel()
+			if !profile.TestHTTPS(checkCtx, socksPort) {
+				log.Printf("⚠️  CDN link — HTTPS is not relayed (video/streaming will fail)")
+				log.Printf("   Run 'bypath bench' to find an HTTPS-capable link")
+			}
+		}()
+	}
+
 	// 8. Auto-start chains with auto_start: true
 	gw.startAutoChains()
 
