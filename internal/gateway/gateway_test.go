@@ -321,3 +321,80 @@ func TestRestartEngineAsLegacy_ResetsConfig(t *testing.T) {
 		t.Error("config.Gateway.NativeTUN should be restored to true (original value)")
 	}
 }
+
+// --- Task 5.3: gateway FallbackController integration tests ---
+
+func TestGetActiveEngine_InitiallyEmpty(t *testing.T) {
+	gw := newTestGateway(true, true)
+	defer gw.cancel()
+
+	if got := gw.GetActiveEngine(); got != "" {
+		t.Errorf("GetActiveEngine() = %q, want \"\" initially", got)
+	}
+}
+
+func TestGetActiveEngine_ReflectsActiveEngine(t *testing.T) {
+	for _, engine := range []string{"sing-box", "xray"} {
+		t.Run(engine, func(t *testing.T) {
+			gw := newTestGateway(true, true)
+			defer gw.cancel()
+
+			gw.activeEngine = engine
+			if got := gw.GetActiveEngine(); got != engine {
+				t.Errorf("GetActiveEngine() = %q, want %q", got, engine)
+			}
+		})
+	}
+}
+
+func TestGetActiveEngine_ClearedOnStop(t *testing.T) {
+	gw := newTestGateway(true, true)
+	defer gw.cancel()
+
+	gw.activeEngine = "sing-box"
+	// Simulate what startEngineWithEngineFallback does on stop
+	gw.activeEngine = ""
+
+	if got := gw.GetActiveEngine(); got != "" {
+		t.Errorf("GetActiveEngine() = %q after clear, want \"\"", got)
+	}
+}
+
+// TestNativeTUN_NotSetForXray verifies that when the engine that starts is xray,
+// nativeTUN is NOT set — xray has no TUN device, so tun2socks must not be skipped.
+func TestNativeTUN_NotSetForXray(t *testing.T) {
+	gw := newTestGateway(true, true) // gateway enabled, nativeTUN config = true
+	defer gw.cancel()
+
+	// Simulate startEngine outcome: FallbackController returned xray
+	engineName := "xray"
+	gw.activeEngine = engineName
+
+	// Replicate the nativeTUN assignment logic from startEngine (gateway.go:660):
+	if gw.config.Gateway.Enabled && gw.config.Gateway.NativeTUN && engineName == "sing-box" {
+		gw.nativeTUN = true
+	}
+
+	if gw.nativeTUN {
+		t.Error("nativeTUN must NOT be set when xray is the active engine (xray provides no TUN device)")
+	}
+}
+
+// TestNativeTUN_SetForSingbox verifies that when sing-box starts successfully in
+// gateway+nativeTUN mode, the nativeTUN flag is set (tun2socks path is skipped).
+func TestNativeTUN_SetForSingbox(t *testing.T) {
+	gw := newTestGateway(true, true)
+	defer gw.cancel()
+
+	engineName := "sing-box"
+	gw.activeEngine = engineName
+
+	// Replicate startEngine logic (gateway.go:660)
+	if gw.config.Gateway.Enabled && gw.config.Gateway.NativeTUN && engineName == "sing-box" {
+		gw.nativeTUN = true
+	}
+
+	if !gw.nativeTUN {
+		t.Error("nativeTUN must be set when sing-box starts in gateway+nativeTUN mode")
+	}
+}

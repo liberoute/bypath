@@ -342,3 +342,68 @@ func TestProperty5_ConfigSerializationRoundTripPreservesBypassDomains(t *testing
 		}
 	})
 }
+
+// Task 1.2: fallback config defaults and explicit values
+
+func TestFallbackConfigDefaults(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgFile := filepath.Join(tmpDir, "test.yaml")
+	os.WriteFile(cfgFile, []byte("server:\n  api_port: 9090\n"), 0644)
+
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	if !cfg.Engines.Fallback.Enabled {
+		t.Error("expected Fallback.Enabled to default to true")
+	}
+	if cfg.Engines.Fallback.Timeout != "10s" {
+		t.Errorf("expected Fallback.Timeout \"10s\", got %q", cfg.Engines.Fallback.Timeout)
+	}
+	want := []string{"sing-box", "xray"}
+	if len(cfg.Engines.Fallback.Order) != len(want) {
+		t.Fatalf("expected Fallback.Order %v, got %v", want, cfg.Engines.Fallback.Order)
+	}
+	for i, e := range want {
+		if cfg.Engines.Fallback.Order[i] != e {
+			t.Errorf("Fallback.Order[%d]: expected %q, got %q", i, e, cfg.Engines.Fallback.Order[i])
+		}
+	}
+}
+
+func TestFallbackConfigExplicitValues(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgFile := filepath.Join(tmpDir, "test.yaml")
+	content := `
+engines:
+  fallback:
+    enabled: false
+    timeout: "5s"
+    order:
+      - "xray"
+      - "sing-box"
+`
+	os.WriteFile(cfgFile, []byte(content), 0644)
+
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	if cfg.Engines.Fallback.Enabled {
+		t.Error("expected Fallback.Enabled to be false when explicitly set")
+	}
+	if cfg.Engines.Fallback.Timeout != "5s" {
+		t.Errorf("expected Fallback.Timeout \"5s\", got %q", cfg.Engines.Fallback.Timeout)
+	}
+	want := []string{"xray", "sing-box"}
+	if len(cfg.Engines.Fallback.Order) != len(want) {
+		t.Fatalf("expected Fallback.Order %v, got %v", want, cfg.Engines.Fallback.Order)
+	}
+	for i, e := range want {
+		if cfg.Engines.Fallback.Order[i] != e {
+			t.Errorf("Fallback.Order[%d]: expected %q, got %q", i, e, cfg.Engines.Fallback.Order[i])
+		}
+	}
+}
