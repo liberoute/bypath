@@ -36,15 +36,16 @@ const (
 
 // Resolved holds all resolved paths for the current run.
 type Resolved struct {
-	Mode       Mode
-	ConfigFile string
-	DataDir    string
-	ProfileDir string
-	TmpDir     string
-	GeoDir     string
-	EngineDir  string
-	LogDir     string
-	PidFile    string
+	Mode         Mode
+	ConfigFile   string
+	DataDir      string
+	ProfileDir   string
+	TmpDir       string
+	GeoDir       string
+	EngineDir    string
+	LogDir       string
+	PidFile      string
+	ChildrenFile string // PIDs of child processes started by bypath (dns2socks, tun2socks)
 }
 
 var current *Resolved
@@ -63,27 +64,29 @@ func Detect() *Resolved {
 		tmpDir := fmt.Sprintf("/tmp/bypath-%d", os.Getpid())
 
 		current = &Resolved{
-			Mode:       ModeInstalled,
-			ConfigFile: "/etc/bypath/config.yaml",
-			DataDir:    "/etc/bypath",
-			ProfileDir: "/etc/bypath/profiles",
-			TmpDir:     tmpDir,
-			GeoDir:     "/etc/bypath/geo",
-			EngineDir:  "/opt/bypath/engines",
-			LogDir:     "/var/log/bypath",
-			PidFile:    "/var/run/bypath.pid",
+			Mode:         ModeInstalled,
+			ConfigFile:   "/etc/bypath/config.yaml",
+			DataDir:      "/etc/bypath",
+			ProfileDir:   "/etc/bypath/profiles",
+			TmpDir:       tmpDir,
+			GeoDir:       "/etc/bypath/geo",
+			EngineDir:    "/opt/bypath/engines",
+			LogDir:       "/var/log/bypath",
+			PidFile:      "/var/run/bypath.pid",
+			ChildrenFile: "/var/run/bypath.children",
 		}
 	} else {
 		current = &Resolved{
-			Mode:       ModeLocal,
-			ConfigFile: "configs/default.yaml",
-			DataDir:    "./data",
-			ProfileDir: "./data/profiles",
-			TmpDir:     "./data/tmp",
-			GeoDir:     "./data/geo",
-			EngineDir:  "./engines",
-			LogDir:     "",
-			PidFile:    "./bypath.pid",
+			Mode:         ModeLocal,
+			ConfigFile:   "configs/default.yaml",
+			DataDir:      "./data",
+			ProfileDir:   "./data/profiles",
+			TmpDir:       "./data/tmp",
+			GeoDir:       "./data/geo",
+			EngineDir:    "./engines",
+			LogDir:       "",
+			PidFile:      "./bypath.pid",
+			ChildrenFile: "./bypath.children",
 		}
 	}
 

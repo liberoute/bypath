@@ -286,10 +286,10 @@ func TestXray_IPIfNonMatch_domainStrategy(t *testing.T) {
 	}
 
 	routing := loadJSON(t, configFile)["routing"].(map[string]interface{})
-	// AsIs prevents local DNS resolution so ISP-poisoned IPs (e.g. youtube→10.x.x.x)
-	// don't route direct; geosite rules handle domain-based country routing instead.
-	if routing["domainStrategy"] != "AsIs" {
-		t.Errorf("domainStrategy = %v, want AsIs", routing["domainStrategy"])
+	// IPIfNonMatch: xray resolves domains via dns2socks (tunnel) so geoip:ir fires
+	// for Iranian domains in proxy mode (socks5h://) — samandehi.ir goes direct. ✓
+	if routing["domainStrategy"] != "IPIfNonMatch" {
+		t.Errorf("domainStrategy = %v, want IPIfNonMatch", routing["domainStrategy"])
 	}
 }
 

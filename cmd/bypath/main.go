@@ -200,8 +200,27 @@ func cmdRun(args []string) {
 		log.Fatalf("❌ Gateway init error: %v", err)
 	}
 
-	if err := gw.Start(); err != nil {
-		log.Fatalf("❌ Gateway start error: %v", err)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// Retry loop: if no server is reachable on first start (e.g. all servers down),
+	// wait and retry instead of exiting. Exiting causes systemd to restart
+	// immediately, quickly exhausting StartLimitBurst and putting the service into
+	// "failed" state that requires manual "systemctl reset-failed bypath".
+	for {
+		if err := gw.Start(); err == nil {
+			break
+		} else {
+			log.Printf("❌ Gateway start error: %v", err)
+			log.Printf("⏳ Retrying in 30s — run 'bypath bench' to find a working server")
+		}
+		select {
+		case <-time.After(30 * time.Second):
+			// retry
+		case <-sigCh:
+			log.Println("🛑 Shutting down...")
+			return
+		}
 	}
 
 	apiServer := api.NewServer(cfg, gw, engineMgr)
@@ -209,8 +228,6 @@ func cmdRun(args []string) {
 
 	log.Printf("✅ %s running. API: :%d | DNS: :%d", build.Name, cfg.Server.APIPort, cfg.Server.DNSPort)
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
 	log.Println("🛑 Shutting down...")
@@ -626,12 +643,12 @@ func cmdTest(args []string) {
 }
 
 func cmdBench(args []string) {
-	group := ""
+	targetGroup := ""
 	autoSelect := false
 	singleIdx := 0
 	for i, arg := range args {
 		if (arg == "-g" || arg == "--group") && i+1 < len(args) {
-			group = args[i+1]
+			targetGroup = args[i+1]
 		}
 		if arg == "--auto" {
 			autoSelect = true
@@ -647,50 +664,30 @@ func cmdBench(args []string) {
 		os.Exit(1)
 	}
 
-	// Find group
-	if group == "" {
-		groups := mgr.ListGroups()
-		if len(groups) == 0 {
-			fmt.Println("❌ No groups found")
-			os.Exit(1)
-		}
-		group = groups[0]
-	}
-
-	g, err := mgr.GetGroup(group)
-	if err != nil {
-		fmt.Printf("❌ Group '%s' not found\n", group)
+	allGroups := mgr.ListGroups()
+	if len(allGroups) == 0 {
+		fmt.Println("❌ No groups found")
 		os.Exit(1)
 	}
 
-	if len(g.Links) == 0 {
-		fmt.Println("❌ No links to test")
-		os.Exit(1)
+	// Which groups to bench: specific group if -g given, else ALL groups.
+	var groupsToTest []string
+	if targetGroup != "" {
+		groupsToTest = []string{targetGroup}
+	} else {
+		groupsToTest = allGroups
 	}
 
-	// Skip info-only links (port 0 or port < 10)
-	var testableLinks []*profile.Link
-	for _, link := range g.Links {
-		if link.Port >= 10 && link.Address != "" {
-			testableLinks = append(testableLinks, link)
-		}
-	}
-
-	if len(testableLinks) == 0 {
-		fmt.Println("❌ No testable links found")
-		os.Exit(1)
-	}
-
-	// Single link test mode
+	// Single-link test mode (requires -g)
 	if singleIdx > 0 {
-		if singleIdx > len(g.Links) {
-			fmt.Printf("❌ Link #%d not found\n", singleIdx)
+		g, err := mgr.GetGroup(groupsToTest[0])
+		if err != nil || singleIdx > len(g.Links) {
+			fmt.Printf("❌ Link #%d not found in group '%s'\n", singleIdx, groupsToTest[0])
 			os.Exit(1)
 		}
 		link := g.Links[singleIdx-1]
 		fmt.Printf("  🔍 Testing [%s] %s → %s:%d\n\n", link.Protocol, link.Remark, link.Address, link.Port)
 
-		// TCP Ping
 		addr := net.JoinHostPort(link.Address, fmt.Sprintf("%d", link.Port))
 		start := time.Now()
 		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
@@ -701,9 +698,7 @@ func cmdBench(args []string) {
 			fmt.Printf("  ✅ Ping: %dms\n", time.Since(start).Milliseconds())
 		}
 
-		// Relay test
-		port := 19999
-		latency, ok, _ := benchLinkOnPort(link, port)
+		latency, ok, _ := benchLinkOnPort(link, 19999)
 		if ok {
 			fmt.Printf("  ✅ Relay: %s\n", latency)
 		} else {
@@ -712,10 +707,8 @@ func cmdBench(args []string) {
 		return
 	}
 
-	fmt.Printf("\n  🏁 Benchmarking %d links in group '%s' (parallel)...\n\n", len(testableLinks), group)
-
 	type benchResult struct {
-		idx     int
+		group   string
 		link    *profile.Link
 		latency string
 		status  string
@@ -723,65 +716,125 @@ func cmdBench(args []string) {
 		httpsOk bool
 	}
 
-	// Run all benchmarks in parallel
-	results := make([]benchResult, len(testableLinks))
+	// Collect all testable links across target groups, track per-group ranges.
+	type groupRange struct {
+		name  string
+		start int
+		end   int
+	}
+	var allLinks []*profile.Link
+	var ranges []groupRange
+
+	for _, gname := range groupsToTest {
+		g, err := mgr.GetGroup(gname)
+		if err != nil {
+			continue
+		}
+		start := len(allLinks)
+		for _, l := range g.Links {
+			if l.Port >= 10 && l.Address != "" {
+				allLinks = append(allLinks, l)
+			}
+		}
+		if len(allLinks) > start {
+			ranges = append(ranges, groupRange{gname, start, len(allLinks)})
+		}
+	}
+
+	if len(allLinks) == 0 {
+		fmt.Println("❌ No testable links found")
+		os.Exit(1)
+	}
+
+	totalGroups := len(ranges)
+	if totalGroups > 1 {
+		fmt.Printf("\n  🏁 Benchmarking %d links across %d groups (parallel)...\n", len(allLinks), totalGroups)
+	} else {
+		fmt.Printf("\n  🏁 Benchmarking %d links in group '%s' (parallel)...\n", len(allLinks), ranges[0].name)
+	}
+
+	// Run all benchmarks in parallel, each on a unique port.
+	results := make([]benchResult, len(allLinks))
 	var wg sync.WaitGroup
 
-	for i, link := range testableLinks {
+	// Assign group name to each result slot.
+	for _, gr := range ranges {
+		for i := gr.start; i < gr.end; i++ {
+			results[i].group = gr.name
+		}
+	}
+
+	for i, link := range allLinks {
 		wg.Add(1)
 		go func(idx int, l *profile.Link) {
 			defer wg.Done()
-			port := 19870 + idx // unique port per link
+			port := 19870 + idx
 			latency, ok, httpsOk := benchLinkOnPort(l, port)
 			if ok {
-				ms := parseMs(latency)
-				results[idx] = benchResult{idx, l, latency, "ok", ms, httpsOk}
+				results[idx].link = l
+				results[idx].latency = latency
+				results[idx].status = "ok"
+				results[idx].ms = parseMs(latency)
+				results[idx].httpsOk = httpsOk
 			} else {
-				results[idx] = benchResult{idx, l, "-", "fail", 99999, false}
+				results[idx].link = l
+				results[idx].latency = "-"
+				results[idx].status = "fail"
+				results[idx].ms = 99999
 			}
 		}(i, link)
 	}
 
 	wg.Wait()
 
-	// Persist HTTPSCapable results to the profile
-	for _, r := range results {
-		if r.status == "ok" && r.httpsOk {
-			r.link.HTTPSCapable = 1
-		} else if r.status == "ok" && !r.httpsOk {
-			r.link.HTTPSCapable = -1
-		}
-		// If status == "fail", leave HTTPSCapable as-is (we didn't test HTTPS)
-	}
-	mgr.SaveGroup(group)
-
-	// Print results
+	// Print results, grouped.
+	fmt.Println()
 	fmt.Printf("  %-3s %-8s %-4s %-22s %-6s %-8s %-5s %s\n", "#", "Proto", "Flag", "Server", "Port", "Latency", "HTTPS", "Status")
 	fmt.Printf("  %-3s %-8s %-4s %-22s %-6s %-8s %-5s %s\n", "---", "-----", "----", "------", "----", "-------", "-----", "------")
 
-	for i, r := range results {
-		flag := extractFlag(r.link.Remark)
-		server := r.link.Address
-		if len(server) > 20 {
-			server = server[:17] + "..."
+	globalIdx := 1
+	for _, gr := range ranges {
+		if totalGroups > 1 {
+			fmt.Printf("\n  ━━ %s ━━\n", gr.name)
 		}
-		proto := shortProto(r.link.Protocol)
-		var httpsCol string
-		if r.status == "fail" {
-			httpsCol = "—"
-		} else if r.httpsOk {
-			httpsCol = "✓"
-		} else {
-			httpsCol = "✗"
+		for i := gr.start; i < gr.end; i++ {
+			r := results[i]
+			flag := extractFlag(r.link.Remark)
+			server := r.link.Address
+			if len(server) > 20 {
+				server = server[:17] + "..."
+			}
+			proto := shortProto(r.link.Protocol)
+			var httpsCol string
+			switch {
+			case r.status == "fail":
+				httpsCol = "—"
+			case r.httpsOk:
+				httpsCol = "✓"
+			default:
+				httpsCol = "✗"
+			}
+			if r.status == "ok" {
+				fmt.Printf("  %-3d %-8s %-4s %-22s %-6d %-8s %-5s ✅ OK\n", globalIdx, proto, flag, server, r.link.Port, r.latency, httpsCol)
+			} else {
+				fmt.Printf("  %-3d %-8s %-4s %-22s %-6d %-8s %-5s ❌ FAIL\n", globalIdx, proto, flag, server, r.link.Port, "timeout", httpsCol)
+			}
+			globalIdx++
 		}
-		if r.status == "ok" {
-			fmt.Printf("  %-3d %-8s %-4s %-22s %-6d %-8s %-5s ✅ OK\n", i+1, proto, flag, server, r.link.Port, r.latency, httpsCol)
-		} else {
-			fmt.Printf("  %-3d %-8s %-4s %-22s %-6d %-8s %-5s ❌ FAIL\n", i+1, proto, flag, server, r.link.Port, "timeout", httpsCol)
+
+		// Persist HTTPSCapable per group
+		for i := gr.start; i < gr.end; i++ {
+			r := results[i]
+			if r.status == "ok" && r.httpsOk {
+				r.link.HTTPSCapable = 1
+			} else if r.status == "ok" && !r.httpsOk {
+				r.link.HTTPSCapable = -1
+			}
 		}
+		mgr.SaveGroup(gr.name)
 	}
 
-	// Convert results to profile.BenchResult for SelectBest
+	// Pick best across ALL tested groups.
 	var benchResults []*profile.BenchResult
 	for i := range results {
 		benchResults = append(benchResults, &profile.BenchResult{
@@ -793,26 +846,34 @@ func cmdBench(args []string) {
 	}
 
 	sel := profile.SelectBest(benchResults)
-
 	if sel.Best == nil {
 		fmt.Println("\n  ❌ No working links found!")
 		return
 	}
 
-	// Find the original benchResult index for display
-	bestIdx := 0
-	var bestLatencyStr string
-	for i := range results {
-		if results[i].link == sel.Best.Link {
-			bestIdx = i
-			bestLatencyStr = results[i].latency
-			break
+	// Find display index for best link
+	bestDisplayIdx := 1
+	var bestLatencyStr, bestGroup string
+	displayIdx := 1
+	for _, gr := range ranges {
+		for i := gr.start; i < gr.end; i++ {
+			if results[i].link == sel.Best.Link {
+				bestDisplayIdx = displayIdx
+				bestLatencyStr = results[i].latency
+				bestGroup = gr.name
+			}
+			displayIdx++
 		}
 	}
 
-	fmt.Printf("\n  🏆 Best: #%d [%s] %s:%d (%s)\n", bestIdx+1, sel.Best.Link.Protocol, sel.Best.Link.Address, sel.Best.Link.Port, bestLatencyStr)
+	if totalGroups > 1 {
+		fmt.Printf("\n  🏆 Best: #%d [%s] %s:%d (%s) — group '%s'\n",
+			bestDisplayIdx, sel.Best.Link.Protocol, sel.Best.Link.Address, sel.Best.Link.Port, bestLatencyStr, bestGroup)
+	} else {
+		fmt.Printf("\n  🏆 Best: #%d [%s] %s:%d (%s)\n",
+			bestDisplayIdx, sel.Best.Link.Protocol, sel.Best.Link.Address, sel.Best.Link.Port, bestLatencyStr)
+	}
 
-	// Print warnings based on selection result
 	if sel.NoHTTPS {
 		fmt.Println("  ⚠️  No HTTPS-capable links found — selected fastest HTTP link")
 	}
@@ -828,11 +889,9 @@ func cmdBench(args []string) {
 		fmt.Printf("  ✅ Auto-selected! Run 'bypath run' to start.\n")
 	} else {
 		fmt.Printf("\n  Auto-select this link? [Y/n]: ")
-
 		reader := bufio.NewReader(os.Stdin)
 		input, _ := reader.ReadString('\n')
 		input = strings.TrimSpace(strings.ToLower(input))
-
 		if input == "" || input == "y" || input == "yes" {
 			mgr.SetActiveLink(sel.Best.Link)
 			fmt.Printf("  ✅ Selected! Run 'bypath run' to start.\n")
@@ -1059,10 +1118,17 @@ func cmdSub(args []string) {
 			}
 		}
 
+		// Read SOCKS port from config so FetchSubscription can route through the
+		// running bypath proxy (correct DNS + routing) when bypath is active.
+		socksPort := 0
+		if cfg, err := config.Load(paths.Get().ConfigFile); err == nil {
+			socksPort = cfg.Server.SOCKSPort
+		}
+
 		if group != "" {
 			// Update specific group
 			fmt.Printf("📡 Updating subscriptions for group '%s'...\n", group)
-			count, err := mgr.UpdateSubscriptions(group)
+			count, err := mgr.UpdateSubscriptions(group, socksPort)
 			if err != nil {
 				fmt.Printf("❌ %v\n", err)
 				os.Exit(1)
@@ -1079,7 +1145,7 @@ func cmdSub(args []string) {
 					continue
 				}
 				fmt.Printf("📡 Updating group '%s'...\n", gName)
-				count, err := mgr.UpdateSubscriptions(gName)
+				count, err := mgr.UpdateSubscriptions(gName, socksPort)
 				if err != nil {
 					fmt.Printf("  ⚠️  %v\n", err)
 					continue

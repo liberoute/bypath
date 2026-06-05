@@ -92,6 +92,9 @@ func (gw *Gateway) Start() error {
 	gw.mu.Lock()
 	defer gw.mu.Unlock()
 
+	// 0. Clean up any state left by a previous crashed/kill-9'd instance.
+	gw.cleanupPreviousRun()
+
 	// 1. Detect network
 	if err := gw.detectNetwork(); err != nil {
 		return fmt.Errorf("network detection: %w", err)
@@ -214,6 +217,7 @@ func (gw *Gateway) Stop() {
 	}
 
 	gw.cancel()
+	os.Remove(paths.Get().ChildrenFile)
 	log.Println("✅ Gateway stopped")
 }
 
@@ -503,39 +507,57 @@ func (gw *Gateway) alternativeEngine(primaryEngine, protocol string) string {
 	return ""
 }
 
-// verifyConnection checks if the SOCKS proxy actually works.
-// Uses socks5:// (not socks5h://) with a known IP to avoid DNS dependency.
-// The curl command explicitly uses --interface to bypass any TUN auto_route
-// that might intercept loopback traffic in native TUN mode.
+// verifyConnection checks if the SOCKS proxy can reach the actual internet
+// through the tunnel — NOT just Cloudflare's own CDN edge.
+//
+// CDN-based VLESS proxies (*.okarimi.ir, *.oneset.ir via Cloudflare port 2083)
+// always return 204 for "Host: cp.cloudflare.com / http://1.1.1.1" because
+// the CDN edge answers locally without actually forwarding through the tunnel.
+// We must verify with a NON-Cloudflare target to detect real connectivity.
 func (gw *Gateway) verifyConnection() bool {
-	addr := fmt.Sprintf("socks5://127.0.0.1:%d", gw.socksPort)
-	// Use IP directly to avoid DNS dependency (dns2socks may not be up yet)
-	// 1.1.1.1:80 is Cloudflare's reliable public IP
-	args := []string{
-		"-s", "-x", addr,
-		"--connect-timeout", "10",
-		"--max-time", "15",
-		"-o", "/dev/null", "-w", "%{http_code}",
-		"-H", "Host: cp.cloudflare.com",
-	}
-	// In native TUN mode, sing-box auto_route intercepts all traffic including
-	// loopback curl. Bind to the physical interface IP to avoid the TUN.
-	if gw.nativeTUN && gw.localIP != "" {
-		args = append(args, "--interface", gw.localIP)
-	}
-	args = append(args, "http://1.1.1.1")
+	addr := fmt.Sprintf("socks5h://127.0.0.1:%d", gw.socksPort)
 
-	cmd := exec.CommandContext(gw.ctx, "curl", args...)
-	out, err := cmd.Output()
-	if err != nil {
-		return false
+	// Candidates: non-Cloudflare targets that return predictable HTTP responses.
+	// socks5h:// means hostname sent to proxy for remote DNS (no local DNS needed).
+	candidates := []struct {
+		url      string
+		wantCode string
+	}{
+		// Google's generate_204 — returns exactly 204, not Cloudflare.
+		{"http://www.gstatic.com/generate_204", "204"},
+		// Microsoft connectivity check — returns 200 with small body.
+		{"http://www.msftconnecttest.com/connecttest.txt", "200"},
+		// Apple captive portal check — returns 200.
+		{"http://captive.apple.com/hotspot-detect.html", "200"},
 	}
-	code := strings.TrimSpace(string(out))
-	return code == "200" || code == "204"
+
+	baseArgs := []string{"-s", "-x", addr, "--connect-timeout", "8", "--max-time", "12",
+		"-o", "/dev/null", "-w", "%{http_code}"}
+	if gw.nativeTUN && gw.localIP != "" {
+		baseArgs = append(baseArgs, "--interface", gw.localIP)
+	}
+
+	for _, c := range candidates {
+		args := append(baseArgs, c.url)
+		cmd := exec.CommandContext(gw.ctx, "curl", args...)
+		out, err := cmd.Output()
+		if err == nil && strings.TrimSpace(string(out)) == c.wantCode {
+			return true
+		}
+	}
+	return false
 }
 
 func (gw *Gateway) startEngine(link *profile.Link) error {
 	log.Printf("🔧 Starting engine for [%s] %s...", link.Protocol, link.Remark)
+
+	// Pin the server hostname in /etc/hosts BEFORE starting the engine.
+	// The engine needs to connect to the VLESS server by hostname, but ISPs
+	// intercept DNS and return fake IPs. Pinning first ensures the engine gets
+	// the real IP regardless of what the system DNS returns.
+	if link.Address != "" {
+		gw.pinHostToEtcHosts(link.Address)
+	}
 
 	// Determine engine
 	engineName := gw.resolveEngine(link.Protocol)
@@ -547,7 +569,12 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 	// Generate config (with whitelist countries for sing-box geoip routing)
 	configGen := tunnel.NewConfigGenerator(paths.Get().TmpDir)
 	configGen.WhitelistCountries = gw.config.Whitelist.Countries
+	// If geosite_countries not explicitly set, mirror whitelist countries so
+	// domain-based routing (geosite:ir) works alongside IP-based (geoip:ir).
 	configGen.GeositeCountries = gw.config.Whitelist.GeositeCountries
+	if len(configGen.GeositeCountries) == 0 {
+		configGen.GeositeCountries = gw.config.Whitelist.Countries
+	}
 	configGen.BypassDomains = gw.config.Whitelist.BypassDomains
 	configGen.ForceProxyDomains = gw.config.Whitelist.ForceProxyDomains
 	configGen.DNSUpstream = gw.config.Gateway.DNSUpstream
@@ -602,12 +629,25 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 func (gw *Gateway) startDNS() error {
 	log.Printf("🔀 Starting DNS proxy on :%d...", gw.dnsPort)
 
-	// Try dns2socks first (if available)
+	// Kill only bypath's own previous DNS proxy (tracked by PID), not user processes.
+	if gw.dnsProc != nil && gw.dnsProc.Process != nil {
+		gw.dnsProc.Process.Kill()
+		gw.dnsProc.Wait()
+		gw.dnsProc = nil
+	}
+
+	upstream := gw.config.Gateway.DNSUpstream
+	if len(upstream) == 0 {
+		upstream = []string{"1.1.1.1", "8.8.8.8"}
+	}
+
+	// Try dns2socks first (routes DNS through the tunnel — preferred).
+	// dns2socks takes a single upstream; use the first configured one.
 	dns2socksPath, err := exec.LookPath("dns2socks")
 	if err == nil {
 		gw.dnsProc = exec.CommandContext(gw.ctx, dns2socksPath,
 			"-l", fmt.Sprintf("0.0.0.0:%d", gw.dnsPort),
-			"-d", "1.1.1.1:53",
+			"-d", upstream[0]+":53",
 			"-s", fmt.Sprintf("socks5://127.0.0.1:%d", gw.socksPort),
 			"-f", "-c",
 		)
@@ -617,24 +657,24 @@ func (gw *Gateway) startDNS() error {
 		if err := waitForPort(gw.dnsPort, 5*time.Second); err != nil {
 			return fmt.Errorf("dns2socks didn't start: %w", err)
 		}
-		log.Printf("  ✅ dns2socks running on :%d (DNS through tunnel)", gw.dnsPort)
+		trackChildPID(gw.dnsProc.Process.Pid)
+		log.Printf("  ✅ dns2socks running on :%d → %s (DNS through tunnel)", gw.dnsPort, upstream[0])
 		return nil
 	}
 
-	// Fallback: dnsmasq
+	// Fallback: dnsmasq (DNS goes direct, not through tunnel).
 	dnsmasqPath, err := exec.LookPath("dnsmasq")
 	if err == nil {
-		// dnsmasq can't route through SOCKS, but at least provides DNS
-		gw.dnsProc = exec.CommandContext(gw.ctx, dnsmasqPath,
-			"--no-daemon", "--no-resolv",
-			"--server=1.1.1.1", "--server=8.8.8.8",
-			fmt.Sprintf("--listen-address=0.0.0.0"),
-			"--bind-interfaces",
-		)
+		args := []string{"--no-daemon", "--no-resolv", "--listen-address=0.0.0.0", "--bind-interfaces"}
+		for _, ns := range upstream {
+			args = append(args, "--server="+ns)
+		}
+		gw.dnsProc = exec.CommandContext(gw.ctx, dnsmasqPath, args...)
 		if err := gw.dnsProc.Start(); err != nil {
 			return fmt.Errorf("starting dnsmasq: %w", err)
 		}
-		log.Printf("  ⚠️  dnsmasq running (DNS NOT through tunnel — install dns2socks for secure DNS)")
+		trackChildPID(gw.dnsProc.Process.Pid)
+		log.Printf("  ⚠️  dnsmasq running → %v (DNS NOT through tunnel — install dns2socks for secure DNS)", upstream)
 		return nil
 	}
 
@@ -677,6 +717,7 @@ func (gw *Gateway) startTun() error {
 	if err := gw.tunProc.Start(); err != nil {
 		return fmt.Errorf("starting tun2socks: %w", err)
 	}
+	trackChildPID(gw.tunProc.Process.Pid)
 
 	time.Sleep(2 * time.Second)
 	log.Printf("  ✅ tun2socks running (tun0 → socks5://127.0.0.1:%d)", gw.socksPort)
@@ -703,6 +744,9 @@ func (gw *Gateway) setupRouting() error {
 		run("iptables", "-A", "FORWARD", "-i", gw.iface, "-o", "tun0", "-j", "ACCEPT")
 		run("iptables", "-A", "FORWARD", "-i", "tun0", "-o", gw.iface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
 		run("iptables", "-A", "FORWARD", "-i", gw.iface, "-o", gw.iface, "-j", "ACCEPT")
+
+		// Intercept LAN DNS so DHCP-configured DNS doesn't bypass the tunnel.
+		gw.setupDNSIntercept()
 
 		log.Printf("  ✅ Routing configured (native TUN: LAN ↔ tun0 via sing-box auto_route)")
 	} else {
@@ -736,6 +780,9 @@ func (gw *Gateway) setupRouting() error {
 		run("iptables", "-A", "FORWARD", "-i", "tun0", "-o", gw.iface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
 		run("iptables", "-A", "FORWARD", "-i", gw.iface, "-o", gw.iface, "-j", "ACCEPT")
 
+		// Intercept LAN DNS so DHCP-configured DNS doesn't bypass the tunnel.
+		gw.setupDNSIntercept()
+
 		log.Printf("  ✅ Routing configured (LAN → tun0 → tunnel, whitelist via sing-box geoip)")
 
 		// Pin the tunnel server's hostname in /etc/hosts BEFORE switching DNS.
@@ -759,21 +806,52 @@ func (gw *Gateway) setupRouting() error {
 	return nil
 }
 
-// pinHostToEtcHosts resolves hostname using the current (pre-switch) DNS and
-// writes a static entry to /etc/hosts. This ensures xray can resolve the
-// tunnel server address even after resolv.conf is switched to 127.0.0.1.
+// pinHostToEtcHosts resolves hostname bypassing /etc/resolv.conf (which may
+// be ISP-poisoned) and writes a static entry to /etc/hosts. This lets
+// xray/sing-box reach the tunnel server after resolv.conf is switched to 127.0.0.1.
 func (gw *Gateway) pinHostToEtcHosts(hostname string) {
 	// Skip if it's already an IP
 	if net.ParseIP(hostname) != nil {
 		return
 	}
 
-	addrs, err := net.LookupHost(hostname)
-	if err != nil || len(addrs) == 0 {
-		log.Printf("⚠️  Could not pre-resolve %s for /etc/hosts: %v", hostname, err)
+	// Use the configured upstream DNS servers directly (bypass system resolv.conf).
+	// ISPs often poison resolv.conf DNS for proxy server hostnames, returning
+	// internal IPs (e.g. 10.10.34.36) that masquerade as the real server.
+	upstream := gw.config.Gateway.DNSUpstream
+	if len(upstream) == 0 {
+		upstream = []string{"1.1.1.1", "8.8.8.8"}
+	}
+
+	var ip string
+	for _, ns := range upstream {
+		r := &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "udp", ns+":53")
+			},
+		}
+		addrs, err := r.LookupHost(context.Background(), hostname)
+		if err != nil || len(addrs) == 0 {
+			continue
+		}
+		candidate := addrs[0]
+		// Reject obviously-intercepted IPs: private/loopback ranges used by ISPs
+		// to redirect blocked hostnames.
+		if parsed := net.ParseIP(candidate); parsed != nil {
+			if parsed.IsLoopback() || parsed.IsPrivate() {
+				log.Printf("⚠️  Rejected intercepted IP %s for %s (from %s)", candidate, hostname, ns)
+				continue
+			}
+		}
+		ip = candidate
+		break
+	}
+
+	if ip == "" {
+		log.Printf("⚠️  Could not resolve %s via any upstream DNS", hostname)
 		return
 	}
-	ip := addrs[0]
 
 	marker := "# bypath-pin"
 	entry := fmt.Sprintf("%s %s %s\n", ip, hostname, marker)
@@ -817,12 +895,54 @@ func (gw *Gateway) unpinHostsFromEtcHosts() {
 	os.WriteFile("/etc/hosts", []byte(strings.Join(filtered, "\n")), 0644)
 }
 
-// setResolvConf overwrites /etc/resolv.conf with a single nameserver line.
-// It also makes the file immutable (chattr +i) so systemd-networkd/dhclient
-// cannot overwrite it while bypath is running. On restore, immutability is removed first.
+const resolvBackup = "/etc/resolv.conf.bypath-backup"
+
+// trackChildPID appends the PID of a bypath-owned child process to the children
+// file so cleanupPreviousRun can kill only our own processes, not user-started ones.
+func trackChildPID(pid int) {
+	f, err := os.OpenFile(paths.Get().ChildrenFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%d\n", pid)
+}
+
+// killTrackedChildren reads the children file and kills only the PIDs bypath
+// started itself. Removes the file afterwards.
+func killTrackedChildren() {
+	data, err := os.ReadFile(paths.Get().ChildrenFile)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		pid := 0
+		fmt.Sscanf(line, "%d", &pid)
+		if pid <= 1 {
+			continue
+		}
+		if proc, err := os.FindProcess(pid); err == nil {
+			proc.Kill()
+		}
+	}
+	os.Remove(paths.Get().ChildrenFile)
+}
+
+// setResolvConf saves the current resolv.conf (DHCP-assigned) as a backup,
+// then overwrites it with bypath's nameserver (immutable so dhcpcd can't clobber it).
 func (gw *Gateway) setResolvConf(nameserver string) {
-	// Remove immutable flag first (in case it was set from a previous run)
 	exec.Command("chattr", "-i", "/etc/resolv.conf").Run()
+
+	// Back up whatever the DHCP client wrote — we'll restore it on stop.
+	if orig, err := os.ReadFile("/etc/resolv.conf"); err == nil {
+		if !strings.Contains(string(orig), "127.0.0.1") {
+			os.WriteFile(resolvBackup, orig, 0644)
+		}
+	}
 
 	content := fmt.Sprintf("nameserver %s\n", nameserver)
 	if err := os.WriteFile("/etc/resolv.conf", []byte(content), 0644); err != nil {
@@ -830,7 +950,6 @@ func (gw *Gateway) setResolvConf(nameserver string) {
 		return
 	}
 
-	// Make immutable so networkd/dhclient can't overwrite it
 	if err := exec.Command("chattr", "+i", "/etc/resolv.conf").Run(); err != nil {
 		log.Printf("⚠️  chattr +i failed (non-ext4?): %v", err)
 	}
@@ -838,9 +957,50 @@ func (gw *Gateway) setResolvConf(nameserver string) {
 	log.Printf("🔧 /etc/resolv.conf → nameserver %s (immutable)", nameserver)
 }
 
+// restoreResolvConf removes the immutable flag and restores the original
+// DHCP-assigned resolv.conf. Falls back to 8.8.8.8 if no backup exists.
+func (gw *Gateway) restoreResolvConf() {
+	exec.Command("chattr", "-i", "/etc/resolv.conf").Run()
+
+	if backup, err := os.ReadFile(resolvBackup); err == nil && len(backup) > 0 {
+		if err := os.WriteFile("/etc/resolv.conf", backup, 0644); err == nil {
+			os.Remove(resolvBackup)
+			log.Printf("🔧 /etc/resolv.conf restored (DHCP original)")
+			return
+		}
+	}
+
+	// No backup — write a safe fallback so DNS works after stop.
+	os.WriteFile("/etc/resolv.conf", []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0644)
+	log.Printf("🔧 /etc/resolv.conf restored (fallback 8.8.8.8)")
+}
+
+// setupDNSIntercept redirects all DNS queries (port 53) arriving on the LAN
+// interface to bypath's own DNS proxy, regardless of what DNS server the
+// DHCP gave the client. This is the transparent DNS hijack that makes bypath
+// work without the user ever touching their DNS settings.
+func (gw *Gateway) setupDNSIntercept() {
+	dnsPort := fmt.Sprintf("%d", gw.dnsPort)
+	// Redirect UDP and TCP DNS from LAN clients to our local DNS proxy.
+	// Only applies to traffic arriving on the LAN interface so we don't
+	// redirect bypath's own DNS queries (those originate from lo/tun0).
+	run("iptables", "-t", "nat", "-A", "PREROUTING",
+		"-i", gw.iface,
+		"-s", gw.subnet,
+		"-p", "udp", "--dport", "53",
+		"-j", "REDIRECT", "--to-port", dnsPort)
+	run("iptables", "-t", "nat", "-A", "PREROUTING",
+		"-i", gw.iface,
+		"-s", gw.subnet,
+		"-p", "tcp", "--dport", "53",
+		"-j", "REDIRECT", "--to-port", dnsPort)
+	log.Printf("🔀 DNS intercept active: LAN :53 → :%s (DHCP DNS ignored)", dnsPort)
+}
+
 func (gw *Gateway) cleanupRouting() {
 	// Always clean up iptables rules regardless of mode
 	run("iptables", "-t", "mangle", "-F", "PREROUTING")
+	run("iptables", "-t", "nat", "-F", "PREROUTING")
 	run("iptables", "-t", "nat", "-F", "POSTROUTING")
 	run("iptables", "-F", "FORWARD")
 
@@ -849,15 +1009,60 @@ func (gw *Gateway) cleanupRouting() {
 		run("ip", "rule", "del", "fwmark", "0x1", "lookup", "100")
 		run("ip", "route", "flush", "table", "100")
 		run("ip", "link", "del", "tun0")
-
-		// Restore DNS to the real upstream so the system works after bypath stops.
-		gw.setResolvConf("8.8.8.8")
-
-		// Remove pinned hosts entries
-		gw.unpinHostsFromEtcHosts()
 	}
-	// In native TUN mode: skip ip link del tun0 (sing-box cleans up its own device)
-	// and skip ip rule del fwmark (not used in native TUN mode)
+
+	// Always restore DNS and hosts — both legacy and native TUN modes may have
+	// modified resolv.conf, and we must leave the system working after stop.
+	gw.restoreResolvConf()
+	gw.unpinHostsFromEtcHosts()
+}
+
+// cleanupPreviousRun kills leftover child processes and restores network state
+// from any previous crashed or kill-9'd bypath instance. Called unconditionally
+// at the start of Start() so every startup begins from a known-clean state.
+func (gw *Gateway) cleanupPreviousRun() {
+	log.Println("🧹 Cleaning up state from previous run...")
+
+	// Kill child processes from the previous instance.
+	// Engine processes: kill by config-path pattern (safe — only matches bypath's own).
+	exec.Command("pkill", "-f", "xray run -c /tmp/bypath").Run()
+	exec.Command("pkill", "-f", "sing-box run -c /tmp/bypath").Run()
+	// dns2socks / tun2socks: kill only tracked PIDs to avoid killing user processes.
+	killTrackedChildren()
+
+	// Allow processes to exit before cleaning up network state.
+	time.Sleep(300 * time.Millisecond)
+
+	// Clean up network state unconditionally — we don't know what the
+	// previous instance's mode was (legacy vs native TUN).
+	exec.Command("iptables", "-t", "mangle", "-F", "PREROUTING").Run()
+	exec.Command("iptables", "-t", "nat", "-F", "PREROUTING").Run()
+	exec.Command("iptables", "-t", "nat", "-F", "POSTROUTING").Run()
+	exec.Command("iptables", "-F", "FORWARD").Run()
+	exec.Command("ip", "rule", "del", "fwmark", "0x1", "lookup", "100").Run()
+	exec.Command("ip", "route", "flush", "table", "100").Run()
+	exec.Command("ip", "link", "del", "tun0").Run()
+
+	// Clean up native TUN policy rules (sing-box uses prio 9000+).
+	for _, prio := range []string{"9000", "9001", "9002", "9003", "9010"} {
+		exec.Command("ip", "rule", "del", "prio", prio).Run()
+	}
+	exec.Command("ip", "route", "flush", "table", "2022").Run()
+
+	// Restore resolv.conf if bypath left it pointing to 127.0.0.1.
+	// Restore resolv.conf: prefer the DHCP backup, fall back to 8.8.8.8.
+	exec.Command("chattr", "-i", "/etc/resolv.conf").Run()
+	if backup, err := os.ReadFile(resolvBackup); err == nil && len(backup) > 0 {
+		os.WriteFile("/etc/resolv.conf", backup, 0644)
+		os.Remove(resolvBackup)
+	} else if content, err := os.ReadFile("/etc/resolv.conf"); err == nil {
+		if strings.TrimSpace(string(content)) == "nameserver 127.0.0.1" {
+			os.WriteFile("/etc/resolv.conf", []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0644)
+		}
+	}
+
+	// Remove any host pins left by a previous run.
+	gw.unpinHostsFromEtcHosts()
 }
 
 func (gw *Gateway) resolveEngine(protocol string) string {

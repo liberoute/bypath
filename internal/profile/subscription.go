@@ -1,10 +1,12 @@
 package profile
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -12,11 +14,46 @@ import (
 	"time"
 )
 
+// bypathDNSActive returns true when bypath has taken over /etc/resolv.conf
+// (pointing it to 127.0.0.1 = the local dns2socks). In that state the SOCKS
+// proxy must be used for outbound HTTP, otherwise direct DNS to 8.8.8.8 is
+// intercepted by the ISP and subscription URLs can't be resolved.
+func bypathDNSActive() bool {
+	data, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(data), "127.0.0.1")
+}
+
 // FetchSubscription downloads and parses a subscription URL.
-// Returns a list of parsed links.
-// It respects HTTP_PROXY/HTTPS_PROXY/ALL_PROXY environment variables (supports socks5).
-func FetchSubscription(subURL string) ([]*Link, error) {
+//
+//   - socksPort > 0 and bypath is running: route through the bypath SOCKS proxy
+//     so DNS and HTTP both go through the tunnel (ISP can't intercept).
+//   - Otherwise: use direct DNS (8.8.8.8) to bypass a stale resolv.conf left
+//     by a previous bypath run, allowing sub update when bypath is stopped.
+func FetchSubscription(subURL string, socksPort int) ([]*Link, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+
+	if socksPort > 0 && bypathDNSActive() {
+		// bypath is running: use its SOCKS proxy so requests go through the tunnel.
+		if u, err := url.Parse(fmt.Sprintf("socks5://127.0.0.1:%d", socksPort)); err == nil {
+			transport.Proxy = http.ProxyURL(u)
+		}
+	} else {
+		// bypath not running (or no port given): direct DNS to bypass stale resolv.conf.
+		transport.DialContext = (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+			Resolver: &net.Resolver{
+				PreferGo: true,
+				Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+					return (&net.Dialer{}).DialContext(ctx, "udp", "8.8.8.8:53")
+				},
+			},
+		}).DialContext
+	}
+
 	// Check for proxy from environment (supports socks5h:// via ALL_PROXY)
 	proxyURL := os.Getenv("ALL_PROXY")
 	if proxyURL == "" {
@@ -90,7 +127,8 @@ func FetchSubscription(subURL string) ([]*Link, error) {
 }
 
 // UpdateSubscriptions fetches all subscriptions for a group and updates its links.
-func (m *Manager) UpdateSubscriptions(groupName string) (int, error) {
+// socksPort is the bypath SOCKS port (from config); pass 0 if unknown.
+func (m *Manager) UpdateSubscriptions(groupName string, socksPort int) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -107,7 +145,7 @@ func (m *Manager) UpdateSubscriptions(groupName string) (int, error) {
 
 	for _, subURL := range g.Subscriptions {
 		log.Printf("  📡 Fetching: %s", truncate(subURL, 50))
-		links, err := FetchSubscription(subURL)
+		links, err := FetchSubscription(subURL, socksPort)
 		if err != nil {
 			log.Printf("  ⚠️  Failed: %v", err)
 			continue

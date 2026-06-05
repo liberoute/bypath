@@ -439,6 +439,9 @@ install_systemd() {
 Description=Bypath Network Gateway
 After=network-online.target
 Wants=network-online.target
+# Disable start-attempt limit so systemd never enters "failed" state.
+# bypath itself handles retry with backoff when no server is reachable.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -454,7 +457,7 @@ StandardError=append:/var/log/bypath/error.log
 # Security hardening
 NoNewPrivileges=no
 ProtectSystem=false
-PrivateTmp=true
+PrivateTmp=false
 
 [Install]
 WantedBy=multi-user.target

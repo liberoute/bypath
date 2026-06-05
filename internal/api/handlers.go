@@ -222,7 +222,7 @@ func (s *Server) handleUpdateSubscription(w http.ResponseWriter, r *http.Request
 	group := vars["group"]
 
 	pm := s.gateway.GetProfileManager()
-	count, err := pm.UpdateSubscriptions(group)
+	count, err := pm.UpdateSubscriptions(group, s.config.Server.SOCKSPort)
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return

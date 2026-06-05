@@ -805,21 +805,29 @@ func (cg *ConfigGenerator) generateXray(link *profile.Link) (string, error) {
 
 		// Whitelisted countries → direct.
 		//
-		// Strategy: AsIs (no local DNS resolution for routing).
+		// Strategy: IPIfNonMatch — xray resolves domains when no domain rule matches.
 		//
-		// WHY AsIs: Iranian ISPs poison DNS for blocked sites (youtube.com → 10.x.x.x).
-		// With IPIfNonMatch, xray resolves youtube.com locally → gets 10.x.x.x →
-		// private IP rule routes it DIRECT → hits ISP censorship server.
-		// With AsIs, domains are never resolved locally; the VLESS outbound sends the
-		// original domain to the CDN server which resolves it at the exit node → real IP.
+		// WHY IPIfNonMatch (not AsIs):
+		// In proxy mode (socks5h://), clients send hostnames. With AsIs, xray never
+		// resolves them for routing, so geoip:ir never fires for Iranian domains like
+		// samandehi.ir → they go through the tunnel → foreign IP → Iranian site blocks.
+		// With IPIfNonMatch, xray resolves via dns2socks (127.0.0.1 → tunnel → real DNS),
+		// gets the real Iranian IP, matches geoip:ir → routes DIRECT from Iran. ✓
 		//
-		// To compensate for losing geoip-based domain routing, add geosite rules:
-		// - geosite:<country>: domain-based direct routing (AsIs-compatible)
-		// - geoip:<country>: IP-based direct routing (still works for bare-IP traffic)
-		// IP-based whitelist: still works with AsIs for bare-IP connections.
-		// Domain traffic (e.g. youtube.com) bypasses this entirely with AsIs,
-		// which is the point — ISP-poisoned IPs never get routed direct.
+		// The old concern (ISP poisoning: youtube.com → 10.x.x.x → private rule → direct)
+		// is now mitigated: dns2socks routes DNS through the tunnel so resolutions are
+		// uncensored. Blocked sites get real IPs → not private → go through proxy. ✓
+		//
+		// In gateway mode (tun2socks sends IPs), domainStrategy is irrelevant because
+		// tun2socks never sends hostnames — only destination IPs are forwarded.
 		for _, country := range cg.WhitelistCountries {
+			if xrayGeositeAvailable() {
+				rules = append(rules, map[string]interface{}{
+					"type":        "field",
+					"domain":      []string{fmt.Sprintf("geosite:%s", country)},
+					"outboundTag": "direct",
+				})
+			}
 			rules = append(rules, map[string]interface{}{
 				"type":        "field",
 				"ip":          []string{fmt.Sprintf("geoip:%s", country)},
@@ -828,12 +836,28 @@ func (cg *ConfigGenerator) generateXray(link *profile.Link) (string, error) {
 		}
 
 		cfg["routing"] = map[string]interface{}{
-			"domainStrategy": "AsIs",
+			"domainStrategy": "IPIfNonMatch",
 			"rules":          rules,
 		}
 	}
 
 	return cg.writeJSON("xray", cfg)
+}
+
+// xrayGeositeAvailable returns true when a geosite.dat that xray can load exists.
+// xray looks for it in the standard locations; if missing it crashes on geosite: rules.
+func xrayGeositeAvailable() bool {
+	candidates := []string{
+		"/usr/local/share/xray/geosite.dat",
+		"/usr/share/xray/geosite.dat",
+		"/etc/bypath/geo/geosite.dat",
+	}
+	for _, p := range candidates {
+		if info, err := os.Stat(p); err == nil && info.Size() > 1000 {
+			return true
+		}
+	}
+	return false
 }
 
 func (cg *ConfigGenerator) xrayOutbounds(link *profile.Link) []map[string]interface{} {
