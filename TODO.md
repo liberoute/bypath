@@ -15,11 +15,19 @@
 - [x] **Reality support** — pbk/sid/fingerprint from VLESS URI → sing-box utls + xray realitySettings
 - [x] **xray domainStrategy** — IPIfNonMatch for socks5h compatibility (geoip:ir matches even when browser sends domain)
 - [x] **verifyConnection native TUN** — Use `--interface localIP` to bypass auto_route when checking connectivity
+- [x] **verifyConnection CDN false positive** — Use gstatic.com/msftconnecttest.com/captive.apple.com instead of cp.cloudflare.com (CDN edge always answers the old check, giving false success)
+- [x] **xray geosite guard** — `xrayGeositeAvailable()` skips geosite:ir rule when geosite.dat is missing; prevents xray crash on devices without xray system package
 - [x] **geosite rule_set consistency** — DNS rules only reference tags that are defined in route rule_set section
 - [x] **xray downloader** — Extract binary from zip/tar.gz, clean up archive, verify binary exists
 - [x] **geo multi-country** — Download geoip+geosite .srs for all supported countries (ir, cn, us, ru, tr, de, fr, gb, ae)
 - [x] **bypath version geo status** — Per-country .srs status, Gateway Helpers section (tun2socks/dns2socks arch validation)
 - [x] **GitHub releases** — CI/CD pipeline publishes lite+full binaries for all targets on tag push
+- [x] **Self-healing gateway** — `cleanupPreviousRun()` on every `Start()`: kills tracked child PIDs, flushes iptables/routing, restores resolv.conf. Crash or kill -9 no longer breaks the network.
+- [x] **DNS intercept for DHCP clients** — iptables PREROUTING REDIRECT `:53 → bypath dns_port` in both modes. LAN clients with DHCP-assigned DNS need no manual change.
+- [x] **resolv.conf backup/restore** — Backs up original before overwriting; restores on stop.
+- [x] **sub update while running** — Routes subscription HTTP through local SOCKS proxy when bypath is active (avoids stale resolv.conf → 127.0.0.1).
+- [x] **bench all groups** — `bypath bench` (no `-g`) tests every group, shows per-group results, selects best across all groups.
+- [x] **systemd crash loop** — `StartLimitIntervalSec=0` + `PrivateTmp=false` in service unit.
 - [ ] **CDN links HTTPS issue** — CDN-based vless links only relay HTTP, not HTTPS. Detect and warn user.
 
 ## 🟡 Medium
@@ -28,7 +36,7 @@
 - [ ] **Health check timer** — Every 60s connectivity check. If fail → restart engine.
 - [x] **systemd installer** — install.sh creates and enables service file.
 - [ ] **Subscription auto-update** — Every 24h auto sub update (timer or goroutine).
-- [ ] **DHCP server** — Clients auto-get DNS/GW. No manual config needed.
+- [~] **DHCP server** — DNS intercept via iptables REDIRECT is in place (v2.5.8). Full DHCP server (auto-push GW setting) still pending.
 - [ ] **sing-box 1.14 migration** — Remove deprecated env vars, use proper `domain_resolver` and new DNS server format.
 - [ ] **Upload speed test** — Add upload test to bench (currently only download).
 - [ ] **Full build (zero deps)** — Embed sing-box + xray + tun2socks in the binary.
@@ -54,10 +62,11 @@
 ## ✅ Done (moved to CHANGELOG.md)
 
 - VLDR bug with comma-separated SNI lists fixed in configgen and main.go bench.
-- xray domainStrategy fixed: IPIfNonMatch (was AsIs, then fixed again in v2.5.6)
+- xray domainStrategy: `IPIfNonMatch` (final; dns2socks resolves via tunnel → real IPs → geoip:ir correct)
 - install.sh proxy support + geo multi-country download
 - per-link engine fallback (sing-box ↔ xray)
 - verifyConnection hang fix under native TUN mode
+- self-healing cleanupPreviousRun, DNS intercept, resolv.conf lifecycle (v2.5.8)
 
 ## ⚠️ Known Issues
 
@@ -65,6 +74,6 @@
 - Some subscription server links only accept connections from Iranian IPs (server-side restriction).
 - sing-box 1.13 rejects `detour: "direct"` on DNS servers — must use no detour.
 - Gateway verify needs 2s delay after sing-box start (port ready ≠ outbound ready).
-- Some subscription URLs are only accessible via proxy (use `o`/`p` in TUI to update via tunnel).
+- Some subscription URLs are only accessible via proxy (CLI `bypath sub update` now auto-routes via SOCKS if bypath is running; TUI also supports `o`/`p`).
 - `sub update` replaces ALL links in a group (by design — subscription is source of truth for that group).
 - geosite .srs only available for `ir` and `cn` from Chocolate4U; other countries have geoip only.
