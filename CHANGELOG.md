@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.5.10 (2026-06-05)
+
+### Bug Fixes
+- **`ir` in default `bypass_domains`** — Iranian sites (e.g. `login.samandehi.ir`) were routed through the tunnel because `countries: []` was set to avoid requiring `geoip.dat`. Without `ir` in `bypass_domains`, `.ir` domains went through the foreign exit node and received 403/connection refused. Added `"ir"` as the first entry in the default `bypass_domains` list so all `.ir` domains route direct without needing any geo data files.
+
 ## v2.5.9 (2026-06-05)
 
 ### Bug Fixes

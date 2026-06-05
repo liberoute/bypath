@@ -30,6 +30,7 @@ whitelist:
   # geosite_url: ""
   # Domains to route directly (bypass tunnel) for VPN detection bypass
   bypass_domains:
+    - "ir"              # route all .ir domains direct (Iranian sites don't need the tunnel)
     - "cloudflare.com"
     - "ip-api.com"
     - "ipinfo.io"
