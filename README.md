@@ -100,8 +100,8 @@ bypath select <name|number>       # Select active server
 bypath select <number> -g <group> # Select from specific group
 
 # Speed test
-bypath bench                      # Test first group
-bypath bench -g <group> --auto    # Test + auto-select best
+bypath bench                      # Test all groups, show per-group results
+bypath bench -g <group> --auto    # Test specific group + auto-select best
 
 # Subscriptions
 bypath sub add <url>              # Add subscription (auto-creates group)

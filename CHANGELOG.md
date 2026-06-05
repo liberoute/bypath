@@ -1,5 +1,25 @@
 # Changelog
 
+## v2.5.8 (2026-06-05)
+
+### Bug Fixes
+- **Self-healing on restart** — `cleanupPreviousRun()` runs at the top of `Start()`, killing bypath's own tracked child processes (not user-run daemons), flushing iptables/routing tables, and restoring `/etc/resolv.conf` from backup. A crash or `kill -9` no longer leaves the network broken.
+- **Child process safety** — PIDs are tracked in `/var/run/bypath.children`; cleanup only kills processes bypath itself started. User-run sing-box/xray/tun2socks are untouched.
+- **DNS intercept for DHCP clients** — `setupDNSIntercept()` adds iptables `PREROUTING REDIRECT :53 → bypath_dns_port` so LAN clients that receive a different DNS via DHCP still hit bypath's resolver. No manual DNS config needed on clients.
+- **resolv.conf backup/restore** — `setResolvConf()` backs up the original `/etc/resolv.conf` before overwriting; `restoreResolvConf()` restores it on `bypath stop` (falls back to `8.8.8.8` if backup is missing).
+- **dns_upstream from config** — `startDNS()` no longer hardcodes `1.1.1.1`; reads from `gateway.dns_upstream` in config.
+- **Double dns2socks** — `startDNS()` kills its own previous dns2socks instance before starting a new one, preventing two concurrent DNS proxies on restart.
+- **pinHostToEtcHosts ISP bypass** — Host pinner uses a direct resolver (bypassing `/etc/resolv.conf`) and rejects private/bogon IPs from ISP DNS interception. Called before engine start, not after.
+- **verifyConnection false positive** — Tests `gstatic.com`, `msftconnecttest.com`, and `captive.apple.com` instead of `cp.cloudflare.com`. CDN-based VLESS proxies (Cloudflare edge) always answered the old check from their own edge, giving a false success for non-working proxies.
+- **xray geosite guard** — `xrayGeositeAvailable()` checks for `geosite.dat` before adding the `geosite:ir` rule. Previously, if the file was missing (e.g. Orange Pi without xray system package), xray crashed with "code not found in geosite.dat: IR" and never started.
+- **xray domainStrategy** — Changed from `AsIs` to `IPIfNonMatch` for correct `geoip:ir` matching in proxy mode. With `AsIs`, domains were never resolved so `geoip:ir` never fired and Iranian sites (e.g. samandehi.ir) went through the tunnel. Now dns2socks resolves via the tunnel → real IPs → correct routing.
+- **systemd crash loop** — `install.sh` adds `StartLimitIntervalSec=0` to `[Unit]` so bypath never enters systemd "failed" state. `PrivateTmp=false` allows engine binaries in `/opt/bypath/engines/` to be reached.
+- **sub update while running** — `bypath sub update` detects if bypath is active and routes the HTTP request through the local SOCKS proxy, avoiding the stale `resolv.conf → 127.0.0.1` that would otherwise block reaching the subscription URL.
+
+### Improvements
+- **bench tests all groups** — `bypath bench` (without `-g`) now tests every group, shows per-group results, and selects the best server across all groups. Previously it only tested the first group.
+- **cmdRun retry loop** — `bypath run` retries every 30 s on engine failure instead of `log.Fatalf`, preventing systemd from immediately entering "failed" state when no servers are reachable.
+
 ## v2.5.7 (2026-06-04)
 
 ### Bug Fixes
