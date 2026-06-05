@@ -3,15 +3,27 @@ package tunnel
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/liberoute/bypath/internal/engine"
 	"github.com/liberoute/bypath/internal/paths"
 	"github.com/liberoute/bypath/internal/profile"
 )
+
+// RoutingRule maps a traffic matcher to a named outbound.
+// Match: "geoip:<cc>" | "geosite:<tag>" | "domain:<exact>" | "domain_suffix:<suffix>" | "ip_cidr:<cidr>" | "default"
+// Outbound: "direct" | "proxy" | any name in ConfigGenerator.ExternalOutbounds
+type RoutingRule struct {
+	Match    string
+	Outbound string
+}
 
 // ConfigGenerator creates engine-specific configuration files from a Link.
 type ConfigGenerator struct {
@@ -25,6 +37,14 @@ type ConfigGenerator struct {
 	SNISpoof           string   // fake SNI to replace real one (empty = disabled)
 	GatewayMode        bool     // when true, generate TUN inbound + DNS server config
 	DNSPort            int      // DNS listen port for gateway mode (default: 53)
+	// New rule-based routing (overrides whitelist fields when non-empty)
+	RoutingRules      []RoutingRule     // ordered routing rules; last rule with match="default" sets final outbound
+	ExternalOutbounds map[string]string // name → proxy URL (e.g. "lray-proxy" → "socks5://172.20.100.12:8088")
+	// PinnedHosts maps hostnames to resolved IPs (populated from /etc/hosts pins).
+	// When set, the outbound server address is replaced with the IP so that
+	// sing-box's internal DNS resolver doesn't need to resolve the hostname itself —
+	// avoiding bootstrap loops and ISP DNS interception for the proxy server.
+	PinnedHosts map[string]string // hostname → IP (e.g. "dl8.okarimi.ir" → "104.16.6.70")
 }
 
 // NewConfigGenerator creates a new config generator.
@@ -164,13 +184,23 @@ func (cg *ConfigGenerator) BuildSingboxOutbound(link *profile.Link) map[string]i
 		sni = cg.SNISpoof
 	}
 
+	// Use pinned IP instead of hostname when available.
+	// sing-box's internal DNS resolver doesn't read /etc/hosts, so using the
+	// hostname would require a live DNS query — which may fail if ISP intercepts
+	// DNS or if the query races with the tunnel bootstrap. Using the pre-resolved
+	// IP avoids the lookup entirely; TLS SNI and WS Host headers remain correct.
+	serverAddr := link.Address
+	if ip, ok := cg.PinnedHosts[link.Address]; ok && ip != "" {
+		serverAddr = ip
+	}
+
 	var outbound map[string]interface{}
 
 	switch link.Protocol {
 	case "vmess":
 		outbound = map[string]interface{}{
 			"type":        "vmess",
-			"server":      link.Address,
+			"server":      serverAddr,
 			"server_port": link.Port,
 			"uuid":        link.UUID,
 			"alter_id":    link.AlterId,
@@ -199,7 +229,7 @@ func (cg *ConfigGenerator) BuildSingboxOutbound(link *profile.Link) map[string]i
 	case "vless":
 		outbound = map[string]interface{}{
 			"type":        "vless",
-			"server":      link.Address,
+			"server":      serverAddr,
 			"server_port": link.Port,
 			"uuid":        link.UUID,
 		}
@@ -255,7 +285,7 @@ func (cg *ConfigGenerator) BuildSingboxOutbound(link *profile.Link) map[string]i
 	case "trojan":
 		outbound = map[string]interface{}{
 			"type":        "trojan",
-			"server":      link.Address,
+			"server":      serverAddr,
 			"server_port": link.Port,
 			"password":    link.UUID,
 		}
@@ -275,7 +305,7 @@ func (cg *ConfigGenerator) BuildSingboxOutbound(link *profile.Link) map[string]i
 	case "shadowsocks":
 		outbound = map[string]interface{}{
 			"type":        "shadowsocks",
-			"server":      link.Address,
+			"server":      serverAddr,
 			"server_port": link.Port,
 			"method":      link.Security,
 			"password":    link.UUID,
@@ -283,18 +313,18 @@ func (cg *ConfigGenerator) BuildSingboxOutbound(link *profile.Link) map[string]i
 
 	case "wireguard":
 		outbound = map[string]interface{}{
-			"type":           "wireguard",
-			"server":         link.Address,
-			"server_port":    link.Port,
-			"private_key":    link.PrivateKey,
+			"type":            "wireguard",
+			"server":          serverAddr,
+			"server_port":     link.Port,
+			"private_key":     link.PrivateKey,
 			"peer_public_key": link.PublicKey,
-			"local_address":  []string{"10.0.0.2/32"},
+			"local_address":   []string{"10.0.0.2/32"},
 		}
 
 	case "socks5":
 		outbound = map[string]interface{}{
 			"type":        "socks",
-			"server":      link.Address,
+			"server":      serverAddr,
 			"server_port": link.Port,
 			"version":     "5",
 		}
@@ -306,7 +336,7 @@ func (cg *ConfigGenerator) BuildSingboxOutbound(link *profile.Link) map[string]i
 	case "http":
 		outbound = map[string]interface{}{
 			"type":        "http",
-			"server":      link.Address,
+			"server":      serverAddr,
 			"server_port": link.Port,
 		}
 		if link.UUID != "" {
@@ -362,8 +392,8 @@ func (cg *ConfigGenerator) singboxDNS(link *profile.Link) map[string]interface{}
 		geositeCountries = cg.WhitelistCountries
 	}
 
-	if !cg.GatewayMode && len(geositeCountries) == 0 {
-		// Fallback: simple DNS, direct only (current behavior for proxy-only mode)
+	if !cg.GatewayMode && len(geositeCountries) == 0 && len(cg.RoutingRules) == 0 {
+		// Fallback: simple DNS, direct only (proxy-only mode with no routing rules)
 		return map[string]interface{}{
 			"servers": []map[string]interface{}{
 				{
@@ -378,6 +408,9 @@ func (cg *ConfigGenerator) singboxDNS(link *profile.Link) map[string]interface{}
 	}
 
 	// Split DNS: tunnel + direct (sing-box 1.12+ format)
+	// Loop prevention is handled by DNS rules: domains that go DIRECT also resolve
+	// via dns-direct (see rule generation below), so dns-tunnel is never needed
+	// when setting up a direct connection, avoiding the proxy bootstrap loop.
 	servers := []map[string]interface{}{
 		{
 			"tag":         "dns-tunnel",
@@ -425,14 +458,53 @@ func (cg *ConfigGenerator) singboxDNS(link *profile.Link) map[string]interface{}
 		}
 	}
 
-	// DNS rules: geosite rule_sets → dns-direct
-	// IMPORTANT: only add DNS rules for geosite files that are actually defined
-	// in the route rule_set section. In legacy mode (GatewayMode=false),
-	// GeositeCountries is empty so we use WhitelistCountries, but we must only
-	// reference tags that will have corresponding rule_set definitions in route.
-	// Route only defines geosite rule_sets when GeositeCountries is non-empty,
-	// so we must be consistent here.
-	if len(cg.GeositeCountries) > 0 {
+	// When using new routing rules: derive DNS rules from routing rules.
+	// Any domain routed to "direct" must also resolve via dns-direct to avoid
+	// the loop: dns-tunnel→proxy→resolve dl8→dns-direct→1.1.1.1→proxy→...
+	if len(cg.RoutingRules) > 0 {
+		for _, rule := range cg.RoutingRules {
+			if rule.Outbound != "direct" || rule.Match == "default" {
+				continue
+			}
+			parts := strings.SplitN(rule.Match, ":", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			typ, val := parts[0], parts[1]
+			switch typ {
+			case "geosite":
+				p := filepath.Join(paths.Get().GeoDir, fmt.Sprintf("geosite-%s.srs", val))
+				if _, err := os.Stat(p); err == nil {
+					dnsRules = append(dnsRules, map[string]interface{}{
+						"rule_set": []string{fmt.Sprintf("geosite-%s", val)},
+						"server":   "dns-direct",
+					})
+				}
+			case "geoip":
+				dnsRules = append(dnsRules, map[string]interface{}{
+					"rule_set": []string{fmt.Sprintf("geoip-%s", val)},
+					"server":   "dns-direct",
+				})
+			case "domain_suffix":
+				dnsRules = append(dnsRules, map[string]interface{}{
+					"domain_suffix": []string{val},
+					"server":        "dns-direct",
+				})
+			case "domain":
+				dnsRules = append(dnsRules, map[string]interface{}{
+					"domain": []string{val},
+					"server": "dns-direct",
+				})
+			}
+		}
+	} else if len(cg.GeositeCountries) > 0 {
+		// Legacy whitelist mode: geosite rule_sets → dns-direct
+		// IMPORTANT: only add DNS rules for geosite files that are actually defined
+		// in the route rule_set section. In legacy mode (GatewayMode=false),
+		// GeositeCountries is empty so we use WhitelistCountries, but we must only
+		// reference tags that will have corresponding rule_set definitions in route.
+		// Route only defines geosite rule_sets when GeositeCountries is non-empty,
+		// so we must be consistent here.
 		var ruleSetTags []string
 		for _, country := range cg.GeositeCountries {
 			geositePath := filepath.Join(paths.Get().GeoDir, fmt.Sprintf("geosite-%s.srs", country))
@@ -487,9 +559,181 @@ func (cg *ConfigGenerator) singboxGeositeRuleSets() []map[string]interface{} {
 	return ruleSets
 }
 
+// singboxRouteFromRules builds the sing-box route section from RoutingRules.
+// Private IPs always go direct. Rules are evaluated in order; "default" sets the final outbound.
+func (cg *ConfigGenerator) singboxRouteFromRules() map[string]interface{} {
+	var rules []map[string]interface{}
+	seenRuleSets := map[string]bool{}
+	var ruleSets []map[string]interface{}
+	finalOutbound := "proxy"
+
+	rules = append(rules, map[string]interface{}{
+		"action":  "sniff",
+		"timeout": "300ms",
+	})
+	rules = append(rules, map[string]interface{}{
+		"ip_is_private": true,
+		"action":        "route",
+		"outbound":      "direct",
+	})
+
+	for _, rule := range cg.RoutingRules {
+		if rule.Match == "default" {
+			finalOutbound = rule.Outbound
+			continue
+		}
+		sbRule := cg.singboxRuleFromMatcher(rule.Match, rule.Outbound)
+		if sbRule == nil {
+			log.Printf("⚠️  routing rule: unsupported matcher %q, skipping", rule.Match)
+			continue
+		}
+		rules = append(rules, sbRule)
+		if rs := cg.ruleSetForMatcher(rule.Match); rs != nil {
+			tag := rs["tag"].(string)
+			if !seenRuleSets[tag] {
+				seenRuleSets[tag] = true
+				ruleSets = append(ruleSets, rs)
+			}
+		}
+	}
+
+	route := map[string]interface{}{
+		"rules":                   rules,
+		"final":                   finalOutbound,
+		"default_domain_resolver": "dns-tunnel",
+	}
+	if cg.GatewayMode {
+		route["auto_detect_interface"] = true
+	}
+	if len(ruleSets) > 0 {
+		route["rule_set"] = ruleSets
+	}
+	return route
+}
+
+// singboxRuleFromMatcher converts a match string + outbound to a sing-box rule map.
+func (cg *ConfigGenerator) singboxRuleFromMatcher(match, outbound string) map[string]interface{} {
+	parts := strings.SplitN(match, ":", 2)
+	if len(parts) != 2 {
+		return nil
+	}
+	typ, val := parts[0], parts[1]
+	rule := map[string]interface{}{"action": "route", "outbound": outbound}
+	switch typ {
+	case "geoip":
+		rule["rule_set"] = []string{fmt.Sprintf("geoip-%s", val)}
+	case "geosite":
+		rule["rule_set"] = []string{fmt.Sprintf("geosite-%s", val)}
+	case "domain":
+		rule["domain"] = []string{val}
+	case "domain_suffix":
+		rule["domain_suffix"] = []string{val}
+	case "ip_cidr":
+		rule["ip_cidr"] = []string{val}
+	default:
+		return nil
+	}
+	return rule
+}
+
+// ruleSetForMatcher returns the sing-box rule_set definition for a geoip/geosite matcher,
+// or nil if the matcher doesn't need one (or the file doesn't exist for geosite).
+func (cg *ConfigGenerator) ruleSetForMatcher(match string) map[string]interface{} {
+	parts := strings.SplitN(match, ":", 2)
+	if len(parts) != 2 {
+		return nil
+	}
+	typ, val := parts[0], parts[1]
+	switch typ {
+	case "geoip":
+		return map[string]interface{}{
+			"type":   "local",
+			"tag":    fmt.Sprintf("geoip-%s", val),
+			"format": "binary",
+			"path":   filepath.Join(paths.Get().GeoDir, fmt.Sprintf("geoip-%s.srs", val)),
+		}
+	case "geosite":
+		p := filepath.Join(paths.Get().GeoDir, fmt.Sprintf("geosite-%s.srs", val))
+		if _, err := os.Stat(p); err != nil {
+			return nil
+		}
+		return map[string]interface{}{
+			"type":   "local",
+			"tag":    fmt.Sprintf("geosite-%s", val),
+			"format": "binary",
+			"path":   p,
+		}
+	}
+	return nil
+}
+
+// singboxExternalOutbounds returns sing-box outbound entries for each ExternalOutbound URL.
+func (cg *ConfigGenerator) singboxExternalOutbounds() []map[string]interface{} {
+	names := make([]string, 0, len(cg.ExternalOutbounds))
+	for name := range cg.ExternalOutbounds {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var result []map[string]interface{}
+	for _, name := range names {
+		ob := parseSingboxExternalOutbound(name, cg.ExternalOutbounds[name])
+		if ob != nil {
+			result = append(result, ob)
+		}
+	}
+	return result
+}
+
+func parseSingboxExternalOutbound(tag, rawURL string) map[string]interface{} {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		log.Printf("⚠️  external_outbounds %q: invalid URL: %v", tag, err)
+		return nil
+	}
+	host, portStr, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		log.Printf("⚠️  external_outbounds %q: invalid host:port: %v", tag, err)
+		return nil
+	}
+	port, _ := strconv.Atoi(portStr)
+
+	ob := map[string]interface{}{
+		"tag":         tag,
+		"server":      host,
+		"server_port": port,
+	}
+	if u.User != nil {
+		ob["username"] = u.User.Username()
+		if pwd, ok := u.User.Password(); ok {
+			ob["password"] = pwd
+		}
+	}
+	switch u.Scheme {
+	case "socks5", "socks5h":
+		ob["type"] = "socks"
+		ob["version"] = "5"
+	case "socks4":
+		ob["type"] = "socks"
+		ob["version"] = "4"
+	case "http":
+		ob["type"] = "http"
+	case "https":
+		ob["type"] = "http"
+		ob["tls"] = map[string]interface{}{"enabled": true}
+	default:
+		log.Printf("⚠️  external_outbounds %q: unsupported scheme %q", tag, u.Scheme)
+		return nil
+	}
+	return ob
+}
+
 // singboxRoute builds the route section with geoip-based whitelist rules.
 // Traffic destined for whitelisted countries goes direct; everything else goes through proxy.
 func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface{} {
+	if len(cg.RoutingRules) > 0 {
+		return cg.singboxRouteFromRules()
+	}
 	var rules []map[string]interface{}
 
 	// Rule: sniff to detect domain from TLS/HTTP
@@ -621,8 +865,8 @@ func (cg *ConfigGenerator) generateSingBox(link *profile.Link) (string, error) {
 
 	// Route and DNS sections:
 	// - Gateway mode: always include (needed for TUN routing and DNS serving)
-	// - Proxy mode: include only when whitelist/bypass/geosite is configured
-	if cg.GatewayMode || len(cg.WhitelistCountries) > 0 || len(cg.BypassDomains) > 0 || len(cg.GeositeCountries) > 0 {
+	// - Proxy mode: include when whitelist/bypass/geosite is configured OR routing rules are set
+	if cg.GatewayMode || len(cg.RoutingRules) > 0 || len(cg.WhitelistCountries) > 0 || len(cg.BypassDomains) > 0 || len(cg.GeositeCountries) > 0 {
 		cfg["route"] = cg.singboxRoute(link)
 		cfg["dns"] = cg.singboxDNS(link)
 	}
@@ -691,9 +935,10 @@ func (cg *ConfigGenerator) singboxOutbounds(link *profile.Link) []map[string]int
 	}
 	outbound["tag"] = "proxy"
 
+	var outbounds []map[string]interface{}
 	if link.ChainProxy != "" {
 		outbound["detour"] = "chain-out"
-		return []map[string]interface{}{
+		outbounds = []map[string]interface{}{
 			outbound,
 			{
 				"type":        "socks",
@@ -703,12 +948,14 @@ func (cg *ConfigGenerator) singboxOutbounds(link *profile.Link) []map[string]int
 			},
 			{"type": "direct", "tag": "direct"},
 		}
+	} else {
+		outbounds = []map[string]interface{}{
+			outbound,
+			{"type": "direct", "tag": "direct"},
+		}
 	}
-
-	return []map[string]interface{}{
-		outbound,
-		{"type": "direct", "tag": "direct"},
-	}
+	outbounds = append(outbounds, cg.singboxExternalOutbounds()...)
+	return outbounds
 }
 
 // --- xray config generation ---
@@ -816,8 +1063,16 @@ func (cg *ConfigGenerator) generateXray(link *profile.Link) (string, error) {
 		"outbounds": cg.xrayOutbounds(link),
 	}
 
-	// Add routing rules for whitelist countries (geoip-based direct routing)
-	if len(cg.WhitelistCountries) > 0 || len(cg.BypassDomains) > 0 || len(cg.ForceProxyDomains) > 0 {
+	// Append external outbounds (referenced by routing rules or used manually)
+	if len(cg.ExternalOutbounds) > 0 {
+		existing := cfg["outbounds"].([]map[string]interface{})
+		cfg["outbounds"] = append(existing, cg.xrayExternalOutbounds()...)
+	}
+
+	// Add routing: prefer new rule-based system, fall back to legacy whitelist config.
+	if len(cg.RoutingRules) > 0 {
+		cfg["routing"] = cg.xrayRouteFromRules()
+	} else if len(cg.WhitelistCountries) > 0 || len(cg.BypassDomains) > 0 || len(cg.ForceProxyDomains) > 0 {
 		var rules []map[string]interface{}
 
 		// Private/LAN IPs → direct (use explicit RFC1918 ranges; geoip:private is not
@@ -907,6 +1162,131 @@ func xrayGeositeAvailable() bool {
 		}
 	}
 	return false
+}
+
+// xrayRouteFromRules builds the xray routing section from RoutingRules.
+// Private IPs always go direct. A "default" rule becomes a TCP+UDP catch-all at the end.
+func (cg *ConfigGenerator) xrayRouteFromRules() map[string]interface{} {
+	var rules []map[string]interface{}
+	finalOutbound := "proxy"
+
+	rules = append(rules, map[string]interface{}{
+		"type":        "field",
+		"ip":          []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "fc00::/7", "::1/128"},
+		"outboundTag": "direct",
+	})
+
+	for _, rule := range cg.RoutingRules {
+		if rule.Match == "default" {
+			finalOutbound = rule.Outbound
+			continue
+		}
+		xrayRule := cg.xrayRuleFromMatcher(rule.Match, rule.Outbound)
+		if xrayRule == nil {
+			log.Printf("⚠️  routing rule: unsupported matcher %q for xray, skipping", rule.Match)
+			continue
+		}
+		rules = append(rules, xrayRule)
+	}
+
+	// Explicit catch-all so unmatched traffic routes to the correct final outbound.
+	rules = append(rules, map[string]interface{}{
+		"type":        "field",
+		"network":     "tcp,udp",
+		"outboundTag": finalOutbound,
+	})
+
+	return map[string]interface{}{
+		"domainStrategy": "IPIfNonMatch",
+		"rules":          rules,
+	}
+}
+
+// xrayRuleFromMatcher converts a match string + outbound to an xray routing rule.
+func (cg *ConfigGenerator) xrayRuleFromMatcher(match, outbound string) map[string]interface{} {
+	parts := strings.SplitN(match, ":", 2)
+	if len(parts) != 2 {
+		return nil
+	}
+	typ, val := parts[0], parts[1]
+	rule := map[string]interface{}{"type": "field", "outboundTag": outbound}
+	switch typ {
+	case "geoip":
+		rule["ip"] = []string{fmt.Sprintf("geoip:%s", val)}
+	case "geosite":
+		if !xrayGeositeAvailable() {
+			log.Printf("⚠️  routing rule geosite:%s: geosite.dat not found, skipping", val)
+			return nil
+		}
+		rule["domain"] = []string{fmt.Sprintf("geosite:%s", val)}
+	case "domain":
+		rule["domain"] = []string{fmt.Sprintf("full:%s", val)}
+	case "domain_suffix":
+		rule["domain"] = []string{fmt.Sprintf("domain:%s", val)}
+	case "ip_cidr":
+		rule["ip"] = []string{val}
+	default:
+		return nil
+	}
+	return rule
+}
+
+// xrayExternalOutbounds returns xray outbound entries for each ExternalOutbound URL.
+func (cg *ConfigGenerator) xrayExternalOutbounds() []map[string]interface{} {
+	names := make([]string, 0, len(cg.ExternalOutbounds))
+	for name := range cg.ExternalOutbounds {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var result []map[string]interface{}
+	for _, name := range names {
+		ob := parseXrayExternalOutbound(name, cg.ExternalOutbounds[name])
+		if ob != nil {
+			result = append(result, ob)
+		}
+	}
+	return result
+}
+
+func parseXrayExternalOutbound(tag, rawURL string) map[string]interface{} {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		log.Printf("⚠️  external_outbounds %q: invalid URL: %v", tag, err)
+		return nil
+	}
+	host, portStr, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		log.Printf("⚠️  external_outbounds %q: invalid host:port: %v", tag, err)
+		return nil
+	}
+	port, _ := strconv.Atoi(portStr)
+
+	server := map[string]interface{}{"address": host, "port": port}
+	if u.User != nil {
+		user := u.User.Username()
+		pwd, _ := u.User.Password()
+		server["users"] = []map[string]interface{}{{"user": user, "pass": pwd}}
+	}
+
+	var protocol string
+	switch u.Scheme {
+	case "socks5", "socks5h", "socks4", "socks":
+		protocol = "socks"
+	case "http", "https":
+		protocol = "http"
+	default:
+		log.Printf("⚠️  external_outbounds %q: unsupported scheme %q", tag, u.Scheme)
+		return nil
+	}
+
+	return map[string]interface{}{
+		"tag":      tag,
+		"protocol": protocol,
+		"settings": map[string]interface{}{
+			"servers": []map[string]interface{}{server},
+		},
+	}
 }
 
 func (cg *ConfigGenerator) xrayOutbounds(link *profile.Link) []map[string]interface{} {

@@ -641,8 +641,11 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 	// The engine needs to connect to the VLESS server by hostname, but ISPs
 	// intercept DNS and return fake IPs. Pinning first ensures the engine gets
 	// the real IP regardless of what the system DNS returns.
+	pinnedHosts := map[string]string{}
 	if link.Address != "" {
-		gw.pinHostToEtcHosts(link.Address)
+		if ip := gw.pinHostToEtcHosts(link.Address); ip != "" {
+			pinnedHosts[link.Address] = ip
+		}
 	}
 
 	// Determine engine
@@ -652,17 +655,27 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 		return fmt.Errorf("engine %s not available: %w", engineName, err)
 	}
 
-	// Generate config (with whitelist countries for sing-box geoip routing)
+	// Generate config (with routing rules or legacy whitelist for geoip/geosite routing)
 	configGen := tunnel.NewConfigGenerator(paths.Get().TmpDir)
-	configGen.WhitelistCountries = gw.config.Whitelist.Countries
-	// If geosite_countries not explicitly set, mirror whitelist countries so
-	// domain-based routing (geosite:ir) works alongside IP-based (geoip:ir).
-	configGen.GeositeCountries = gw.config.Whitelist.GeositeCountries
-	if len(configGen.GeositeCountries) == 0 {
-		configGen.GeositeCountries = gw.config.Whitelist.Countries
+	configGen.PinnedHosts = pinnedHosts
+	if len(gw.config.Routing.Rules) > 0 {
+		// New rule-based routing: map config rules to tunnel rules
+		rules := make([]tunnel.RoutingRule, len(gw.config.Routing.Rules))
+		for i, r := range gw.config.Routing.Rules {
+			rules[i] = tunnel.RoutingRule{Match: r.Match, Outbound: r.Outbound}
+		}
+		configGen.RoutingRules = rules
+		configGen.ExternalOutbounds = gw.config.Routing.ExternalOutbounds
+	} else {
+		// Legacy whitelist config (deprecated — shows warning at load time)
+		configGen.WhitelistCountries = gw.config.Whitelist.Countries
+		configGen.GeositeCountries = gw.config.Whitelist.GeositeCountries
+		if len(configGen.GeositeCountries) == 0 {
+			configGen.GeositeCountries = gw.config.Whitelist.Countries
+		}
+		configGen.BypassDomains = gw.config.Whitelist.BypassDomains
+		configGen.ForceProxyDomains = gw.config.Whitelist.ForceProxyDomains
 	}
-	configGen.BypassDomains = gw.config.Whitelist.BypassDomains
-	configGen.ForceProxyDomains = gw.config.Whitelist.ForceProxyDomains
 	configGen.DNSUpstream = gw.config.Gateway.DNSUpstream
 	configGen.SOCKSPort = gw.socksPort
 	if gw.config.SNISpoof.Enabled {
@@ -1052,10 +1065,11 @@ func (gw *Gateway) setupRouting() error {
 // pinHostToEtcHosts resolves hostname bypassing /etc/resolv.conf (which may
 // be ISP-poisoned) and writes a static entry to /etc/hosts. This lets
 // xray/sing-box reach the tunnel server after resolv.conf is switched to 127.0.0.1.
-func (gw *Gateway) pinHostToEtcHosts(hostname string) {
+// Returns the resolved IP on success, or "" if resolution failed or hostname is already an IP.
+func (gw *Gateway) pinHostToEtcHosts(hostname string) string {
 	// Skip if it's already an IP
 	if net.ParseIP(hostname) != nil {
-		return
+		return ""
 	}
 
 	// Use the configured upstream DNS servers directly (bypass system resolv.conf).
@@ -1093,7 +1107,7 @@ func (gw *Gateway) pinHostToEtcHosts(hostname string) {
 
 	if ip == "" {
 		log.Printf("⚠️  Could not resolve %s via any upstream DNS", hostname)
-		return
+		return ""
 	}
 
 	marker := "# bypath-pin"
@@ -1116,9 +1130,10 @@ func (gw *Gateway) pinHostToEtcHosts(hostname string) {
 
 	if err := os.WriteFile("/etc/hosts", []byte(newContent), 0644); err != nil {
 		log.Printf("⚠️  Could not pin %s to /etc/hosts: %v", hostname, err)
-		return
+		return ""
 	}
 	log.Printf("🔧 Pinned %s → %s in /etc/hosts", hostname, ip)
+	return ip
 }
 
 // unpinHostsFromEtcHosts removes all bypath-pin entries added by pinHostToEtcHosts.

@@ -17,6 +17,7 @@ type Config struct {
 	Whitelist   WhitelistConfig   `yaml:"whitelist"`
 	Isolation   IsolationConfig   `yaml:"isolation"`
 	Profiles    ProfilesConfig    `yaml:"profiles"`
+	Routing     RoutingConfig     `yaml:"routing,omitempty"`
 	Chains      []ChainConfig     `yaml:"chains"`
 	HealthCheck HealthCheckConfig `yaml:"health_check,omitempty"`
 	DHCP        DHCPConfig        `yaml:"dhcp,omitempty"`
@@ -55,6 +56,22 @@ type WhitelistConfig struct {
 	ForceProxyDomains []string `yaml:"force_proxy_domains,omitempty"`
 	CustomFile       string   `yaml:"custom_file,omitempty"`
 	UpdateInterval   string   `yaml:"update_interval"`
+}
+
+// RoutingRule maps a traffic matcher to a named outbound.
+// Match syntax: "geoip:<cc>", "geosite:<tag>", "domain:<exact>", "domain_suffix:<suffix>", "ip_cidr:<cidr>", "default"
+// Outbound: "direct", "proxy", or any name defined in RoutingConfig.ExternalOutbounds
+type RoutingRule struct {
+	Match    string `yaml:"match"`
+	Outbound string `yaml:"outbound"`
+}
+
+// RoutingConfig is the new rule-based routing system.
+// When Rules is non-empty it overrides the legacy whitelist config entirely.
+// ExternalOutbounds defines proxy servers not managed by bypath profiles.
+type RoutingConfig struct {
+	Rules             []RoutingRule     `yaml:"rules,omitempty"`
+	ExternalOutbounds map[string]string `yaml:"external_outbounds,omitempty"` // name → URL e.g. "lray-proxy": "socks5://172.20.100.12:8088"
 }
 
 type IsolationConfig struct {
@@ -117,7 +134,20 @@ func Load(path string) (*Config, error) {
 
 	applyDefaults(cfg)
 	validateBypassDomains(cfg)
+	warnLegacyRouting(cfg)
 	return cfg, nil
+}
+
+// warnLegacyRouting prints a deprecation notice when whitelist-style config is used
+// without a routing.rules block. Silence it by migrating to routing.rules.
+func warnLegacyRouting(cfg *Config) {
+	if len(cfg.Routing.Rules) > 0 {
+		return // new system active
+	}
+	if len(cfg.Whitelist.Countries) > 0 || len(cfg.Whitelist.BypassDomains) > 0 ||
+		len(cfg.Whitelist.ForceProxyDomains) > 0 || len(cfg.Whitelist.GeositeCountries) > 0 {
+		log.Println("⚠️  [config] whitelist is deprecated — migrate to routing.rules for per-outbound control")
+	}
 }
 
 // validateBypassDomains filters out empty strings from BypassDomains and logs a warning for each removed entry.

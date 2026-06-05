@@ -21,21 +21,35 @@ engines:
   prefer_system: true
   preferred: ""           # "sing-box" or "xray" (empty = auto-detect based on protocol)
 
-# Country IPs that bypass the tunnel (go direct)
-whitelist:
-  countries: ["ir"]
-  # Domain-based whitelist using geosite rule sets (complements geoip)
-  # geosite_countries: ["ir"]
-  # Custom geosite download URL (empty = default SagerNet/sing-geosite GitHub releases)
-  # geosite_url: ""
-  # Domains to route directly (bypass tunnel) for VPN detection bypass
-  bypass_domains:
-    - "ir"              # route all .ir domains direct (Iranian sites don't need the tunnel)
-    - "cloudflare.com"
-    - "ip-api.com"
-    - "ipinfo.io"
-    - "api.myip.com"
-  update_interval: "24h"
+# Rule-based routing — map traffic matchers to named outbounds.
+# Matchers: geoip:<cc>, geosite:<tag>, domain:<exact>, domain_suffix:<suffix>, ip_cidr:<cidr>, default
+# Outbounds: direct, proxy, or any name defined in external_outbounds below.
+# Rules are evaluated in order; private IPs always go direct regardless.
+routing:
+  rules:
+    - match: geoip:ir
+      outbound: direct
+    - match: geosite:ir
+      outbound: direct
+    - match: domain_suffix:cloudflare.com
+      outbound: direct
+    - match: domain_suffix:ip-api.com
+      outbound: direct
+    - match: default
+      outbound: proxy
+
+  # External proxy servers not managed by bypath profiles.
+  # Format: <name>: <url>   (supported schemes: socks5, socks4, http, https)
+  # external_outbounds:
+  #   lray-proxy: socks5://172.20.100.12:8088
+
+# Legacy whitelist config (deprecated — use routing.rules above instead)
+# whitelist:
+#   countries: ["ir"]
+#   bypass_domains:
+#     - "ir"
+#     - "cloudflare.com"
+#   update_interval: "24h"
 
 # Network namespace isolation for tunnel processes
 isolation:
@@ -62,3 +76,4 @@ chains:
   - name: "default"
     hops:
       - profile: "my-server"
+        engine: ""       # empty = auto-detect based on protocol
