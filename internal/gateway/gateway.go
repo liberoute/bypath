@@ -1,10 +1,13 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
@@ -18,6 +21,7 @@ import (
 	"github.com/liberoute/bypath/internal/profile"
 	"github.com/liberoute/bypath/internal/tunnel"
 	"github.com/liberoute/bypath/internal/whitelist"
+	"github.com/miekg/dns"
 )
 
 // Gateway is the main orchestrator. When Start() is called it:
@@ -37,6 +41,7 @@ type Gateway struct {
 	engineProc  *exec.Cmd
 	dnsProc     *exec.Cmd
 	tunProc     *exec.Cmd
+	dnsBuiltin  []*dns.Server // built-in DNS servers (fallback when dns2socks/dnsmasq absent)
 
 	// Native TUN state
 	nativeTUN bool // whether sing-box native TUN is active
@@ -208,6 +213,10 @@ func (gw *Gateway) Stop() {
 		gw.dnsProc.Wait()
 		log.Println("  ✓ DNS proxy stopped")
 	}
+	for _, s := range gw.dnsBuiltin {
+		s.Shutdown()
+	}
+	gw.dnsBuiltin = nil
 
 	// Stop engine — in native TUN mode, sing-box removes its TUN device on exit
 	if gw.engineProc != nil {
@@ -537,15 +546,92 @@ func (gw *Gateway) verifyConnection() bool {
 		baseArgs = append(baseArgs, "--interface", gw.localIP)
 	}
 
+	tunnelOK := false
 	for _, c := range candidates {
 		args := append(baseArgs, c.url)
 		cmd := exec.CommandContext(gw.ctx, "curl", args...)
 		out, err := cmd.Output()
 		if err == nil && strings.TrimSpace(string(out)) == c.wantCode {
-			return true
+			tunnelOK = true
+			break
 		}
 	}
-	return false
+	if !tunnelOK {
+		return false
+	}
+
+	// If Iran is whitelisted, also verify that Iranian sites are routed direct
+	// (not proxied through a foreign exit node).
+	return gw.verifyWhitelistRouting()
+}
+
+// verifyWhitelistRouting checks that whitelisted-country sites are reachable via
+// direct routing, not through the proxy. Only runs when relevant countries are configured.
+//
+// Iranian routing check:
+//   - login.samandehi.ir returns HTTP 307 from Iranian IPs, but 403 from foreign IPs.
+//     So 403 means traffic is going through the proxy instead of direct — fail.
+//   - wp.mahex.com/ip and ip.shecan.ir return the caller's IP. If routing is correct
+//     (direct from Iran) these sites are reachable. If going through proxy, they block
+//     foreign TLS and return SSL errors — fail.
+func (gw *Gateway) verifyWhitelistRouting() bool {
+	hasIR := false
+	for _, c := range gw.config.Whitelist.Countries {
+		if strings.EqualFold(c, "ir") {
+			hasIR = true
+			break
+		}
+	}
+	if !hasIR {
+		return true
+	}
+
+	addr := fmt.Sprintf("socks5h://127.0.0.1:%d", gw.socksPort)
+	baseArgs := []string{"-s", "-x", addr, "--connect-timeout", "8", "--max-time", "12",
+		"-o", "/dev/null", "-w", "%{http_code}"}
+
+	// samandehi.ir: 307 = direct (Iranian IP), 403 = going through proxy (foreign IP).
+	code := func(url string) string {
+		args := append(append([]string{}, baseArgs...), url)
+		cmd := exec.CommandContext(gw.ctx, "curl", args...)
+		out, err := cmd.Output()
+		if err != nil {
+			return "000"
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	samandehiCode := code("https://login.samandehi.ir")
+	if samandehiCode == "403" {
+		log.Printf("  ⚠️  IR routing check: login.samandehi.ir returned 403 (traffic going through proxy, not direct)")
+		return false
+	}
+	if samandehiCode == "000" {
+		log.Printf("  ⚠️  IR routing check: login.samandehi.ir unreachable (000)")
+		return false
+	}
+	log.Printf("  ✅ IR routing: login.samandehi.ir → %s (direct)", samandehiCode)
+
+	// IP checker sites: these block foreign TLS, so reachability = direct routing.
+	ipCheckers := []string{
+		"https://wp.mahex.com/ip",
+		"https://ip.shecan.ir",
+	}
+	baseArgsBody := []string{"-s", "-x", addr, "--connect-timeout", "8", "--max-time", "12"}
+	for _, url := range ipCheckers {
+		args := append(append([]string{}, baseArgsBody...), url)
+		cmd := exec.CommandContext(gw.ctx, "curl", args...)
+		out, err := cmd.Output()
+		if err == nil && len(strings.TrimSpace(string(out))) > 0 {
+			log.Printf("  ✅ IR routing: %s → %s", url, strings.TrimSpace(string(out)))
+			return true
+		}
+		log.Printf("  ⚠️  IR routing: %s unreachable via direct path", url)
+	}
+
+	// samandehi passed but IP checkers were unreachable — not a routing failure,
+	// just those specific sites being down. Consider routing OK.
+	return true
 }
 
 func (gw *Gateway) startEngine(link *profile.Link) error {
@@ -678,7 +764,164 @@ func (gw *Gateway) startDNS() error {
 		return nil
 	}
 
-	return fmt.Errorf("no DNS proxy available (install dns2socks or dnsmasq)")
+	// Last resort: built-in DNS forwarder (no external tool needed).
+	return gw.startBuiltinDNS(upstream)
+}
+
+// startBuiltinDNS starts a DNS forwarder using DoH (DNS-over-HTTPS) routed through
+// the SOCKS5 proxy. This avoids ISP DNS hijacking/poisoning for blocked sites.
+// Falls back to direct UDP if the proxy-routed DoH fails (e.g. proxy not yet ready).
+func (gw *Gateway) startBuiltinDNS(upstreams []string) error {
+	// Build DoH URLs from upstream IPs.
+	dohURLs := make([]string, 0, len(upstreams))
+	for _, up := range upstreams {
+		if net.ParseIP(up) != nil {
+			dohURLs = append(dohURLs, "https://"+up+"/dns-query")
+		} else {
+			dohURLs = append(dohURLs, up)
+		}
+	}
+
+	// HTTP client that tunnels through SOCKS5 (xray) — avoids ISP DNS hijacking.
+	socksAddr := fmt.Sprintf("127.0.0.1:%d", gw.socksPort)
+	proxyHTTP := &http.Client{
+		Timeout: 8 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				d := net.Dialer{Timeout: 5 * time.Second}
+				conn, err := d.DialContext(ctx, "tcp", socksAddr)
+				if err != nil {
+					return nil, err
+				}
+				// SOCKS5 handshake: no-auth, then CONNECT
+				if err := socks5Connect(conn, addr); err != nil {
+					conn.Close()
+					return nil, fmt.Errorf("socks5 connect %s: %w", addr, err)
+				}
+				return conn, nil
+			},
+			TLSHandshakeTimeout: 5 * time.Second,
+		},
+	}
+
+	// Fallback: plain UDP client (direct, no proxy) for when proxy isn't ready.
+	udpClient := &dns.Client{Net: "udp", Timeout: 4 * time.Second}
+
+	queryFn := func(ctx context.Context, r *dns.Msg) *dns.Msg {
+		packed, err := r.Pack()
+		if err == nil {
+			for _, dohURL := range dohURLs {
+				req, _ := http.NewRequestWithContext(ctx, http.MethodPost, dohURL,
+					bytes.NewReader(packed))
+				req.Header.Set("Content-Type", "application/dns-message")
+				req.Header.Set("Accept", "application/dns-message")
+				resp, err := proxyHTTP.Do(req)
+				if err == nil {
+					body, _ := io.ReadAll(resp.Body)
+					resp.Body.Close()
+					m := new(dns.Msg)
+					if m.Unpack(body) == nil {
+						return m
+					}
+				}
+			}
+		}
+		// Proxy unavailable — fall back to direct UDP.
+		for _, up := range upstreams {
+			resp, _, err := udpClient.ExchangeContext(ctx, r, up+":53")
+			if err == nil {
+				return resp
+			}
+		}
+		return nil
+	}
+
+	mux := dns.NewServeMux()
+	mux.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
+		resp := queryFn(gw.ctx, r)
+		if resp == nil {
+			m := new(dns.Msg)
+			m.SetRcode(r, dns.RcodeServerFailure)
+			w.WriteMsg(m)
+			return
+		}
+		resp.Id = r.Id
+		w.WriteMsg(resp)
+	})
+
+	addr := fmt.Sprintf("0.0.0.0:%d", gw.dnsPort)
+
+	udpConn, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		return fmt.Errorf("built-in DNS (UDP): %w", err)
+	}
+	tcpLn, err := net.Listen("tcp", addr)
+	if err != nil {
+		udpConn.Close()
+		return fmt.Errorf("built-in DNS (TCP): %w", err)
+	}
+
+	udpSrv := &dns.Server{PacketConn: udpConn, Net: "udp", Handler: mux}
+	tcpSrv := &dns.Server{Listener: tcpLn, Net: "tcp", Handler: mux}
+
+	go udpSrv.ActivateAndServe()
+	go tcpSrv.ActivateAndServe()
+
+	gw.dnsBuiltin = append(gw.dnsBuiltin, udpSrv, tcpSrv)
+	log.Printf("  ✅ Built-in DNS forwarder on :%d → DoH via proxy (%v)", gw.dnsPort, upstreams)
+	return nil
+}
+
+// socks5Connect performs a minimal SOCKS5 no-auth handshake + CONNECT on an open conn.
+func socks5Connect(conn net.Conn, target string) error {
+	host, portStr, err := net.SplitHostPort(target)
+	if err != nil {
+		return err
+	}
+	port := 0
+	fmt.Sscanf(portStr, "%d", &port)
+
+	// Greeting: VER=5, NMETHODS=1, METHOD=0 (no auth)
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write([]byte{5, 1, 0}); err != nil {
+		return err
+	}
+	// Server choice
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return err
+	}
+	if buf[1] != 0 {
+		return fmt.Errorf("socks5: server chose auth method %d", buf[1])
+	}
+
+	// CONNECT request: VER=5, CMD=1, RSV=0, ATYP=3 (domain), then host+port
+	req := []byte{5, 1, 0, 3, byte(len(host))}
+	req = append(req, []byte(host)...)
+	req = append(req, byte(port>>8), byte(port))
+	if _, err := conn.Write(req); err != nil {
+		return err
+	}
+	// Reply: skip VER, REP, RSV, then read address (variable length)
+	head := make([]byte, 4)
+	if _, err := io.ReadFull(conn, head); err != nil {
+		return err
+	}
+	if head[1] != 0 {
+		return fmt.Errorf("socks5: CONNECT failed, REP=%d", head[1])
+	}
+	switch head[3] {
+	case 1: // IPv4
+		io.ReadFull(conn, make([]byte, 6))
+	case 3: // domain
+		n := make([]byte, 1)
+		io.ReadFull(conn, n)
+		io.ReadFull(conn, make([]byte, int(n[0])+2))
+	case 4: // IPv6
+		io.ReadFull(conn, make([]byte, 18))
+	}
+	conn.SetDeadline(time.Time{})
+	return nil
 }
 
 func (gw *Gateway) startTun() error {

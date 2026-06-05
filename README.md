@@ -44,7 +44,7 @@ sudo ./install.sh
 The installer will:
 - Detect your OS and architecture automatically
 - Download the correct binary from GitHub releases
-- **Auto-install dependencies** (sing-box, tun2socks, iptables, iproute2, curl)
+- **Auto-install dependencies** (sing-box, tun2socks, iptables, iproute2, curl — dns2socks is optional; bypath has a built-in DNS fallback)
 - Install to `/opt/bypath/` with proper directory structure
 - Download `geoip-ir.srs` for Iran IP whitelist
 - Optionally create a systemd service

@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.5.9 (2026-06-05)
+
+### Bug Fixes
+- **Built-in DNS forwarder** — When `dns2socks` and `dnsmasq` are both absent, bypath now starts its own DNS server on port 53 using `miekg/dns`. Queries are forwarded via DoH (HTTPS) through the SOCKS5 proxy, avoiding ISP DNS hijacking (e.g. `youtube.com → 10.10.34.36`). Falls back to direct UDP only if the proxy itself is temporarily unavailable.
+- **xray DoH DNS** — `xrayDNSConfig()` now uses DoH (`https://1.1.1.1/dns-query`) instead of plain UDP. Plain UDP DNS silently fails through TCP-only VLESS WebSocket transports (xray 25.x). DoH goes over TCP/HTTPS → survives any transport.
+- **xray routing `domainStrategy: IPIfNonMatch`** — Was `UseIPv4`, which skipped DNS resolution entirely in xray 25.x routing decisions. `IPIfNonMatch`: if no domain rule matches directly, resolve the domain to an IP, then re-check IP rules (geoip:ir). Required for `geoip:ir` to match Iranian sites at all.
+- **xray freedom outbound `UseIPv4`** — Direct (freedom) outbound now has `domainStrategy: UseIPv4` so it resolves hostnames through xray's own DNS (DoH) rather than system DNS (`127.0.0.1` with no server). Fixes `SSL_ERROR_SYSCALL` / HTTP 000 for Iranian sites in gateway mode.
+- **geosite:ir removed from xray routing** — Standard `geosite.dat` distributions (v2fly/domain-list-community, Loyalsoldier) do not include an `IR` category. Removed the rule entirely; `geoip:ir` alone handles Iranian IP routing correctly.
+- **IR routing health check (`verifyWhitelistRouting`)** — New check runs at gateway startup when `ir` is in whitelist countries. Tests `login.samandehi.ir` (expects 307 = direct/Iranian IP; 403 = traffic going through foreign proxy), then `wp.mahex.com/ip` and `ip.shecan.ir` as IP-checker fallbacks. If Iranian routing is broken, bypath marks the engine unhealthy and tries the next link/engine.
+
 ## v2.5.8 (2026-06-05)
 
 ### Bug Fixes
