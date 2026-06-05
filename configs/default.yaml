@@ -21,6 +21,15 @@ engines:
   prefer_system: true
   preferred: ""           # "sing-box" or "xray" (empty = auto-detect based on protocol)
 
+  # Automatic engine fallback — if the preferred engine fails, try the next one.
+  # Set enabled: false to disable fallback and fail hard if the primary engine doesn't start.
+  fallback:
+    enabled: true
+    timeout: "10s"        # per-engine startup timeout
+    order:
+      - sing-box
+      - xray
+
 # Rule-based routing — map traffic matchers to named outbounds.
 # Matchers: geoip:<cc>, geosite:<tag>, domain:<exact>, domain_suffix:<suffix>, ip_cidr:<cidr>, default
 # Outbounds: direct, proxy, or any name defined in external_outbounds below.

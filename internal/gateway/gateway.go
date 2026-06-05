@@ -44,7 +44,8 @@ type Gateway struct {
 	dnsBuiltin  []*dns.Server // built-in DNS servers (fallback when dns2socks/dnsmasq absent)
 
 	// Native TUN state
-	nativeTUN bool // whether sing-box native TUN is active
+	nativeTUN    bool   // whether sing-box native TUN is active
+	activeEngine string // name of the currently running engine (e.g. "sing-box", "xray")
 
 	// Network info (auto-detected)
 	iface      string // e.g., "eth0", "end0"
@@ -454,81 +455,29 @@ func (gw *Gateway) startEngineWithLinkFallback(link *profile.Link) error {
 	return fmt.Errorf("no working link found in group '%s'", fallbackGroup)
 }
 
-// startEngineWithEngineFallback tries a link with its preferred engine, then falls back
-// to the alternative engine (sing-box ↔ xray) if the first attempt fails.
-// Returns true if the link is running and verified, false otherwise.
+// startEngineWithEngineFallback starts an engine for the given link (with automatic
+// engine fallback handled by FallbackController) then verifies connectivity.
+// Returns true if the engine is running and the tunnel has internet access.
 func (gw *Gateway) startEngineWithEngineFallback(link *profile.Link) bool {
-	primaryEngine := gw.resolveEngine(link.Protocol)
-
-	// Try primary engine
-	if err := gw.startEngine(link); err == nil {
-		if gw.verifyConnection() {
-			return true
-		}
-		log.Printf("  ⚠️  %s started but no connectivity, trying alternative engine...", primaryEngine)
-		if gw.engineProc != nil {
-			gw.engineProc.Process.Kill()
-			gw.engineProc.Wait()
-			gw.engineProc = nil
-		}
-	} else {
-		log.Printf("  ⚠️  %s failed: %v", primaryEngine, err)
-	}
-
-	// Determine alternative engine
-	altEngine := gw.alternativeEngine(primaryEngine, link.Protocol)
-	if altEngine == "" {
+	if err := gw.startEngine(link); err != nil {
+		log.Printf("  ❌ Engine start failed: %v", err)
 		return false
 	}
 
-	log.Printf("  🔀 Trying alternative engine: %s", altEngine)
-
-	// Temporarily override preferred engine for this attempt
-	origPreferred := gw.config.Engines.PreferredEngine
-	gw.config.Engines.PreferredEngine = altEngine
-	defer func() { gw.config.Engines.PreferredEngine = origPreferred }()
-
-	if err := gw.startEngine(link); err == nil {
-		if gw.verifyConnection() {
-			log.Printf("  ✅ Connected with %s!", altEngine)
-			return true
-		}
-		log.Printf("  ❌ %s also no connectivity", altEngine)
-		if gw.engineProc != nil {
-			gw.engineProc.Process.Kill()
-			gw.engineProc.Wait()
-			gw.engineProc = nil
-		}
-	} else {
-		log.Printf("  ❌ %s also failed: %v", altEngine, err)
+	if gw.verifyConnection() {
+		return true
 	}
 
+	log.Printf("  ⚠️  Engine started but no connectivity")
+	if gw.engineProc != nil {
+		gw.engineProc.Process.Kill()
+		gw.engineProc.Wait() //nolint:errcheck
+		gw.engineProc = nil
+	}
+	gw.activeEngine = ""
 	return false
 }
 
-// alternativeEngine returns the fallback engine for a given primary engine and protocol.
-// Only switches between sing-box and xray for supported protocols.
-// Returns "" if no alternative is available.
-func (gw *Gateway) alternativeEngine(primaryEngine, protocol string) string {
-	// Only sing-box ↔ xray fallback makes sense for these protocols
-	switch protocol {
-	case "vmess", "vless", "trojan", "shadowsocks":
-		// ok to try alternative
-	default:
-		return ""
-	}
-	switch primaryEngine {
-	case "sing-box":
-		if _, err := gw.engineMgr.Get("xray"); err == nil {
-			return "xray"
-		}
-	case "xray":
-		if _, err := gw.engineMgr.Get("sing-box"); err == nil {
-			return "sing-box"
-		}
-	}
-	return ""
-}
 
 // verifyConnection checks if the SOCKS proxy can reach the actual internet
 // through the tunnel — NOT just Cloudflare's own CDN edge.
@@ -662,18 +611,10 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 		}
 	}
 
-	// Determine engine
-	engineName := gw.resolveEngine(link.Protocol)
-	eng, err := gw.engineMgr.Get(engineName)
-	if err != nil {
-		return fmt.Errorf("engine %s not available: %w", engineName, err)
-	}
-
-	// Generate config (with routing rules or legacy whitelist for geoip/geosite routing)
+	// Build config generator (shared across all fallback engine attempts).
 	configGen := tunnel.NewConfigGenerator(paths.Get().TmpDir)
 	configGen.PinnedHosts = pinnedHosts
 	if len(gw.config.Routing.Rules) > 0 {
-		// New rule-based routing: map config rules to tunnel rules
 		rules := make([]tunnel.RoutingRule, len(gw.config.Routing.Rules))
 		for i, r := range gw.config.Routing.Rules {
 			rules[i] = tunnel.RoutingRule{Match: r.Match, Outbound: r.Outbound}
@@ -681,7 +622,6 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 		configGen.RoutingRules = rules
 		configGen.ExternalOutbounds = gw.config.Routing.ExternalOutbounds
 	} else {
-		// Legacy whitelist config (deprecated — shows warning at load time)
 		configGen.WhitelistCountries = gw.config.Whitelist.Countries
 		configGen.GeositeCountries = gw.config.Whitelist.GeositeCountries
 		if len(configGen.GeositeCountries) == 0 {
@@ -699,40 +639,25 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 		configGen.GatewayMode = true
 		configGen.DNSPort = gw.dnsPort
 	}
-	configFile, err := configGen.Generate(eng, link)
+
+	// FallbackController handles engine selection and startup with automatic fallback.
+	fc := engine.NewFallbackController(gw.engineMgr, gw.config.Engines.Fallback, configGen, gw.socksPort)
+	result, err := fc.StartWithFallback(gw.ctx, link, gw.config.Engines.PreferredEngine)
 	if err != nil {
-		return fmt.Errorf("generating config: %w", err)
+		return err
 	}
 
-	// Start engine process
-	var args []string
-	switch eng.Name {
-	case "sing-box":
-		args = []string{"run", "-c", configFile}
-	case "xray":
-		args = []string{"run", "-c", configFile}
-	default:
-		args = []string{"-c", configFile}
-	}
+	gw.engineProc = result.Process
+	gw.activeEngine = result.EngineName
 
-	gw.engineProc = exec.CommandContext(gw.ctx, eng.Path, args...)
-	if err := gw.engineProc.Start(); err != nil {
-		return fmt.Errorf("starting %s: %w", eng.Name, err)
-	}
-
-	// Wait for port to be ready
-	if err := waitForPort(gw.socksPort, 10*time.Second); err != nil {
-		return fmt.Errorf("%s didn't start in time: %w", eng.Name, err)
-	}
-
-	// Give sing-box a moment to fully initialize outbound connections
+	// Give the engine a moment to fully initialize outbound connections.
 	time.Sleep(2 * time.Second)
 
-	log.Printf("  ✅ %s running on :%d (PID: %d)", eng.Name, gw.socksPort, gw.engineProc.Process.Pid)
+	log.Printf("  ✅ %s running on :%d (PID: %d)", result.EngineName, gw.socksPort, gw.engineProc.Process.Pid)
 
 	// Mark native TUN as active only when sing-box started with gateway mode.
 	// xray does not create a TUN device — it provides SOCKS only.
-	if gw.config.Gateway.Enabled && gw.config.Gateway.NativeTUN && eng.Name == "sing-box" {
+	if gw.config.Gateway.Enabled && gw.config.Gateway.NativeTUN && result.EngineName == "sing-box" {
 		gw.nativeTUN = true
 	}
 
@@ -1337,33 +1262,12 @@ func (gw *Gateway) cleanupPreviousRun() {
 	gw.unpinHostsFromEtcHosts()
 }
 
-func (gw *Gateway) resolveEngine(protocol string) string {
-	// If user has a preferred engine, use it for supported protocols
-	if gw.config.Engines.PreferredEngine != "" {
-		switch protocol {
-		case "vmess", "vless", "trojan", "shadowsocks":
-			return gw.config.Engines.PreferredEngine
-		}
-	}
-	switch protocol {
-	case "vmess", "vless", "trojan", "shadowsocks", "hysteria2", "tuic", "socks5", "http":
-		return "sing-box"
-	case "wireguard":
-		return "wireguard-go"
-	case "openvpn":
-		return "openvpn"
-	case "ssh":
-		return "ssh"
-	default:
-		return "sing-box"
-	}
-}
-
 // --- Accessors for API ---
 
-func (gw *Gateway) GetProfileManager() *profile.Manager  { return gw.profileMgr }
-func (gw *Gateway) GetTunnelManager() *tunnel.Manager     { return gw.tunnelMgr }
+func (gw *Gateway) GetProfileManager() *profile.Manager    { return gw.profileMgr }
+func (gw *Gateway) GetTunnelManager() *tunnel.Manager      { return gw.tunnelMgr }
 func (gw *Gateway) GetWhitelistManager() *whitelist.Manager { return gw.whitelist }
+func (gw *Gateway) GetActiveEngine() string                 { return gw.activeEngine }
 
 // --- Helpers ---
 

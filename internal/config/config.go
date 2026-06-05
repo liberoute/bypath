@@ -39,10 +39,17 @@ type GatewayConfig struct {
 	NativeTUN   bool     `yaml:"native_tun"`
 }
 
+type FallbackConfig struct {
+	Enabled bool     `yaml:"enabled"`
+	Timeout string   `yaml:"timeout"` // duration string, e.g. "10s"
+	Order   []string `yaml:"order"`   // e.g. ["sing-box", "xray"]
+}
+
 type EnginesConfig struct {
-	Directory       string `yaml:"directory"`
-	PreferSystem    bool   `yaml:"prefer_system"`
-	PreferredEngine string `yaml:"preferred,omitempty"` // "sing-box" or "xray" (empty = auto)
+	Directory       string         `yaml:"directory"`
+	PreferSystem    bool           `yaml:"prefer_system"`
+	PreferredEngine string         `yaml:"preferred,omitempty"` // "sing-box" or "xray" (empty = auto)
+	Fallback        FallbackConfig `yaml:"fallback,omitempty"`
 }
 
 type WhitelistConfig struct {
@@ -178,6 +185,11 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Engines.Directory == "" {
 		cfg.Engines.Directory = paths.Get().EngineDir
+	}
+	if !cfg.Engines.Fallback.Enabled && len(cfg.Engines.Fallback.Order) == 0 {
+		cfg.Engines.Fallback.Enabled = true
+		cfg.Engines.Fallback.Timeout = "10s"
+		cfg.Engines.Fallback.Order = []string{"sing-box", "xray"}
 	}
 	if cfg.Profiles.Directory == "" {
 		cfg.Profiles.Directory = paths.Get().ProfileDir

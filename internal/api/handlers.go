@@ -18,10 +18,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	whitelistStats := s.gateway.GetWhitelistManager().GetStats()
 
 	status := map[string]interface{}{
-		"version":   build.Version,
-		"tunnels":   tunnelStatus,
-		"chains":    chainStatus,
-		"whitelist": whitelistStats,
+		"version":       build.Version,
+		"active_engine": s.gateway.GetActiveEngine(),
+		"tunnels":       tunnelStatus,
+		"chains":        chainStatus,
+		"whitelist":     whitelistStats,
 	}
 
 	jsonResponse(w, http.StatusOK, status)
