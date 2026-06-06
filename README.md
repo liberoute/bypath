@@ -12,8 +12,9 @@ Iranian IPs go direct (no tunnel). Everything else goes through your proxy serve
 - **Subscription support** — add URL, auto-fetch links, auto-group by domain
 - **Parallel speed test** — test all servers simultaneously, auto-select best
 - **Interactive TUI** — tab-based terminal UI (Home / Servers / Subscriptions)
-- **Dual engine** — sing-box (default) + xray as fallback; configurable per-deployment
-- **Auto-fallback** — if a link fails, tries the next one
+- **Dual engine** — sing-box (default) + xray as automatic fallback; configurable per-deployment
+- **Rule-based routing** — geoip/geosite/domain rules map traffic to direct or proxy outbounds
+- **Auto-fallback** — if a link or engine fails, tries the next one automatically
 - **Mixed proxy** — SOCKS5 + HTTP on configurable port (default: 2801)
 - **API authentication** — token-based auth for REST API
 - **PID management** — clean start/stop without orphan processes
@@ -137,10 +138,12 @@ Your Phone/Laptop
     │ Gateway = Bypath IP
     │ DNS = Bypath IP
     ▼
-Bypath (iptables → tun0 → tun2socks → sing-box)
+Bypath (iptables → tun0 → sing-box native TUN)
     │
-    ├── digikala.com (IR) → DIRECT (geoip whitelist)
-    └── google.com → tunnel → exit in Germany/Netherlands/etc
+    ├── geoip:ir  → DIRECT (Iran IPs)
+    ├── geosite:ir → DIRECT (Iran domains)
+    ├── domain_suffix:.ir → DIRECT
+    └── default   → tunnel → exit IP of your proxy server
 ```
 
 Proxy port available for manual configuration:
@@ -174,11 +177,27 @@ server:
 
 gateway:
   enabled: true
+  native_tun: true        # sing-box native TUN (no tun2socks needed)
   interface: ""           # auto-detect
 
-whitelist:
-  countries: ["ir"]       # bypass tunnel for these countries
-  update_interval: "24h"
+engines:
+  prefer_system: true
+  preferred: ""           # "sing-box" or "xray" (empty = auto)
+  fallback:
+    enabled: true         # try xray if sing-box fails (and vice versa)
+    timeout: "10s"
+    order: [sing-box, xray]
+
+routing:
+  rules:
+    - match: geoip:ir
+      outbound: direct
+    - match: geosite:ir
+      outbound: direct
+    - match: domain_suffix:cloudflare.com
+      outbound: direct
+    - match: default
+      outbound: proxy
 
 isolation:
   enabled: true
