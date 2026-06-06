@@ -3,12 +3,12 @@
 ## 🔴 Priority
 
 
-- [x] **Full build (zero deps)** — Embed sing-box + xray + tun2socks in the binary.
+- [x] **Full build (zero deps)** — Embed sing-box + xray in the binary (`-tags full`). sing-box embedded is working; xray embedded is present but needs `geoip.dat`/`geosite.dat` (xray format, not `.srs`).
 - [x] **TUI: confirm dialogs** — Before delete/restart, ask "are you sure?"
-- [x] **Metrics (Prometheus)** — `/metrics` endpoint for monitoring.
-- [x] **sing-box as Go library** — Run in-process instead of spawning (full build).
-- [x] **xray as Go library** — Same as above for xray.
-- [x] **Config hot-reload** — Change config without restart.
+- [x] **sing-box as Go library** — Run in-process instead of spawning (full build). Fixed DNS init: uses `singJSON.UnmarshalContext` with `include.Context` so `DNSServerOptions` is parsed correctly.
+- [ ] **xray as Go library** — Code exists but broken: embedded xray needs `geoip.dat`/`geosite.dat` (xray format), only `.srs` files (sing-box format) are present.
+- [ ] **Metrics (Prometheus)** — Prometheus counters defined in `internal/metrics/` but no `/metrics` HTTP endpoint exposed. Counter increments are no-ops effectively.
+- [ ] **Config hot-reload** — `ConfigReloads` counter defined but no SIGHUP handler or fsnotify watcher. Not implemented.
 - [ ] **Auto-reconnect** — If tunnel drops, auto reconnect. If 3 failures, switch to next link.
 - [ ] **Health check timer** — Every 60s connectivity check. If fail → restart engine.
 - [ ] **sing-box 1.14 migration** — Remove deprecated env vars, use proper `domain_resolver` and new DNS server format.
@@ -29,6 +29,13 @@
 - [ ] **Bandwidth limiter** — Per-client speed limit.
 - [ ] **TUI: server details view** — Show full link info on a detail page.
 - [ ] **Export/import profiles** — Share configs between devices.
+
+## ✅ Recently Fixed
+
+- **Embedded sing-box DNS crash** (`invalid server address: :53`) — `encoding/json.Unmarshal` ignores `json:"-"` fields; fixed by using `singJSON.UnmarshalContext` with `include.Context(ctx)` set up before unmarshal so `DNSServerOptions` is populated correctly.
+- **Self-update crash loop** — after binary replacement, old process held PID file → new binary saw "already running" on next start → systemd restart loop. Fixed: `cmdUpdate()` now kills old process and restarts systemd service after successful replacement.
+- **TUI shows "No server selected" while connected** — `getActiveLink()` fallback path returned a link without writing `.active` file → TUI couldn't read active server name. Fixed: fallback now calls `SetActiveLink()` before returning.
+- **install.sh: `bypath add` failed silently** — server link was added before default profile was created. Fixed: profile creation now happens first.
 
 ## ⚠️ Known Issues
 

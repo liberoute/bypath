@@ -416,20 +416,18 @@ install_systemd() {
         return
     fi
 
-    # Skip interactive prompt if no TTY (e.g. piped install)
+    # In non-interactive mode, create service automatically unless explicitly disabled
     if [ "$IS_INTERACTIVE" = "0" ]; then
-        info "No TTY detected, skipping systemd service (run with BYPATH_NO_SYSTEMD=0 to force)."
-        return
-    fi
-
-    echo ""
-    local answer
-    read -rp "$(echo -e "${CYAN}?${NC}  Create systemd service? [Y/n] ")" answer </dev/tty 2>/dev/null || answer="y"
-    answer="${answer:-y}"
-
-    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
-        info "Skipping systemd service."
-        return
+        info "No TTY detected — creating systemd service automatically."
+    else
+        echo ""
+        local answer
+        read -rp "$(echo -e "${CYAN}?${NC}  Create systemd service? [Y/n] ")" answer </dev/tty 2>/dev/null || answer="y"
+        answer="${answer:-y}"
+        if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+            info "Skipping systemd service."
+            return
+        fi
     fi
 
     local service_file="/etc/systemd/system/bypath.service"
@@ -646,18 +644,26 @@ main() {
     mkdir -p "/etc/bypath/geo"
     mkdir -p "/var/log/bypath"
 
-    # Download binary
-    local tmp_file
-    tmp_file=$(mktemp)
-    if ! download "$url" "$tmp_file"; then
-        rm -f "$tmp_file"
-        die "Download failed. Check version/variant or your internet connection."
+    # Download or copy binary
+    if [ -n "${BYPATH_LOCAL_BINARY:-}" ]; then
+        # Use a pre-built local binary (for testing before GitHub release)
+        if [ ! -f "${BYPATH_LOCAL_BINARY}" ]; then
+            die "BYPATH_LOCAL_BINARY not found: ${BYPATH_LOCAL_BINARY}"
+        fi
+        cp "${BYPATH_LOCAL_BINARY}" "${INSTALL_DIR}/${BINARY_NAME}"
+        chmod 755 "${INSTALL_DIR}/${BINARY_NAME}"
+        ok "Binary installed from local path: ${BYPATH_LOCAL_BINARY}"
+    else
+        local tmp_file
+        tmp_file=$(mktemp)
+        if ! download "$url" "$tmp_file"; then
+            rm -f "$tmp_file"
+            die "Download failed. Check version/variant or your internet connection."
+        fi
+        mv "$tmp_file" "${INSTALL_DIR}/${BINARY_NAME}"
+        chmod 755 "${INSTALL_DIR}/${BINARY_NAME}"
+        ok "Binary installed to ${INSTALL_DIR}/${BINARY_NAME}"
     fi
-
-    # Install binary
-    mv "$tmp_file" "${INSTALL_DIR}/${BINARY_NAME}"
-    chmod 755 "${INSTALL_DIR}/${BINARY_NAME}"
-    ok "Binary installed to ${INSTALL_DIR}/${BINARY_NAME}"
 
     # Symlink to PATH
     if [ -d "/usr/local/bin" ]; then
@@ -688,23 +694,22 @@ gateway:
 engines:
   directory: "/opt/bypath/engines"
   prefer_system: true
-  preferred: ""
+  preferred: "sing-box"
 
-whitelist:
-  countries: ["ir"]
-  bypass_domains:
-    - "cloudflare.com"
-    - "ip-api.com"
-    - "ipinfo.io"
-    - "api.myip.com"
-  update_interval: "24h"
+# Rule-based routing: traffic matching a rule goes to its outbound.
+# Rules are evaluated top-to-bottom; first match wins.
+# Outbound values: "direct" (bypass tunnel) or "proxy" (through tunnel).
+routing:
+  rules:
+    - match: "geoip:ir"
+      outbound: "direct"
+    - match: "geosite:ir"
+      outbound: "direct"
+    - match: "default"
+      outbound: "proxy"
 
 isolation:
   enabled: true
-
-sni_spoof:
-  enabled: false
-  sni: "digikala.com"
 EOF
         ok "Default config created: ${config_file}"
     else
@@ -729,6 +734,24 @@ EOF
 }
 EOF
         ok "Default profile created: ${profile_file}"
+    fi
+
+    # Add server link — from env var or interactive prompt
+    local init_link="${BYPATH_INIT_LINK:-}"
+    if [ -z "$init_link" ] && [ "$IS_INTERACTIVE" = "1" ]; then
+        echo ""
+        local link_answer
+        read -rp "$(echo -e "${CYAN}?${NC}  Paste a server link to add now (vless/vmess/ss/trojan), or press Enter to skip: ")" link_answer </dev/tty 2>/dev/null || link_answer=""
+        init_link="${link_answer:-}"
+    fi
+    if [ -n "$init_link" ]; then
+        echo ""
+        info "Adding server link..."
+        if "${INSTALL_DIR}/${BINARY_NAME}" add "${init_link}" 2>/dev/null; then
+            ok "Server link added"
+        else
+            warn "Could not add server link — run 'bypath add <link>' manually after install"
+        fi
     fi
 
     # Download geo rule sets

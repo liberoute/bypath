@@ -8,13 +8,13 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"sync"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/option"
+	singJSON "github.com/sagernet/sing/common/json"
 
 	xray "github.com/xtls/xray-core/core"
 	_ "github.com/xtls/xray-core/main/distro/all"
@@ -72,13 +72,20 @@ func (e *embeddedSingBox) Start() error {
 	if err != nil {
 		return err
 	}
-	var opts option.Options
-	if err := json.Unmarshal(data, &opts); err != nil {
-		return err
-	}
 
+	// Must set up the include context BEFORE unmarshaling so that
+	// DNSServerOptions.UnmarshalJSONContext can access the DNS transport
+	// registry and populate the Options field. Using encoding/json.Unmarshal
+	// without context leaves Options=nil (it has json:"-"), causing
+	// "initialize DNS server[0]: invalid server address: :53".
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx = include.Context(ctx)
+
+	var opts option.Options
+	if err := singJSON.UnmarshalContext(ctx, data, &opts); err != nil {
+		cancel()
+		return err
+	}
 
 	instance, err := box.New(box.Options{
 		Context: ctx,

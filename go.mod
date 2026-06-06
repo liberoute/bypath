@@ -8,7 +8,10 @@ require (
 	github.com/gorilla/mux v1.8.1
 	github.com/mattn/go-runewidth v0.0.16
 	github.com/miekg/dns v1.1.72
+	github.com/prometheus/client_golang v1.23.2
+	github.com/sagernet/sing v0.8.0-beta.16.0.20260227013657-e419e9875a07
 	github.com/sagernet/sing-box v1.13.0
+	github.com/xtls/xray-core v1.260327.0
 	gopkg.in/yaml.v3 v3.0.1
 	pgregory.net/rapid v1.1.0
 )
@@ -94,7 +97,6 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.21 // indirect
 	github.com/pires/go-proxyproto v0.11.0 // indirect
 	github.com/prometheus-community/pro-bing v0.4.0 // indirect
-	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
@@ -113,7 +115,6 @@ require (
 	github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a // indirect
 	github.com/sagernet/nftables v0.3.0-beta.4 // indirect
 	github.com/sagernet/quic-go v0.59.0-sing-box-mod.4 // indirect
-	github.com/sagernet/sing v0.8.0-beta.16.0.20260227013657-e419e9875a07 // indirect
 	github.com/sagernet/sing-mux v0.3.4 // indirect
 	github.com/sagernet/sing-quic v0.6.0-beta.13 // indirect
 	github.com/sagernet/sing-shadowsocks v0.2.8 // indirect
@@ -137,12 +138,12 @@ require (
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
 	github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
+	github.com/vishvananda/netlink v1.3.1 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xjasonlyu/tun2socks/v2 v2.6.0 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/xtls/reality v0.0.0-20260322125925-9234c772ba8f // indirect
-	github.com/xtls/xray-core v1.260327.0 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/automaxprocs v1.6.0 // indirect

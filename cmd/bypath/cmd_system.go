@@ -206,7 +206,25 @@ func cmdUpdate() {
 	}
 	os.Remove(backupFile)
 
-	fmt.Printf("✅ Updated to %s! Restart bypath to use new version.\n", result.LatestVersion)
+	fmt.Printf("✅ Updated to %s!\n", result.LatestVersion)
+
+	// Restart the gateway if it was running, so the new binary takes effect.
+	pidPath := paths.Get().PidFile
+	if pid, running := pidfile.IsRunningFromFile(pidPath); running {
+		fmt.Printf("🔄 Restarting gateway (PID: %d)...\n", pid)
+		pidfile.StopFromFile(pidPath) //nolint:errcheck
+		exec.Command("pkill", "sing-box").Run()
+		exec.Command("pkill", "-f", "xray run -c /tmp/bypath").Run()
+		exec.Command("pkill", "tun2socks").Run()
+		exec.Command("ip", "link", "del", "tun0").Run()
+		if _, err := exec.LookPath("systemctl"); err == nil {
+			if out, _ := exec.Command("systemctl", "is-active", "bypath").Output();
+				strings.TrimSpace(string(out)) == "active" || strings.TrimSpace(string(out)) == "activating" {
+				exec.Command("systemctl", "restart", "bypath").Run()
+				fmt.Println("  ✓ systemd service restarted")
+			}
+		}
+	}
 	if result.ReleaseNotes != "" {
 		fmt.Printf("\n   Release notes:\n%s\n", result.ReleaseNotes)
 	}

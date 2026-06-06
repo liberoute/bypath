@@ -12,7 +12,7 @@ Iranian IPs go direct (no tunnel). Everything else goes through your proxy serve
 - **Subscription support** — add URL, auto-fetch links, auto-group by domain
 - **Parallel speed test** — test all servers simultaneously, auto-select best
 - **Interactive TUI** — tab-based terminal UI (Home / Servers / Subscriptions)
-- **Dual engine** — sing-box (default) + xray as automatic fallback; configurable per-deployment
+- **Dual engine** — sing-box (default, embedded in full build) + xray as automatic fallback; configurable per-deployment
 - **Rule-based routing** — geoip/geosite/domain rules map traffic to direct or proxy outbounds
 - **Auto-fallback** — if a link or engine fails, tries the next one automatically
 - **Mixed proxy** — SOCKS5 + HTTP on configurable port (default: 2801)
@@ -44,10 +44,11 @@ sudo ./install.sh
 
 The installer will:
 - Detect your OS and architecture automatically
-- Download the correct binary from GitHub releases
+- Download the correct binary from GitHub releases (or use `BYPATH_LOCAL_BINARY` for a local binary)
 - **Auto-install dependencies** (sing-box, tun2socks, iptables, iproute2, curl — dns2socks is optional; bypath has a built-in DNS fallback)
 - Install to `/opt/bypath/` with proper directory structure
-- Download `geoip-ir.srs` for Iran IP whitelist
+- Download geo rule sets (`geoip-ir.srs`, `geosite-ir.srs`) for Iran IP/domain whitelist
+- **Prompt for a server link** to add right after install (in interactive mode)
 - Optionally create a systemd service
 
 ### Installer options
@@ -60,8 +61,15 @@ The installer will:
 | `./install.sh latest full` | Latest version, full variant |
 
 Environment variables:
-- `BYPATH_INSTALL_DIR` — Override install path (default: `/opt/bypath`)
-- `BYPATH_NO_SYSTEMD=1` — Skip systemd service creation
+
+| Variable | Description |
+|----------|-------------|
+| `BYPATH_INSTALL_DIR` | Override install path (default: `/opt/bypath`) |
+| `BYPATH_NO_SYSTEMD=1` | Skip systemd service creation |
+| `BYPATH_INIT_LINK=<uri>` | Server link to add during install (vmess/vless/ss/trojan) |
+| `BYPATH_LOCAL_BINARY=<path>` | Use a local binary instead of downloading from GitHub |
+
+In interactive mode (TTY), the installer will prompt for a server link even without `BYPATH_INIT_LINK`.
 
 ## Quick Start
 
@@ -235,19 +243,31 @@ GOOS=linux GOARCH=amd64 go build -o bypath ./cmd/bypath/
 - [Troubleshooting](https://github.com/liberoute/bypath/wiki/Troubleshooting)
 - [Build from Source](https://github.com/liberoute/bypath/wiki/Build-from-Source)
 
-## Requirements (Lite build)
+## Requirements
 
 All dependencies are auto-installed by `install.sh`. For manual setup:
+
+### Lite build
 
 | | Required | Why |
 |---|---|---|
 | Linux (arm/arm64/amd64) | ✅ | OS |
 | Root | ✅ | iptables, TUN, port 53 |
 | sing-box ≥1.12 | ✅ | Primary tunnel engine |
-| tun2socks | ✅ | TUN → SOCKS5 (gateway mode) |
 | iptables + iproute2 | ✅ | Routing (gateway mode) |
 | curl | recommended | Bench + health check |
-| xray | optional | Fallback engine (`engines.preferred: xray` in config) |
+| xray | optional | Fallback engine |
+| tun2socks | only in legacy mode | TUN → SOCKS5 bridge (not needed with `native_tun: true`) |
+
+### Full build (embedded engines)
+
+| | Required | Why |
+|---|---|---|
+| Linux (arm/arm64/amd64) | ✅ | OS |
+| Root | ✅ | iptables, TUN, port 53 |
+| iptables + iproute2 | ✅ | Routing (gateway mode) |
+
+sing-box runs in-process — no external binary needed. xray embedded requires `geoip.dat`/`geosite.dat` (download separately if using xray engine).
 
 ## License
 

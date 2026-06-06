@@ -422,6 +422,7 @@ func (gw *Gateway) getActiveLink() *profile.Link {
 		}
 		for _, l := range g.Links {
 			if l.Port >= 10 && l.Address != "" && l.Address != "0.0.0.0" {
+				gw.profileMgr.SetActiveLink(l)
 				return l
 			}
 		}
