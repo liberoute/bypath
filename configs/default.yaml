@@ -36,13 +36,13 @@ engines:
 # Rules are evaluated in order; private IPs always go direct regardless.
 routing:
   rules:
-    - match: geoip:ir
-      outbound: direct
-    - match: geosite:ir
-      outbound: direct
     - match: domain_suffix:cloudflare.com
       outbound: direct
     - match: domain_suffix:ip-api.com
+      outbound: direct
+    - match: geoip:ir
+      outbound: direct
+    - match: geosite:ir
       outbound: direct
     - match: default
       outbound: proxy

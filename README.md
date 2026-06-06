@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/liberoute/bypath/main/install.sh | 
 Or with a specific version and variant:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/liberoute/bypath/main/install.sh | sudo bash -s -- v2.3.0 full
+curl -fsSL https://raw.githubusercontent.com/liberoute/bypath/main/install.sh | sudo bash -s -- v2.6.1 full
 ```
 
 Or download and run manually:
@@ -199,11 +199,11 @@ engines:
 
 routing:
   rules:
+    - match: domain_suffix:cloudflare.com
+      outbound: direct
     - match: geoip:ir
       outbound: direct
     - match: geosite:ir
-      outbound: direct
-    - match: domain_suffix:cloudflare.com
       outbound: direct
     - match: default
       outbound: proxy

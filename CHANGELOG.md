@@ -4,6 +4,16 @@
 
 ### Added
 - **`geo.DownloadXrayGeoFiles()`** — downloads `geoip.dat` and `geosite.dat` (xray format, from v2fly) at startup for full builds or when `engines.preferred: xray`. Previously required manual download or relied on install.sh; now clean installs with xray engine work automatically.
+- **`domain_suffix` routing rule support** — `routing.rules` now supports `domain_suffix:<domain>` matcher for per-domain direct/proxy routing (e.g. `domain_suffix:cloudflare.com → direct`). Replaces legacy `bypass_domains` in the rule-based system.
+- **Default config includes `cloudflare.com` direct rule** — `configs/default.yaml` now ships with `domain_suffix:cloudflare.com` and `domain_suffix:ip-api.com` as direct rules, ensuring CDN check endpoints and IP detection services route directly without going through the tunnel.
+
+### Tested
+- **Clean-OS install verified (lite + full)** — Both lite (14MB, external sing-box) and full (45MB, embedded sing-box) builds tested end-to-end on a fresh Debian 12 x86_64 machine via `install.sh`. All 5 routing tests pass:
+  - icanhazip: non-IR IP (tunnel working)
+  - mahex: IR IP (geoip:ir → direct)
+  - youtube: HTTP 200 (tunnel bypasses censorship)
+  - samandehi: HTTP 307 (IR site direct, not 403)
+  - cloudflare cdn-cgi/trace: IR IP + loc=IR (domain_suffix direct rule working)
 
 ### Removed (dead code cleanup)
 - **`internal/whitelist/` package** — `networks` map was never populated externally; `IsWhitelisted()` always returned false. Whitelist routing is handled entirely by sing-box geoip/geosite rule sets. Package deleted.
