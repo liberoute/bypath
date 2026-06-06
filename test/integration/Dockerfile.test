@@ -9,7 +9,7 @@
 # With custom subscription:
 #   docker run --rm --cap-add=NET_ADMIN -e TEST_SUB_URL="https://..." bypath-test
 
-FROM golang:1.24-alpine AS base
+FROM golang:1.26-alpine AS base
 
 RUN apk add --no-cache git
 
@@ -21,14 +21,14 @@ COPY . .
 # --- Lite Build ---
 FROM base AS build-lite
 RUN CGO_ENABLED=0 GOOS=linux go build \
-    -ldflags="-s -w -X github.com/liberoute/bypath/internal/build.Version=2.1.0-test" \
+    -ldflags="-s -w -X github.com/liberoute/bypath/internal/build.Version=2.6.0-test" \
     -o /bypath-lite ./cmd/bypath
 
 # --- Full Build ---
 FROM base AS build-full
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -tags full \
-    -ldflags="-s -w -X github.com/liberoute/bypath/internal/build.Version=2.1.0-test" \
+    -ldflags="-s -w -X github.com/liberoute/bypath/internal/build.Version=2.6.0-test" \
     -o /bypath-full ./cmd/bypath
 
 # --- Clean OS (simulates fresh Alpine install) ---
@@ -52,7 +52,7 @@ RUN ARCH=$(uname -m) && \
         armv7l) SB_ARCH="armv7" ;; \
         *) SB_ARCH="amd64" ;; \
     esac && \
-    wget -qO /tmp/sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v1.11.0/sing-box-1.11.0-linux-${SB_ARCH}.tar.gz" && \
+    wget -qO /tmp/sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v1.13.12/sing-box-1.13.12-linux-${SB_ARCH}.tar.gz" && \
     tar -xzf /tmp/sing-box.tar.gz -C /tmp && \
     mv /tmp/sing-box-*/sing-box /usr/local/bin/sing-box && \
     chmod +x /usr/local/bin/sing-box && \
