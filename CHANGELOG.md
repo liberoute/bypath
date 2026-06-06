@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.6.1 (2026-06-07)
+
+### Added
+- **`geo.DownloadXrayGeoFiles()`** — downloads `geoip.dat` and `geosite.dat` (xray format, from v2fly) at startup for full builds or when `engines.preferred: xray`. Previously required manual download or relied on install.sh; now clean installs with xray engine work automatically.
+
+### Removed (dead code cleanup)
+- **`internal/whitelist/` package** — `networks` map was never populated externally; `IsWhitelisted()` always returned false. Whitelist routing is handled entirely by sing-box geoip/geosite rule sets. Package deleted.
+- **`DHCPConfig` struct from config** — parsed from YAML but never consumed by any code path.
+- **`WhitelistIPs` Prometheus gauge** — only ever called `Reset()`, never received real data.
+- **`/whitelist/stats` and `/whitelist/check/{ip}` API endpoints** — backed by the deleted whitelist package.
+
 ## v2.6.0 (2026-06-06)
 
 ### Bug Fixes

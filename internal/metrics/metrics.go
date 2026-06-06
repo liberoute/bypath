@@ -37,11 +37,6 @@ var (
 		Buckets: prometheus.DefBuckets,
 	})
 
-	// WhitelistIPs tracks how many IPs are in the whitelist per country.
-	WhitelistIPs = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "bypath_whitelist_ips",
-		Help: "Number of whitelisted IP ranges per country.",
-	}, []string{"country"})
 )
 
 // SetActiveEngine updates the active engine gauge labels.

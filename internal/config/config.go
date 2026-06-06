@@ -20,7 +20,6 @@ type Config struct {
 	Routing     RoutingConfig     `yaml:"routing,omitempty"`
 	Chains      []ChainConfig     `yaml:"chains"`
 	HealthCheck HealthCheckConfig `yaml:"health_check,omitempty"`
-	DHCP        DHCPConfig        `yaml:"dhcp,omitempty"`
 	SNISpoof    SNISpoofConfig    `yaml:"sni_spoof,omitempty"`
 }
 
@@ -61,7 +60,6 @@ type WhitelistConfig struct {
 	// even if their resolved IP falls within a whitelisted country (e.g. geoip:ir).
 	// These rules are evaluated before any geoip/geosite direct rules.
 	ForceProxyDomains []string `yaml:"force_proxy_domains,omitempty"`
-	CustomFile       string   `yaml:"custom_file,omitempty"`
 	UpdateInterval   string   `yaml:"update_interval"`
 }
 
@@ -89,15 +87,6 @@ type HealthCheckConfig struct {
 	Enabled  bool   `yaml:"enabled"`
 	Interval string `yaml:"interval"`
 	URL      string `yaml:"url"`
-}
-
-type DHCPConfig struct {
-	Enabled    bool     `yaml:"enabled"`
-	RangeStart string   `yaml:"range_start"`
-	RangeEnd   string   `yaml:"range_end"`
-	Gateway    string   `yaml:"gateway"`
-	DNS        []string `yaml:"dns"`
-	LeaseTime  string   `yaml:"lease_time"`
 }
 
 type ProfilesConfig struct {

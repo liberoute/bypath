@@ -125,6 +125,51 @@ func DownloadGeoipFiles(urlTemplate string, countries []string, geoDir string, u
 	return lastErr
 }
 
+// DownloadXrayGeoFiles downloads geoip.dat and geosite.dat in xray/v2ray format.
+// These are different from the sing-box .srs rule-set files and are required
+// by the xray engine for routing rules like "geoip:ir".
+// Files are saved as geoDir/geoip.dat and geoDir/geosite.dat.
+// Files are only re-downloaded if they don't exist or are older than updateInterval.
+func DownloadXrayGeoFiles(geoDir string, updateInterval time.Duration) error {
+	if err := os.MkdirAll(geoDir, 0755); err != nil {
+		return fmt.Errorf("creating geo directory: %w", err)
+	}
+
+	files := []struct {
+		url  string
+		dest string
+	}{
+		{"https://github.com/v2fly/geoip/releases/latest/download/geoip.dat", "geoip.dat"},
+		// dlc.dat is the v2fly domain-list-community release — saved as geosite.dat (xray convention)
+		{"https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat", "geosite.dat"},
+	}
+
+	var lastErr error
+	for _, f := range files {
+		destPath := filepath.Join(geoDir, f.dest)
+		if !needsUpdate(destPath, updateInterval) {
+			log.Printf("  ✅ %s is up to date", f.dest)
+			continue
+		}
+
+		_, existsErr := os.Stat(destPath)
+		fileExists := existsErr == nil
+
+		log.Printf("🌍 Downloading %s (xray format)...", f.dest)
+		if err := downloadToFile(f.url, destPath); err != nil {
+			lastErr = err
+			if fileExists {
+				log.Printf("⚠️  Failed to update %s: %v (using existing file)", f.dest, err)
+			} else {
+				log.Printf("❌ Failed to download %s: %v (xray routing rules will be skipped)", f.dest, err)
+			}
+			continue
+		}
+		log.Printf("  ✅ Downloaded %s", f.dest)
+	}
+	return lastErr
+}
+
 // needsUpdate returns true if the file doesn't exist or is older than maxAge.
 func needsUpdate(path string, maxAge time.Duration) bool {
 	info, err := os.Stat(path)

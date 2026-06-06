@@ -69,10 +69,6 @@ func (s *Server) registerRoutes() {
 	// Chains
 	api.HandleFunc("/chains", s.handleListChains).Methods("GET")
 
-	// Whitelist
-	api.HandleFunc("/whitelist/stats", s.handleWhitelistStats).Methods("GET")
-	api.HandleFunc("/whitelist/check/{ip}", s.handleWhitelistCheck).Methods("GET")
-
 	// Engines
 	api.HandleFunc("/engines", s.handleListEngines).Methods("GET")
 

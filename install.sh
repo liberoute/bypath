@@ -570,6 +570,19 @@ main() {
         die "This installer must be run as root. Try: sudo ./install.sh"
     fi
 
+    # Ensure curl is available — it may be absent on Debian/Ubuntu minimal installs.
+    # wget is used to bootstrap the installer itself on such systems, but curl is
+    # needed for progress bars and some operations below. Auto-install it if missing.
+    if ! command -v curl &>/dev/null; then
+        detect_pkg_manager
+        if [ -n "$PKG_MGR" ]; then
+            info "curl not found — installing..."
+            pkg_install curl && ok "curl installed" || warn "Could not install curl — will use wget for downloads"
+        else
+            warn "curl not found and no supported package manager detected — will use wget for downloads"
+        fi
+    fi
+
     # Parse arguments
     local arg_version="${1:-}"
     local arg_variant="${2:-}"

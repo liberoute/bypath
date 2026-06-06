@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/liberoute/bypath/internal/build"
 	"github.com/liberoute/bypath/internal/config"
 	"github.com/liberoute/bypath/internal/embedbin"
 	"github.com/liberoute/bypath/internal/engine"
@@ -22,7 +23,6 @@ import (
 	"github.com/liberoute/bypath/internal/paths"
 	"github.com/liberoute/bypath/internal/profile"
 	"github.com/liberoute/bypath/internal/tunnel"
-	"github.com/liberoute/bypath/internal/whitelist"
 	"github.com/miekg/dns"
 )
 
@@ -31,13 +31,11 @@ import (
 // 2. Starts DNS proxy (dns2socks or built-in) on port 53
 // 3. Starts tun2socks to create a TUN device routed through the SOCKS proxy
 // 4. Configures iptables so LAN clients' traffic goes through the TUN
-// 5. Applies country whitelist (bypass tunnel for whitelisted IPs)
 type Gateway struct {
 	config     *config.Config
 	engineMgr  *engine.Manager
 	tunnelMgr  *tunnel.Manager
 	profileMgr *profile.Manager
-	whitelist  *whitelist.Manager
 
 	// Running processes / in-process runners
 	engineProc     *exec.Cmd
@@ -75,18 +73,11 @@ func New(cfg *config.Config, engineMgr *engine.Manager) (*Gateway, error) {
 
 	tunnelMgr := tunnel.NewManager(cfg, engineMgr)
 
-	wlMgr, err := whitelist.NewManager(cfg.Whitelist)
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("initializing whitelist: %w", err)
-	}
-
 	gw := &Gateway{
 		config:     cfg,
 		engineMgr:  engineMgr,
 		tunnelMgr:  tunnelMgr,
 		profileMgr: profileMgr,
-		whitelist:  wlMgr,
 		socksPort:  cfg.Server.SOCKSPort,
 		dnsPort:    cfg.Server.DNSPort,
 		ctx:        ctx,
@@ -126,8 +117,12 @@ func (gw *Gateway) Start() error {
 		log.Printf("🚀 Using sing-box native TUN mode (no tun2socks/dns2socks needed)")
 
 		if err := waitForTUNDevice("tun0", 10*time.Second); err != nil {
-			// TUN device didn't appear — fall back to legacy mode
-			log.Printf("⚠️ sing-box native TUN failed, falling back to legacy mode")
+			// TUN device didn't appear within 10s — kernel/permission issue.
+			if build.Variant == "full" {
+				log.Printf("⚠️ sing-box TUN device did not appear (full build). Check kernel TUN support: modprobe tun")
+			} else {
+				log.Printf("⚠️ sing-box native TUN failed, falling back to legacy mode")
+			}
 			if err := gw.restartEngineAsLegacy(activeLink); err != nil {
 				return fmt.Errorf("fallback to legacy mode failed: %w", err)
 			}
@@ -257,7 +252,6 @@ func (gw *Gateway) Stop() {
 }
 
 // Reload applies a new config without restarting the gateway.
-// It immediately updates whitelist settings and other soft fields.
 // Returns the names of fields that require an engine restart to take effect.
 func (gw *Gateway) Reload(newCfg *config.Config) []string {
 	gw.mu.Lock()
@@ -282,9 +276,6 @@ func (gw *Gateway) Reload(newCfg *config.Config) []string {
 	if newCfg.Engines.PreferredEngine != old.Engines.PreferredEngine {
 		needRestart = append(needRestart, "engines.preferred")
 	}
-
-	// Update whitelist manager immediately
-	gw.whitelist.UpdateConfig(newCfg.Whitelist)
 
 	// Replace config contents so all code paths using gw.config pick up the new values.
 	*gw.config = *newCfg
@@ -440,8 +431,23 @@ func (gw *Gateway) startEngineWithFallback(link *profile.Link) error {
 	// Attempt native TUN mode
 	err := gw.startEngineWithLinkFallback(link)
 	if err != nil {
-		// sing-box failed to start with TUN config — fall back to legacy mode
-		log.Printf("⚠️ sing-box native TUN failed, falling back to legacy mode")
+		// On a full build tun2socks is not available, so falling back to legacy
+		// mode would also fail. Retry native TUN once with a short pause — the
+		// tunnel may simply need more time to warm up on the first start.
+		if build.Variant == "full" {
+			log.Printf("⚠️ Native TUN failed (full build — no tun2socks). Retrying native TUN once...")
+			select {
+			case <-gw.ctx.Done():
+				return gw.ctx.Err()
+			case <-time.After(4 * time.Second):
+			}
+			if retryErr := gw.startEngineWithLinkFallback(link); retryErr == nil {
+				return nil
+			}
+			log.Printf("⚠️ Native TUN retry also failed — running proxy-only (tun2socks unavailable on full build)")
+		} else {
+			log.Printf("⚠️ sing-box native TUN failed, falling back to legacy mode")
+		}
 		gw.nativeTUN = false
 		return gw.restartEngineAsLegacy(link)
 	}
@@ -521,8 +527,22 @@ func (gw *Gateway) startEngineWithEngineFallback(link *profile.Link) bool {
 		return false
 	}
 
-	if gw.verifyConnection() {
-		return true
+	// CDN-fronted VLESS proxies (e.g. Cloudflare port 2083) need a few seconds
+	// to complete the WS/TLS handshake before the first DoH query can succeed.
+	// Port-ready does not mean tunnel-ready: retry with backoff before giving up.
+	delays := []time.Duration{0, 3 * time.Second, 5 * time.Second}
+	for i, d := range delays {
+		if d > 0 {
+			log.Printf("  🔄 Connectivity check attempt %d/3 (waiting %s for tunnel warm-up)...", i+1, d)
+			select {
+			case <-gw.ctx.Done():
+				return false
+			case <-time.After(d):
+			}
+		}
+		if gw.verifyConnection() {
+			return true
+		}
 	}
 
 	log.Printf("  ⚠️  Engine started but no connectivity")
@@ -1362,10 +1382,9 @@ func (gw *Gateway) cleanupPreviousRun() {
 
 // --- Accessors for API ---
 
-func (gw *Gateway) GetProfileManager() *profile.Manager    { return gw.profileMgr }
-func (gw *Gateway) GetTunnelManager() *tunnel.Manager      { return gw.tunnelMgr }
-func (gw *Gateway) GetWhitelistManager() *whitelist.Manager { return gw.whitelist }
-func (gw *Gateway) GetActiveEngine() string                 { return gw.activeEngine }
+func (gw *Gateway) GetProfileManager() *profile.Manager { return gw.profileMgr }
+func (gw *Gateway) GetTunnelManager() *tunnel.Manager   { return gw.tunnelMgr }
+func (gw *Gateway) GetActiveEngine() string             { return gw.activeEngine }
 
 // --- Helpers ---
 

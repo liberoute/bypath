@@ -91,6 +91,10 @@ func cmdRun(args []string) {
 			geo.DownloadGeoipFiles(
 				"https://github.com/SagerNet/sing-geoip/raw/rule-set/geoip-{country}.srs",
 				geoipCountries, paths.Get().GeoDir, updateInterval)
+			// xray engine needs geoip.dat/geosite.dat (xray format) — different from .srs files
+			if build.Variant == "full" || cfg.Engines.PreferredEngine == "xray" {
+				geo.DownloadXrayGeoFiles(paths.Get().EngineDir, updateInterval)
+			}
 		}
 	}
 

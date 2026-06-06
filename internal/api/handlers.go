@@ -2,7 +2,6 @@ package api
 
 import (
 	"encoding/json"
-	"net"
 	"net/http"
 
 	"github.com/gorilla/mux"
@@ -18,20 +17,12 @@ import (
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	tunnelStatus := s.gateway.GetTunnelManager().GetStatus()
 	chainStatus := s.gateway.GetTunnelManager().GetChainStatus()
-	whitelistStats := s.gateway.GetWhitelistManager().GetStats()
-
-	// Sync whitelist counts to Prometheus
-	metrics.WhitelistIPs.Reset()
-	for country, count := range whitelistStats {
-		metrics.WhitelistIPs.WithLabelValues(country).Set(float64(count))
-	}
 
 	status := map[string]interface{}{
 		"version":       build.Version,
 		"active_engine": s.gateway.GetActiveEngine(),
 		"tunnels":       tunnelStatus,
 		"chains":        chainStatus,
-		"whitelist":     whitelistStats,
 	}
 
 	jsonResponse(w, http.StatusOK, status)
@@ -192,30 +183,6 @@ func (s *Server) handleStopTunnel(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListChains(w http.ResponseWriter, r *http.Request) {
 	status := s.gateway.GetTunnelManager().GetChainStatus()
 	jsonResponse(w, http.StatusOK, map[string]interface{}{"chains": status})
-}
-
-// --- Whitelist ---
-
-func (s *Server) handleWhitelistStats(w http.ResponseWriter, r *http.Request) {
-	stats := s.gateway.GetWhitelistManager().GetStats()
-	jsonResponse(w, http.StatusOK, map[string]interface{}{"stats": stats})
-}
-
-func (s *Server) handleWhitelistCheck(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	ipStr := vars["ip"]
-
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		errorResponse(w, http.StatusBadRequest, "invalid IP address")
-		return
-	}
-
-	whitelisted := s.gateway.GetWhitelistManager().IsWhitelisted(ip)
-	jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"ip":          ipStr,
-		"whitelisted": whitelisted,
-	})
 }
 
 // --- Engines ---

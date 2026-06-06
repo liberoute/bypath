@@ -47,6 +47,24 @@ type ConfigGenerator struct {
 	PinnedHosts map[string]string // hostname → IP (e.g. "dl8.okarimi.ir" → "104.16.6.70")
 }
 
+// proxyDNSServer returns the DoH server to use for DNS queries routed through the
+// tunnel proxy. Cloudflare IPs (1.1.1.1, 1.0.0.1) are avoided because CDN-fronted
+// VLESS proxies run on Cloudflare — connecting to 1.1.1.1:443 through them causes
+// the CDN to rate-limit or self-intercept the request (503/429).
+// Selection order: first non-Cloudflare entry in DNSUpstream → last entry → "8.8.8.8".
+func (cg *ConfigGenerator) proxyDNSServer() string {
+	cloudflare := map[string]bool{"1.1.1.1": true, "1.0.0.1": true}
+	for _, u := range cg.DNSUpstream {
+		if !cloudflare[u] {
+			return u
+		}
+	}
+	if len(cg.DNSUpstream) > 0 {
+		return cg.DNSUpstream[len(cg.DNSUpstream)-1]
+	}
+	return "8.8.8.8"
+}
+
 // NewConfigGenerator creates a new config generator.
 func NewConfigGenerator(tempDir string) *ConfigGenerator {
 	os.MkdirAll(tempDir, 0755)
@@ -416,9 +434,10 @@ func (cg *ConfigGenerator) singboxDNS(link *profile.Link) map[string]interface{}
 			// DoH (HTTPS) so the query goes over TCP through the VLESS/WebSocket tunnel.
 			// Plain UDP DNS doesn't survive TCP-only transports (VLESS-WS, Trojan-WS, etc.)
 			// and would silently fail or be intercepted/poisoned by the ISP.
+			// proxyDNSServer() avoids Cloudflare IPs — see its doc for why.
 			"tag":    "dns-tunnel",
 			"type":   "https",
-			"server": "1.1.1.1",
+			"server": cg.proxyDNSServer(),
 			"detour": "proxy",
 		},
 		{
@@ -1005,6 +1024,14 @@ func (cg *ConfigGenerator) xrayDNSConfig(link *profile.Link) map[string]interfac
 		upstreamDoH = "https://" + upstream + "/dns-query"
 	}
 
+	// For proxy DoH (goes through the CDN-fronted VLESS outbound), avoid Cloudflare IPs.
+	// proxyDNSServer() selects a non-Cloudflare server from DNSUpstream. See its doc.
+	proxyUpstream := cg.proxyDNSServer()
+	proxyUpstreamDoH := proxyUpstream
+	if net.ParseIP(proxyUpstream) != nil {
+		proxyUpstreamDoH = "https://" + proxyUpstream + "/dns-query"
+	}
+
 	// Collect hostnames that must resolve without going through the proxy.
 	// Proxy-server domains are already in /etc/hosts (pinned by bypath), so direct DNS
 	// here is just a belt-and-suspenders fallback. Bypass domains go direct anyway.
@@ -1038,7 +1065,7 @@ func (cg *ConfigGenerator) xrayDNSConfig(link *profile.Link) map[string]interfac
 	// Everything else → DoH via proxy (TCP through VLESS — works with WS transport).
 	// This ensures ISP-poisoned domains get real IPs from the uncensored exit node.
 	servers = append(servers, map[string]interface{}{
-		"address":  upstreamDoH,
+		"address":  proxyUpstreamDoH,
 		"proxyTag": "proxy",
 	})
 
