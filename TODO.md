@@ -2,6 +2,13 @@
 
 ## 🔴 Priority
 
+
+- [x] **Full build (zero deps)** — Embed sing-box + xray + tun2socks in the binary.
+- [x] **TUI: confirm dialogs** — Before delete/restart, ask "are you sure?"
+- [x] **Metrics (Prometheus)** — `/metrics` endpoint for monitoring.
+- [x] **sing-box as Go library** — Run in-process instead of spawning (full build).
+- [x] **xray as Go library** — Same as above for xray.
+- [x] **Config hot-reload** — Change config without restart.
 - [ ] **Auto-reconnect** — If tunnel drops, auto reconnect. If 3 failures, switch to next link.
 - [ ] **Health check timer** — Every 60s connectivity check. If fail → restart engine.
 - [ ] **sing-box 1.14 migration** — Remove deprecated env vars, use proper `domain_resolver` and new DNS server format.
@@ -11,19 +18,13 @@
 - [ ] **Subscription auto-update** — Every 24h auto sub update (timer or goroutine).
 - [~] **DHCP server** — DNS intercept via iptables REDIRECT is in place (v2.5.8). Full DHCP server (auto-push GW setting) still pending.
 - [ ] **Upload speed test** — Add upload test to bench (currently only download).
-- [ ] **Full build (zero deps)** — Embed sing-box + xray + tun2socks in the binary.
-- [ ] **TUI: confirm dialogs** — Before delete/restart, ask "are you sure?"
 
 ## 🟢 Nice to have
 
 - [ ] **Web UI** — Simple embedded dashboard (static files). Status, switch link, bench from browser.
-- [ ] **Metrics (Prometheus)** — `/metrics` endpoint for monitoring.
 - [ ] **Windows gateway** — WinDivert for routing without TUN.
 - [ ] **mTLS for API** — API accessible only with certificate.
 - [ ] **Multi-hop chain** (In Progress) — Core configgen & CLI implemented; API/TUI/Status pending.
-- [ ] **sing-box as Go library** — Run in-process instead of spawning (full build).
-- [ ] **xray as Go library** — Same as above for xray.
-- [ ] **Config hot-reload** — Change config without restart.
 - [ ] **Per-client routing** — Each client (MAC/IP) has separate rules.
 - [ ] **Bandwidth limiter** — Per-client speed limit.
 - [ ] **TUI: server details view** — Show full link info on a detail page.
