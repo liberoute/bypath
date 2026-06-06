@@ -413,11 +413,13 @@ func (cg *ConfigGenerator) singboxDNS(link *profile.Link) map[string]interface{}
 	// when setting up a direct connection, avoiding the proxy bootstrap loop.
 	servers := []map[string]interface{}{
 		{
-			"tag":         "dns-tunnel",
-			"type":        "udp",
-			"server":      "1.1.1.1",
-			"server_port": 53,
-			"detour":      "proxy",
+			// DoH (HTTPS) so the query goes over TCP through the VLESS/WebSocket tunnel.
+			// Plain UDP DNS doesn't survive TCP-only transports (VLESS-WS, Trojan-WS, etc.)
+			// and would silently fail or be intercepted/poisoned by the ISP.
+			"tag":    "dns-tunnel",
+			"type":   "https",
+			"server": "1.1.1.1",
+			"detour": "proxy",
 		},
 		{
 			"tag":         "dns-direct",
@@ -571,6 +573,14 @@ func (cg *ConfigGenerator) singboxRouteFromRules() map[string]interface{} {
 		"action":  "sniff",
 		"timeout": "300ms",
 	})
+	// resolve action: translate domain names to IPs so that IP-based rules (geoip, ip_cidr)
+	// can match. Uses dns-tunnel (DoH via proxy) to bypass ISP DNS poisoning — blocked sites
+	// return bogon/private IPs from local DNS, which would incorrectly match ip_is_private.
+	// Proxy server domains are pinned to IPs in /etc/hosts so no bootstrap loop occurs.
+	rules = append(rules, map[string]interface{}{
+		"action": "resolve",
+		"server": "dns-tunnel",
+	})
 	rules = append(rules, map[string]interface{}{
 		"ip_is_private": true,
 		"action":        "route",
@@ -600,7 +610,7 @@ func (cg *ConfigGenerator) singboxRouteFromRules() map[string]interface{} {
 	route := map[string]interface{}{
 		"rules":                   rules,
 		"final":                   finalOutbound,
-		"default_domain_resolver": "dns-tunnel",
+		"default_domain_resolver": "dns-direct",
 	}
 	if cg.GatewayMode {
 		route["auto_detect_interface"] = true
@@ -646,11 +656,16 @@ func (cg *ConfigGenerator) ruleSetForMatcher(match string) map[string]interface{
 	typ, val := parts[0], parts[1]
 	switch typ {
 	case "geoip":
+		p := filepath.Join(paths.Get().GeoDir, fmt.Sprintf("geoip-%s.srs", val))
+		if _, err := os.Stat(p); err != nil {
+			log.Printf("⚠️  geoip-%s.srs not found — run 'bypath geo update' or wait for auto-download", val)
+			return nil
+		}
 		return map[string]interface{}{
 			"type":   "local",
 			"tag":    fmt.Sprintf("geoip-%s", val),
 			"format": "binary",
-			"path":   filepath.Join(paths.Get().GeoDir, fmt.Sprintf("geoip-%s.srs", val)),
+			"path":   p,
 		}
 	case "geosite":
 		p := filepath.Join(paths.Get().GeoDir, fmt.Sprintf("geosite-%s.srs", val))
@@ -741,6 +756,12 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 		"action":  "sniff",
 		"timeout": "300ms",
 	})
+	// resolve: translate domain names to IPs before IP-based rules (geoip, ip_cidr).
+	// Must use dns-direct — UDP DNS via a WebSocket/TCP proxy doesn't work.
+	rules = append(rules, map[string]interface{}{
+		"action": "resolve",
+		"server": "dns-direct",
+	})
 
 	// Rule: force proxy domains — always tunnel these, even if IP is in a whitelisted country.
 	// Must come before bypass_domains and geoip/geosite direct rules.
@@ -817,7 +838,7 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 	route := map[string]interface{}{
 		"rules":                   rules,
 		"final":                   "proxy",
-		"default_domain_resolver": "dns-tunnel",
+		"default_domain_resolver": "dns-direct",
 	}
 
 	// In TUN (gateway) mode, bind outbound connections to the physical interface

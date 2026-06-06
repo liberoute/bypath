@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -72,6 +73,25 @@ func cmdRun(args []string) {
 			log.Printf("⚠️  Geosite: only %d/%d country files available", len(validatedCountries), len(cfg.Whitelist.GeositeCountries))
 		}
 		cfg.Whitelist.GeositeCountries = validatedCountries
+	}
+
+	// Auto-download geoip rule-set files referenced in routing.rules
+	if len(cfg.Routing.Rules) > 0 {
+		updateInterval, parseErr := time.ParseDuration(cfg.Whitelist.UpdateInterval)
+		if parseErr != nil || updateInterval == 0 {
+			updateInterval = 24 * time.Hour
+		}
+		var geoipCountries []string
+		for _, rule := range cfg.Routing.Rules {
+			if strings.HasPrefix(rule.Match, "geoip:") {
+				geoipCountries = append(geoipCountries, strings.TrimPrefix(rule.Match, "geoip:"))
+			}
+		}
+		if len(geoipCountries) > 0 {
+			geo.DownloadGeoipFiles(
+				"https://github.com/SagerNet/sing-geoip/raw/rule-set/geoip-{country}.srs",
+				geoipCountries, paths.Get().GeoDir, updateInterval)
+		}
 	}
 
 	engineMgr := engine.NewManager(cfg.Engines)
