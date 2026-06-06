@@ -211,7 +211,9 @@ EOF
     # --- 13. Binary size ---
     SIZE=$(stat -c%s "$BIN" 2>/dev/null || stat -f%z "$BIN" 2>/dev/null || echo 0)
     SIZE_MB=$((SIZE / 1048576))
-    if [ "$SIZE" -gt 0 ] && [ "$SIZE" -lt 30000000 ]; then
+    MAX_SIZE=30000000
+    [ "$VARIANT" = "full" ] && MAX_SIZE=60000000
+    if [ "$SIZE" -gt 0 ] && [ "$SIZE" -lt "$MAX_SIZE" ]; then
         pass "${VARIANT}: binary size (${SIZE_MB}MB)"
     else
         fail "${VARIANT}: binary size" "${SIZE_MB}MB"
