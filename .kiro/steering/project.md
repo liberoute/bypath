@@ -4,7 +4,7 @@
 Bypath is a network gateway written in Go that transparently routes LAN traffic through encrypted tunnels. Clients set their DNS and Gateway to the Bypath machine — traffic is either tunneled or sent direct based on rule-based routing (geoip + geosite + domain rules).
 
 Target platforms: Linux (ARM/ARMv7/ARM64/AMD64), partial Windows support (proxy-only mode).
-Current version: v2.5.11+
+Current version: v2.6.0
 
 ## Tech Stack
 - Language: Go 1.24+
@@ -179,7 +179,7 @@ Two strategies auto-resolved at startup:
 - Cross-compile targets: linux/amd64, linux/arm64, linux/arm (ARMv7), linux/mipsle, windows/amd64
 
 ## Test Environment
-- **Active server:** `root@172.16.11.196` — Debian 12 x86_64, full build (embedded sing-box working)
+- **Active server:** `root@172.16.11.196` — Debian 12 x86_64, full build (embedded sing-box working, v2.6.0 tested)
 - **Previous server:** Orange Pi Zero (ARMv7, Armbian): `root@172.16.11.15`
 - sing-box 1.13.12 installed on system (also embedded in full build)
 - See `deploy_env.md` in memory for current deploy workflow
@@ -249,6 +249,14 @@ Do not re-implement or revert these:
 - **`rule-based-routing`** — `routing.rules` config replaces legacy whitelist. Matchers: `geoip:<cc>`, `geosite:<tag>`, `domain:<exact>`, `domain_suffix:<suffix>`, `ip_cidr:<cidr>`, `default`. Outbounds: `direct`, `proxy`, or named external outbound. When rules non-empty, whitelist config is ignored.
 
 - **`vpn-detection-bypass`** — Reality protocol, xhttp transport, TLS fingerprinting via utls/chrome.
+
+## Important Bugs Fixed (v2.6.0 — Don't Reintroduce)
+
+- **sing-box DNS poisoning (DoH)** — `dns-tunnel` type MUST be `"https"` (DoH), NOT `"udp"`. Plain UDP DNS silently fails over TCP-only VLESS-WS transports. ISP DNS returns bogon IPs (e.g. `10.10.34.36`) for youtube.com — with UDP these match `ip_is_private → direct` → censorship server. DoH goes over TCP through the proxy, bypassing both issues. See `singboxDNS()` in `internal/tunnel/configgen.go`.
+- **`resolve` action required before geoip rules** — `geoip:ir` is IP-based; it cannot match unresolved domain names. Route rules MUST include `{"action":"resolve","server":"dns-tunnel"}` after the sniff action, before any geoip/ip_cidr rules. Without it, samandehi.ir goes through the foreign exit and returns 403. See `singboxRouteFromRules()` and `singboxRoute()` in `configgen.go`.
+- **`default_domain_resolver` must be `"dns-direct"`** — The `resolve` action handles proxy-bound domain resolution explicitly; the global default should be direct. Setting it to `"dns-tunnel"` sends all domain resolutions through the proxy unnecessarily.
+- **geoip `.srs` existence check** — `ruleSetForMatcher()` MUST check `os.Stat` for `geoip-{country}.srs` before adding it to the config. Missing file → sing-box crash at startup. Skip with warning if missing (same pattern as geosite).
+- **Auto-download geoip at startup** — `cmd_run.go` MUST call `geo.DownloadGeoipFiles()` for any `geoip:<country>` matchers in `routing.rules` BEFORE starting the engine. This ensures clean-machine deployments work without manual `bypath geo update`.
 
 ## Important Bugs Fixed (v2.5.11 — Don't Reintroduce)
 

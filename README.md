@@ -45,9 +45,10 @@ sudo ./install.sh
 The installer will:
 - Detect your OS and architecture automatically
 - Download the correct binary from GitHub releases (or use `BYPATH_LOCAL_BINARY` for a local binary)
-- **Auto-install dependencies** (sing-box, tun2socks, iptables, iproute2, curl — dns2socks is optional; bypath has a built-in DNS fallback)
+- **Auto-install dependencies** (sing-box, iptables, iproute2, curl — tun2socks only needed in legacy mode)
 - Install to `/opt/bypath/` with proper directory structure
 - Download geo rule sets (`geoip-ir.srs`, `geosite-ir.srs`) for Iran IP/domain whitelist
+- **`bypath run` auto-downloads** any missing geoip files at startup (clean-machine safe)
 - **Prompt for a server link** to add right after install (in interactive mode)
 - Optionally create a systemd service
 
@@ -257,7 +258,7 @@ All dependencies are auto-installed by `install.sh`. For manual setup:
 | iptables + iproute2 | ✅ | Routing (gateway mode) |
 | curl | recommended | Bench + health check |
 | xray | optional | Fallback engine |
-| tun2socks | only in legacy mode | TUN → SOCKS5 bridge (not needed with `native_tun: true`) |
+| tun2socks | legacy mode only | Not needed with `native_tun: true` (default) |
 
 ### Full build (embedded engines)
 

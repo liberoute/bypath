@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.6.0 (2026-06-06)
+
+### Bug Fixes
+- **sing-box DNS poisoning bypass (DoH)** — `dns-tunnel` type changed from `udp` to `https` (DoH). Plain UDP DNS silently fails over TCP-only transports (VLESS-WS, Trojan-WS): queries are dropped or intercepted by the ISP. Iranian ISPs also return bogon IPs (e.g. `10.10.34.36`) for blocked domains like youtube.com — causing `ip_is_private` to match and route them direct to censorship servers. DoH goes over TCP through the proxy outbound, bypassing both issues. YouTube now returns 200 correctly.
+- **`geoip:ir` never matched (resolve action missing)** — Added `{"action": "resolve", "server": "dns-tunnel"}` route rule after the sniff action, for both `singboxRouteFromRules()` and the legacy `singboxRoute()`. Without a `resolve` action, sing-box routes based on unresolved domain names — `geoip:ir` is an IP-based rule and never fires for domain traffic. With resolve using `dns-tunnel` (DoH), domains are resolved to real IPs before the geoip rule is evaluated. `login.samandehi.ir` now correctly returns 307 (direct) instead of 403 (tunnel → foreign exit → blocked).
+- **`default_domain_resolver` changed to `dns-direct`** — The global default was `dns-tunnel` (all domain resolution going through the proxy). Now `dns-direct` is used as the global default; the `resolve` action explicitly routes proxy-bound domains through `dns-tunnel`. This avoids unnecessary proxy load for direct-routed traffic.
+- **geoip `.srs` missing → sing-box crash** — `ruleSetForMatcher()` now checks if `geoip-{country}.srs` exists on disk before including it in the sing-box config (same pattern as geosite). Previously, a missing file caused sing-box to crash at startup ("port :2801 not ready within 10s"). Now logs a warning and skips the rule — bypath starts without geoip routing rather than failing entirely.
+- **Auto-download geoip `.srs` files at startup** — `cmd_run.go` now parses `routing.rules` for `geoip:<country>` matchers and calls `geo.DownloadGeoipFiles()` before starting the engine. Fresh installs no longer require a manual `bypath geo update` — the file is downloaded on first `bypath run`. Combined with the existence check above, clean-machine deployments work end-to-end without any manual steps.
+
 ## v2.5.10 (2026-06-05)
 
 ### Bug Fixes
