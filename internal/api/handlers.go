@@ -7,6 +7,9 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/liberoute/bypath/internal/build"
+	"github.com/liberoute/bypath/internal/config"
+	"github.com/liberoute/bypath/internal/metrics"
+	"github.com/liberoute/bypath/internal/paths"
 	"github.com/liberoute/bypath/internal/profile"
 )
 
@@ -16,6 +19,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	tunnelStatus := s.gateway.GetTunnelManager().GetStatus()
 	chainStatus := s.gateway.GetTunnelManager().GetChainStatus()
 	whitelistStats := s.gateway.GetWhitelistManager().GetStats()
+
+	// Sync whitelist counts to Prometheus
+	metrics.WhitelistIPs.Reset()
+	for country, count := range whitelistStats {
+		metrics.WhitelistIPs.WithLabelValues(country).Set(float64(count))
+	}
 
 	status := map[string]interface{}{
 		"version":       build.Version,
@@ -232,5 +241,22 @@ func (s *Server) handleUpdateSubscription(w http.ResponseWriter, r *http.Request
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
 		"message": "subscriptions updated",
 		"links":   count,
+	})
+}
+
+// --- Config ---
+
+func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
+	cfgPath := paths.Get().ConfigFile
+	newCfg, err := config.Load(cfgPath)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, "config reload failed: "+err.Error())
+		return
+	}
+	needRestart := s.gateway.Reload(newCfg)
+	metrics.ConfigReloads.Inc()
+	jsonResponse(w, http.StatusOK, map[string]interface{}{
+		"message":          "config reloaded",
+		"restart_required": needRestart,
 	})
 }

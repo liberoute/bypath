@@ -5,6 +5,10 @@ dist/
 # Engine binaries (downloaded at runtime)
 engines/
 
+# Embedded binaries (downloaded at build time via make fetch-tun2socks-*)
+assets/embed/tun2socks
+assets/embed/tun2socks.zip
+
 # Runtime data
 data/profiles/
 data/ips/

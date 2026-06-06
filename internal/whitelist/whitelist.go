@@ -51,6 +51,13 @@ func (m *Manager) IsWhitelisted(ip net.IP) bool {
 	return false
 }
 
+// UpdateConfig replaces the whitelist config at runtime (hot-reload).
+func (m *Manager) UpdateConfig(cfg config.WhitelistConfig) {
+	m.mu.Lock()
+	m.config = cfg
+	m.mu.Unlock()
+}
+
 // GetStats returns whitelist statistics.
 func (m *Manager) GetStats() map[string]int {
 	m.mu.RLock()

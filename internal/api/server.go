@@ -7,9 +7,11 @@ import (
 	"net/http"
 
 	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/liberoute/bypath/internal/config"
 	"github.com/liberoute/bypath/internal/engine"
 	"github.com/liberoute/bypath/internal/gateway"
+	_ "github.com/liberoute/bypath/internal/metrics" // register metrics
 )
 
 // Server is the REST API server for managing Liberoute.
@@ -76,6 +78,12 @@ func (s *Server) registerRoutes() {
 
 	// Subscriptions
 	api.HandleFunc("/subscriptions/update/{group}", s.handleUpdateSubscription).Methods("POST")
+
+	// Config
+	api.HandleFunc("/config/reload", s.handleConfigReload).Methods("POST")
+
+	// Prometheus metrics (no auth — standard scrape endpoint)
+	s.router.Handle("/metrics", promhttp.Handler()).Methods("GET")
 }
 
 // --- Response Helpers ---

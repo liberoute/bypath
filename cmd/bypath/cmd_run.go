@@ -87,6 +87,20 @@ func cmdRun(args []string) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	reloadCh := make(chan os.Signal, 1)
+	signal.Notify(reloadCh, syscall.SIGHUP)
+	go func() {
+		for range reloadCh {
+			log.Printf("♻️  SIGHUP received — reloading config from %s", configPath)
+			newCfg, err := config.Load(configPath)
+			if err != nil {
+				log.Printf("❌ Config reload failed: %v", err)
+				continue
+			}
+			gw.Reload(newCfg)
+		}
+	}()
+
 	// Retry loop: if no server is reachable on first start (e.g. all servers down),
 	// wait and retry instead of exiting. Exiting causes systemd to restart
 	// immediately, quickly exhausting StartLimitBurst and putting the service into

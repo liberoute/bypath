@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -368,6 +369,18 @@ func (m model) executeHomeAction(item homeItem) (tea.Model, tea.Cmd) {
 		m.confirmYes = true // default on Yes
 		m.confirmAction = "do-update-ask-method"
 		return m, nil
+	case "restart":
+		m.confirmMode = true
+		m.confirmLabel = "Restart gateway?"
+		m.confirmYes = true
+		m.confirmAction = "restart-gateway"
+		return m, nil
+	case "stop":
+		m.confirmMode = true
+		m.confirmLabel = "Stop gateway?"
+		m.confirmYes = false
+		m.confirmAction = "stop-gateway"
+		return m, nil
 	default:
 		m.running = true
 		act := item.action
@@ -517,12 +530,12 @@ func (m model) handleServersKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(links) > 0 && m.cursor < len(links) {
 			link := links[m.cursor]
 			group := m.groups[m.activeGroup]
-			m.running = true
-			idx := link.idx
-			return m, func() tea.Msg {
-				exe, _ := os.Executable()
-				return runCmdCapture(exe, "remove", fmt.Sprintf("%d", idx), "-g", group)
-			}
+			name := link.remark
+			if name == "" { name = link.server }
+			m.confirmMode = true
+			m.confirmLabel = fmt.Sprintf("Delete server '%s'?", name)
+			m.confirmYes = false
+			m.confirmAction = fmt.Sprintf("delete-server|%s|%d", group, link.idx)
 		}
 	}
 	return m, nil
@@ -586,15 +599,10 @@ func (m model) handleSubsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "d", "delete":
 		if len(subs) > 0 && m.cursor < len(subs) {
 			sub := subs[m.cursor]
-			err := removeSubscription(sub.group, sub.idx)
-			if err != nil {
-				m.showOutput = true
-				m.output = fmt.Sprintf("❌ %v", err)
-			} else {
-				m.showOutput = true
-				m.output = fmt.Sprintf("✅ Removed from '%s'", sub.group)
-				if m.cursor > 0 { m.cursor-- }
-			}
+			m.confirmMode = true
+			m.confirmLabel = fmt.Sprintf("Delete subscription from '%s'?", sub.group)
+			m.confirmYes = false
+			m.confirmAction = fmt.Sprintf("delete-sub|%s|%d", sub.group, sub.idx)
 		}
 	case "u":
 		// Update all subs (direct)
@@ -718,6 +726,39 @@ func (m model) handleConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.showOutput = true
 				m.output = fmt.Sprintf("✅ Group '%s' deleted", groupName)
 				return m, nil
+			case strings.HasPrefix(m.confirmAction, "delete-server|"):
+				parts := strings.SplitN(strings.TrimPrefix(m.confirmAction, "delete-server|"), "|", 2)
+				if len(parts) == 2 {
+					group := parts[0]
+					idx, _ := strconv.Atoi(parts[1])
+					m.running = true
+					return m, func() tea.Msg {
+						exe, _ := os.Executable()
+						return runCmdCapture(exe, "remove", fmt.Sprintf("%d", idx), "-g", group)
+					}
+				}
+			case strings.HasPrefix(m.confirmAction, "delete-sub|"):
+				parts := strings.SplitN(strings.TrimPrefix(m.confirmAction, "delete-sub|"), "|", 2)
+				if len(parts) == 2 {
+					group := parts[0]
+					idx, _ := strconv.Atoi(parts[1])
+					err := removeSubscription(group, idx)
+					if err != nil {
+						m.showOutput = true
+						m.output = fmt.Sprintf("❌ %v", err)
+					} else {
+						m.showOutput = true
+						m.output = fmt.Sprintf("✅ Removed from '%s'", group)
+						if m.cursor > 0 { m.cursor-- }
+					}
+					return m, nil
+				}
+			case m.confirmAction == "restart-gateway":
+				m.running = true
+				return m, func() tea.Msg { return executeAction("restart", "") }
+			case m.confirmAction == "stop-gateway":
+				m.running = true
+				return m, func() tea.Msg { return executeAction("stop", "") }
 			}
 		} else {
 			// "No" selected

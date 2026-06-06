@@ -16,7 +16,9 @@ import (
 	"time"
 
 	"github.com/liberoute/bypath/internal/config"
+	"github.com/liberoute/bypath/internal/embedbin"
 	"github.com/liberoute/bypath/internal/engine"
+	"github.com/liberoute/bypath/internal/metrics"
 	"github.com/liberoute/bypath/internal/paths"
 	"github.com/liberoute/bypath/internal/profile"
 	"github.com/liberoute/bypath/internal/tunnel"
@@ -37,11 +39,12 @@ type Gateway struct {
 	profileMgr *profile.Manager
 	whitelist  *whitelist.Manager
 
-	// Running processes
-	engineProc  *exec.Cmd
-	dnsProc     *exec.Cmd
-	tunProc     *exec.Cmd
-	dnsBuiltin  []*dns.Server // built-in DNS servers (fallback when dns2socks/dnsmasq absent)
+	// Running processes / in-process runners
+	engineProc     *exec.Cmd
+	embeddedEngine engine.EmbeddedRunner // non-nil when engine runs in-process (full build)
+	dnsProc        *exec.Cmd
+	tunProc        *exec.Cmd
+	dnsBuiltin     []*dns.Server // built-in DNS servers (fallback when dns2socks/dnsmasq absent)
 
 	// Native TUN state
 	nativeTUN    bool   // whether sing-box native TUN is active
@@ -170,6 +173,8 @@ func (gw *Gateway) Start() error {
 		}
 	}
 
+	metrics.GatewayUp.Set(1)
+	metrics.SetActiveEngine(gw.activeEngine)
 	log.Printf("✅ Gateway running:")
 	log.Printf("   Interface:  %s", gw.iface)
 	log.Printf("   Local IP:   %s", gw.localIP)
@@ -234,15 +239,62 @@ func (gw *Gateway) Stop() {
 	gw.dnsBuiltin = nil
 
 	// Stop engine — in native TUN mode, sing-box removes its TUN device on exit
-	if gw.engineProc != nil {
+	if gw.embeddedEngine != nil {
+		gw.embeddedEngine.Stop() //nolint:errcheck
+		gw.embeddedEngine = nil
+		log.Println("  ✓ Engine stopped (embedded)")
+	} else if gw.engineProc != nil {
 		gw.engineProc.Process.Kill()
 		gw.engineProc.Wait()
 		log.Println("  ✓ Engine stopped")
 	}
 
+	metrics.GatewayUp.Set(0)
+	metrics.SetActiveEngine("")
 	gw.cancel()
 	os.Remove(paths.Get().ChildrenFile)
 	log.Println("✅ Gateway stopped")
+}
+
+// Reload applies a new config without restarting the gateway.
+// It immediately updates whitelist settings and other soft fields.
+// Returns the names of fields that require an engine restart to take effect.
+func (gw *Gateway) Reload(newCfg *config.Config) []string {
+	gw.mu.Lock()
+	defer gw.mu.Unlock()
+
+	var needRestart []string
+
+	old := gw.config
+
+	if newCfg.Server.SOCKSPort != old.Server.SOCKSPort {
+		needRestart = append(needRestart, "server.socks_port")
+	}
+	if newCfg.Server.APIPort != old.Server.APIPort {
+		needRestart = append(needRestart, "server.api_port")
+	}
+	if newCfg.Gateway.NativeTUN != old.Gateway.NativeTUN {
+		needRestart = append(needRestart, "gateway.native_tun")
+	}
+	if strings.Join(newCfg.Gateway.DNSUpstream, ",") != strings.Join(old.Gateway.DNSUpstream, ",") {
+		needRestart = append(needRestart, "gateway.dns_upstream")
+	}
+	if newCfg.Engines.PreferredEngine != old.Engines.PreferredEngine {
+		needRestart = append(needRestart, "engines.preferred")
+	}
+
+	// Update whitelist manager immediately
+	gw.whitelist.UpdateConfig(newCfg.Whitelist)
+
+	// Replace config contents so all code paths using gw.config pick up the new values.
+	*gw.config = *newCfg
+
+	if len(needRestart) > 0 {
+		log.Printf("♻️  Config reloaded — the following changes require engine restart: %s", strings.Join(needRestart, ", "))
+	} else {
+		log.Printf("♻️  Config reloaded — all changes applied")
+	}
+	return needRestart
 }
 
 // --- Internal methods ---
@@ -399,8 +451,12 @@ func (gw *Gateway) startEngineWithFallback(link *profile.Link) error {
 // restartEngineAsLegacy kills the current engine process (if any), regenerates config
 // with GatewayMode=false, and restarts the engine in legacy (mixed-inbound) mode.
 func (gw *Gateway) restartEngineAsLegacy(link *profile.Link) error {
-	// Kill the failed engine process
-	if gw.engineProc != nil {
+	metrics.TunnelRestarts.Inc()
+	// Kill the failed engine process (or stop embedded runner)
+	if gw.embeddedEngine != nil {
+		gw.embeddedEngine.Stop() //nolint:errcheck
+		gw.embeddedEngine = nil
+	} else if gw.engineProc != nil {
 		gw.engineProc.Process.Kill()
 		gw.engineProc.Wait()
 		gw.engineProc = nil
@@ -469,7 +525,10 @@ func (gw *Gateway) startEngineWithEngineFallback(link *profile.Link) bool {
 	}
 
 	log.Printf("  ⚠️  Engine started but no connectivity")
-	if gw.engineProc != nil {
+	if gw.embeddedEngine != nil {
+		gw.embeddedEngine.Stop() //nolint:errcheck
+		gw.embeddedEngine = nil
+	} else if gw.engineProc != nil {
 		gw.engineProc.Process.Kill()
 		gw.engineProc.Wait() //nolint:errcheck
 		gw.engineProc = nil
@@ -638,6 +697,39 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 	if gw.config.Gateway.Enabled && gw.config.Gateway.NativeTUN {
 		configGen.GatewayMode = true
 		configGen.DNSPort = gw.dnsPort
+	}
+
+	// Try embedded (in-process) engine first if one is registered (full build only).
+	preferredName := gw.config.Engines.PreferredEngine
+	if preferredName == "" && len(gw.config.Engines.Fallback.Order) > 0 {
+		preferredName = gw.config.Engines.Fallback.Order[0]
+	}
+	if preferredName == "" {
+		preferredName = "sing-box"
+	}
+	if factory, ok := engine.GetEmbedded(preferredName); ok {
+		configFile, cfgErr := configGen.Generate(&engine.Engine{Name: preferredName}, link)
+		if cfgErr == nil {
+			runner, runErr := factory(configFile)
+			if runErr == nil {
+				if startErr := runner.Start(); startErr == nil {
+					gw.embeddedEngine = runner
+					gw.activeEngine = preferredName
+					time.Sleep(2 * time.Second)
+					log.Printf("  ✅ %s running in-process (embedded) on :%d", preferredName, gw.socksPort)
+					if gw.config.Gateway.Enabled && gw.config.Gateway.NativeTUN && preferredName == "sing-box" {
+						gw.nativeTUN = true
+					}
+					return nil
+				} else {
+					log.Printf("  ⚠️  Embedded %s start failed: %v — falling back to binary", preferredName, startErr)
+				}
+			} else {
+				log.Printf("  ⚠️  Embedded %s init failed: %v — falling back to binary", preferredName, runErr)
+			}
+		} else {
+			log.Printf("  ⚠️  Embedded %s config gen failed: %v — falling back to binary", preferredName, cfgErr)
+		}
 	}
 
 	// FallbackController handles engine selection and startup with automatic fallback.
@@ -883,10 +975,15 @@ func (gw *Gateway) startTun() error {
 
 	log.Printf("🔧 Setting up TUN device...")
 
-	// Check for tun2socks
+	// Resolve tun2socks: prefer system PATH, fall back to embedded binary.
 	tunPath, err := exec.LookPath("tun2socks")
 	if err != nil {
-		return fmt.Errorf("tun2socks not found (install it for gateway mode)")
+		if embedded, eErr := embedbin.ExtractTun2socks(); eErr == nil {
+			tunPath = embedded
+			defer os.Remove(tunPath)
+		} else {
+			return fmt.Errorf("tun2socks not found (install it or use native TUN mode with a full build)")
+		}
 	}
 
 	// Remove old TUN if exists
@@ -984,8 +1081,8 @@ func (gw *Gateway) setupRouting() error {
 		// This prevents a chicken-and-egg problem: after resolv.conf points to
 		// dns2socks (127.0.0.1), xray needs to resolve the server hostname but
 		// can't do so until xray itself is up and forwarding DNS queries.
-		if gw.engineProc != nil {
-			// engineProc is the xray/sing-box process; find the link that was used
+		if gw.engineProc != nil || gw.embeddedEngine != nil {
+			// pin the tunnel server's hostname before switching DNS
 			if link := gw.profileMgr.GetActiveLink(); link != nil && link.Address != "" {
 				gw.pinHostToEtcHosts(link.Address)
 			}
