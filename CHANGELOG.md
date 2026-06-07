@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.6.2 (2026-06-08)
+
+### Bug Fixes
+- **systemd-resolved conflict on Debian 12+** — On systems with `systemd-resolved` active (Debian 12, Ubuntu 18+), port 53 was occupied, preventing `dns2socks` from starting. Gateway would start without DNS → LAN clients got no resolution. Now `disableSystemdResolved()` is called automatically at the top of `startDNS()` — detects, stops, disables the service, and fixes the `/etc/resolv.conf` symlink. Also added to `install.sh` so fresh installs handle this at install time.
+- **Double "v" in version output** — `bypath version` displayed `vv2.6.1` when the version string was injected with a "v" prefix via ldflags. Now `versionStr()` normalizes to a single "v" prefix.
+
+### Added
+- **TUI: scrollable output view** — Version info and command output panels now support `↑↓`/`j`/`k` scrolling. Previously long output (engines, geo data) overflowed on small terminals. Close with `q`/`esc`/`enter`.
+
+### Changed
+- **install.sh disables systemd-resolved** — `check_deps()` now automatically stops and disables `systemd-resolved` if active, freeing port 53 for bypath's DNS proxy.
+
 ## v2.6.1 (2026-06-07)
 
 ### Bug Fixes

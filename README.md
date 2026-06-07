@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/liberoute/bypath/main/install.sh | 
 Or with a specific version and variant:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/liberoute/bypath/main/install.sh | sudo bash -s -- v2.6.1 full
+curl -fsSL https://raw.githubusercontent.com/liberoute/bypath/main/install.sh | sudo bash -s -- v2.6.2 full
 ```
 
 Or download and run manually:

@@ -23,7 +23,15 @@ var (
 
 // FullVersion returns a formatted version string.
 func FullVersion() string {
-	return fmt.Sprintf("%s v%s (%s) [%s] built %s", Name, Version, shortCommit(), Variant, BuildDate)
+	return fmt.Sprintf("%s %s (%s) [%s] built %s", Name, versionStr(), shortCommit(), Variant, BuildDate)
+}
+
+// versionStr returns the version with a single "v" prefix.
+func versionStr() string {
+	if strings.HasPrefix(Version, "v") {
+		return Version
+	}
+	return "v" + Version
 }
 
 // UserAgent returns the HTTP User-Agent string.
@@ -43,7 +51,7 @@ type EngineInfo struct {
 func PrintVersionInfo() string {
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("%s v%s\n", Name, Version))
+	sb.WriteString(fmt.Sprintf("%s %s\n", Name, versionStr()))
 	sb.WriteString(fmt.Sprintf("  Variant:    %s\n", Variant))
 	sb.WriteString(fmt.Sprintf("  Commit:     %s\n", Commit))
 	sb.WriteString(fmt.Sprintf("  Built:      %s\n", BuildDate))

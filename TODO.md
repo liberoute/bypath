@@ -38,3 +38,4 @@
 - Some subscription URLs are only accessible via proxy (CLI `bypath sub update` now auto-routes via SOCKS if bypath is running; TUI also supports `o`/`p`).
 - `sub update` replaces ALL links in a group (by design — subscription is source of truth for that group).
 - geosite .srs only available for `ir` and `cn` from Chocolate4U; other countries have geoip only.
+- **sing-box 1.13 on ARM64 gets HTTP 403 from Cloudflare Workers** — VLESS+WebSocket through CDN Workers fails with sing-box on aarch64 (OPi Zero 3). xray connects fine to the same links. Workaround: set `preferred: "xray"` on affected machines. Root cause under investigation (TLS fingerprint or WebSocket handshake difference).

@@ -75,6 +75,8 @@ type model struct {
 	activeGroup int // index into groups for server tab
 	output      string
 	showOutput  bool
+	outputScroll int // scroll offset for output view
+	termHeight   int // terminal height for scroll calculation
 	running     bool
 	inputMode   bool
 	inputBuf    string
@@ -194,6 +196,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case statusMsg:
 		m.statusInfo = msg.info
 		return m, nil
+	case tea.WindowSizeMsg:
+		m.termHeight = msg.Height
+		return m, nil
 	case inlineBenchDoneMsg:
 		m.benchRunning = false
 		m.benchDone = true
@@ -202,6 +207,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case actionDoneMsg:
 		m.running = false
 		m.showOutput = true
+		m.outputScroll = 0
 		m.output = msg.output
 		if msg.err != nil {
 			m.output += "\n" + errorMsgStyle.Render(fmt.Sprintf("Error: %v", msg.err))
@@ -233,11 +239,29 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleInput(msg)
 	}
 
-	// Output mode — any key dismisses
+	// Output mode — scroll or dismiss
 	if m.showOutput {
-		m.showOutput = false
-		m.output = ""
-		return m, nil
+		switch msg.String() {
+		case "q", "esc", "enter":
+			m.showOutput = false
+			m.output = ""
+			m.outputScroll = 0
+			return m, nil
+		case "up", "k":
+			if m.outputScroll > 0 {
+				m.outputScroll--
+			}
+			return m, nil
+		case "down", "j":
+			m.outputScroll++
+			return m, nil
+		default:
+			// Any other key dismisses
+			m.showOutput = false
+			m.output = ""
+			m.outputScroll = 0
+			return m, nil
+		}
 	}
 
 	// Running — ignore
@@ -906,12 +930,38 @@ func (m model) View() string {
 		return b.String()
 	}
 
-	// Output overlay
+	// Output overlay (scrollable)
 	if m.showOutput {
 		b.WriteString("\n")
-		b.WriteString(outputStyle.Render(m.output))
-		b.WriteString("\n\n")
-		b.WriteString(dimStyle.Render("  press any key"))
+		lines := strings.Split(m.output, "\n")
+		// Calculate visible area (leave room for header + footer)
+		visibleLines := m.termHeight - 6
+		if visibleLines < 5 {
+			visibleLines = 20 // fallback if termHeight not set
+		}
+		// Clamp scroll
+		maxScroll := len(lines) - visibleLines
+		if maxScroll < 0 {
+			maxScroll = 0
+		}
+		if m.outputScroll > maxScroll {
+			m.outputScroll = maxScroll
+		}
+		// Render visible portion
+		end := m.outputScroll + visibleLines
+		if end > len(lines) {
+			end = len(lines)
+		}
+		for _, line := range lines[m.outputScroll:end] {
+			b.WriteString(outputStyle.Render(line))
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+		scrollInfo := ""
+		if len(lines) > visibleLines {
+			scrollInfo = fmt.Sprintf(" (%d/%d)", m.outputScroll+1, len(lines))
+		}
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  ↑↓ scroll • q/esc/enter close%s", scrollInfo)))
 		b.WriteString("\n")
 		return b.String()
 	}
