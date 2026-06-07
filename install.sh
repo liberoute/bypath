@@ -292,6 +292,23 @@ check_deps() {
 
     detect_pkg_manager
 
+    # systemd-resolved conflicts with bypath's DNS on port 53
+    if [ "$OS" = "linux" ] && command -v systemctl &>/dev/null; then
+        if systemctl is-active systemd-resolved &>/dev/null; then
+            info "systemd-resolved is active (conflicts with port 53) — disabling..."
+            systemctl stop systemd-resolved 2>/dev/null
+            systemctl disable systemd-resolved 2>/dev/null
+            # Fix resolv.conf if it's a symlink to the stub
+            if [ -L /etc/resolv.conf ] && readlink /etc/resolv.conf | grep -q systemd; then
+                rm -f /etc/resolv.conf
+                printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+            fi
+            ok "systemd-resolved disabled (port 53 freed for bypath)"
+        else
+            ok "systemd-resolved not active (no conflict)"
+        fi
+    fi
+
     # iptables (required for gateway mode on Linux)
     if [ "$OS" = "linux" ]; then
         if ! command -v iptables &>/dev/null; then

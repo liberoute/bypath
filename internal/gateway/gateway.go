@@ -777,8 +777,39 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 	return nil
 }
 
+// disableSystemdResolved stops and disables systemd-resolved if it's running.
+// systemd-resolved binds to port 53 (127.0.0.53 and/or 127.0.0.54) which
+// prevents dns2socks/dnsmasq from binding to 0.0.0.0:53.
+// Common on Debian 12+, Ubuntu 18+. Not present on Armbian minimal.
+func disableSystemdResolved() {
+	// Check if systemd-resolved is active
+	out, err := exec.Command("systemctl", "is-active", "systemd-resolved").Output()
+	if err != nil || strings.TrimSpace(string(out)) != "active" {
+		return // not running, nothing to do
+	}
+
+	log.Printf("  ⚠️  systemd-resolved is active (conflicts with port 53) — disabling...")
+
+	// Stop and disable
+	exec.Command("systemctl", "stop", "systemd-resolved").Run()
+	exec.Command("systemctl", "disable", "systemd-resolved").Run()
+
+	// Fix /etc/resolv.conf if it's a symlink to systemd-resolved's stub
+	target, err := os.Readlink("/etc/resolv.conf")
+	if err == nil && strings.Contains(target, "systemd") {
+		os.Remove("/etc/resolv.conf")
+		os.WriteFile("/etc/resolv.conf", []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"), 0644)
+		log.Printf("  ✅ /etc/resolv.conf fixed (was symlink to systemd-resolved stub)")
+	}
+
+	log.Printf("  ✅ systemd-resolved disabled")
+}
+
 func (gw *Gateway) startDNS() error {
 	log.Printf("🔀 Starting DNS proxy on :%d...", gw.dnsPort)
+
+	// Disable systemd-resolved if it's occupying port 53
+	disableSystemdResolved()
 
 	// Kill only bypath's own previous DNS proxy (tracked by PID), not user processes.
 	if gw.dnsProc != nil && gw.dnsProc.Process != nil {
