@@ -714,6 +714,8 @@ engines:
 # Outbound values: "direct" (bypass tunnel) or "proxy" (through tunnel).
 routing:
   rules:
+    - match: "domain_suffix:ir"
+      outbound: "direct"
     - match: "geoip:ir"
       outbound: "direct"
     - match: "geosite:ir"

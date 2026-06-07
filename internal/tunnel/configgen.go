@@ -650,8 +650,16 @@ func (cg *ConfigGenerator) singboxRuleFromMatcher(match, outbound string) map[st
 	rule := map[string]interface{}{"action": "route", "outbound": outbound}
 	switch typ {
 	case "geoip":
+		// Only add rule if the .srs file actually exists — referencing a missing
+		// rule_set crashes sing-box at startup.
+		if cg.ruleSetForMatcher(match) == nil {
+			return nil
+		}
 		rule["rule_set"] = []string{fmt.Sprintf("geoip-%s", val)}
 	case "geosite":
+		if cg.ruleSetForMatcher(match) == nil {
+			return nil
+		}
 		rule["rule_set"] = []string{fmt.Sprintf("geosite-%s", val)}
 	case "domain":
 		rule["domain"] = []string{val}

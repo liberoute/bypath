@@ -40,6 +40,8 @@ routing:
       outbound: direct
     - match: domain_suffix:ip-api.com
       outbound: direct
+    - match: domain_suffix:ir
+      outbound: direct
     - match: geoip:ir
       outbound: direct
     - match: geosite:ir

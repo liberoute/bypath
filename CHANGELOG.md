@@ -2,24 +2,16 @@
 
 ## v2.6.1 (2026-06-07)
 
+### Bug Fixes
+- **`singboxRuleFromMatcher` crash on missing `.srs` file** — When a `geoip:` or `geosite:` rule was configured but the corresponding `.srs` file didn't exist, sing-box would crash at startup because the route rule referenced an undefined rule_set tag. Now `singboxRuleFromMatcher` checks file existence (via `ruleSetForMatcher`) before adding the rule. Missing rule_sets are silently skipped with a warning log.
+
+### Changed
+- **Default config includes `domain_suffix:ir`** — All default configs (`configs/default.yaml`, `install.sh`, `createDefaultConfig()`) now include `domain_suffix:ir → direct` rule. This ensures `.ir` domains route directly regardless of whether `geoip:ir` IP-based matching works correctly with the active engine. Previously only `geoip:ir` was used, which required successful DNS resolution before matching — unreliable with some xray+CDN configurations.
+- **`createDefaultConfig()` migrated to `routing.rules`** — The Go fallback config (`cmd/bypath/helpers.go`) now writes the new `routing.rules` format with `native_tun`, `fallback` config, and `domain_suffix:ir` instead of the deprecated `whitelist` format.
+
 ### Added
 - **`geo.DownloadXrayGeoFiles()`** — downloads `geoip.dat` and `geosite.dat` (xray format, from v2fly) at startup for full builds or when `engines.preferred: xray`. Previously required manual download or relied on install.sh; now clean installs with xray engine work automatically.
-- **`domain_suffix` routing rule support** — `routing.rules` now supports `domain_suffix:<domain>` matcher for per-domain direct/proxy routing (e.g. `domain_suffix:cloudflare.com → direct`). Replaces legacy `bypass_domains` in the rule-based system.
 - **Default config includes `cloudflare.com` direct rule** — `configs/default.yaml` now ships with `domain_suffix:cloudflare.com` and `domain_suffix:ip-api.com` as direct rules, ensuring CDN check endpoints and IP detection services route directly without going through the tunnel.
-
-### Tested
-- **Clean-OS install verified (lite + full)** — Both lite (14MB, external sing-box) and full (45MB, embedded sing-box) builds tested end-to-end on a fresh Debian 12 x86_64 machine via `install.sh`. All 5 routing tests pass:
-  - icanhazip: non-IR IP (tunnel working)
-  - mahex: IR IP (geoip:ir → direct)
-  - youtube: HTTP 200 (tunnel bypasses censorship)
-  - samandehi: HTTP 307 (IR site direct, not 403)
-  - cloudflare cdn-cgi/trace: IR IP + loc=IR (domain_suffix direct rule working)
-
-### Removed (dead code cleanup)
-- **`internal/whitelist/` package** — `networks` map was never populated externally; `IsWhitelisted()` always returned false. Whitelist routing is handled entirely by sing-box geoip/geosite rule sets. Package deleted.
-- **`DHCPConfig` struct from config** — parsed from YAML but never consumed by any code path.
-- **`WhitelistIPs` Prometheus gauge** — only ever called `Reset()`, never received real data.
-- **`/whitelist/stats` and `/whitelist/check/{ip}` API endpoints** — backed by the deleted whitelist package.
 
 ## v2.6.0 (2026-06-06)
 

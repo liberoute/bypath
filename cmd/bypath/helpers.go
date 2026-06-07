@@ -109,6 +109,7 @@ server:
 
 gateway:
   enabled: true
+  native_tun: true
   interface: ""
   dns_upstream:
     - "1.1.1.1"
@@ -119,13 +120,27 @@ engines:
   prefer_system: true
   preferred: ""
 
+  fallback:
+    enabled: true
+    timeout: "10s"
+    order:
+      - sing-box
+      - xray
+
 profiles:
   directory: "%s"
   active_group: "default"
 
-whitelist:
-  countries: ["ir"]
-  update_interval: "24h"
+routing:
+  rules:
+    - match: "domain_suffix:ir"
+      outbound: "direct"
+    - match: "geoip:ir"
+      outbound: "direct"
+    - match: "geosite:ir"
+      outbound: "direct"
+    - match: "default"
+      outbound: "proxy"
 
 isolation:
   enabled: true
