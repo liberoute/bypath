@@ -106,6 +106,14 @@ func (gw *Gateway) Start() error {
 		return fmt.Errorf("no active link configured. Use 'bypath add <uri>' first")
 	}
 
+	// 2b. In gateway mode, free port 53 before starting the engine.
+	// sing-box (native TUN) binds port 53 for its DNS inbound; if systemd-resolved
+	// or another stub resolver is already there, the DNS inbound silently fails while
+	// the SOCKS proxy keeps working — exactly the "proxy works, DNS/GW broken" symptom.
+	if gw.config.Gateway.Enabled {
+		disableSystemdResolved()
+	}
+
 	// 3. Start tunnel engine (with auto-fallback)
 	if err := gw.startEngineWithFallback(activeLink); err != nil {
 		return fmt.Errorf("starting engine: %w", err)
@@ -805,11 +813,44 @@ func disableSystemdResolved() {
 	log.Printf("  ✅ systemd-resolved disabled")
 }
 
+// stopDnsmasq temporarily stops the system dnsmasq service if it is running on
+// port 53, so that bypath's own dns2socks can bind to that port.
+// Unlike disableSystemdResolved, we do NOT disable the service permanently —
+// dnsmasq often provides DHCP too and must come back after bypath stops.
+func stopDnsmasq() {
+	out, err := exec.Command("systemctl", "is-active", "dnsmasq").Output()
+	if err != nil || strings.TrimSpace(string(out)) != "active" {
+		return
+	}
+	log.Printf("  ⚠️  dnsmasq is active (conflicts with port 53) — stopping temporarily...")
+	exec.Command("systemctl", "stop", "dnsmasq").Run()
+	log.Printf("  ✅ dnsmasq stopped (will restart on next boot or after bypath stops)")
+}
+
+// restartDnsmasq starts the dnsmasq service again after bypath releases port 53.
+func restartDnsmasq() {
+	// Only restart if the unit exists and is not already running
+	out, _ := exec.Command("systemctl", "is-active", "dnsmasq").Output()
+	if strings.TrimSpace(string(out)) == "active" {
+		return
+	}
+	// Check that the unit is known to systemd before trying to start it
+	if err := exec.Command("systemctl", "cat", "dnsmasq").Run(); err != nil {
+		return
+	}
+	exec.Command("systemctl", "start", "dnsmasq").Run()
+	log.Printf("🔀 dnsmasq restarted")
+}
+
 func (gw *Gateway) startDNS() error {
 	log.Printf("🔀 Starting DNS proxy on :%d...", gw.dnsPort)
 
 	// Disable systemd-resolved if it's occupying port 53
 	disableSystemdResolved()
+	// Also stop dnsmasq: it binds port 53 at boot on many Armbian/Debian setups and
+	// causes dns2socks to fail silently (waitForPort returns true because dnsmasq is
+	// already there, so bypath thinks dns2socks started when it actually crashed).
+	stopDnsmasq()
 
 	// Kill only bypath's own previous DNS proxy (tracked by PID), not user processes.
 	if gw.dnsProc != nil && gw.dnsProc.Process != nil {
@@ -838,6 +879,12 @@ func (gw *Gateway) startDNS() error {
 		}
 		if err := waitForPort(gw.dnsPort, 5*time.Second); err != nil {
 			return fmt.Errorf("dns2socks didn't start: %w", err)
+		}
+		// Verify dns2socks itself is still alive — waitForPort can return true because
+		// another process (dnsmasq, systemd-resolved) was already on the port, masking
+		// the fact that dns2socks exited immediately after failing to bind.
+		if _, statErr := os.Stat(fmt.Sprintf("/proc/%d", gw.dnsProc.Process.Pid)); statErr != nil {
+			return fmt.Errorf("dns2socks exited immediately (another process may still hold port %d)", gw.dnsPort)
 		}
 		trackChildPID(gw.dnsProc.Process.Pid)
 		log.Printf("  ✅ dns2socks running on :%d → %s (DNS through tunnel)", gw.dnsPort, upstream[0])
@@ -1361,6 +1408,8 @@ func (gw *Gateway) cleanupRouting() {
 	// modified resolv.conf, and we must leave the system working after stop.
 	gw.restoreResolvConf()
 	gw.unpinHostsFromEtcHosts()
+	// Restart dnsmasq if bypath stopped it to free port 53.
+	restartDnsmasq()
 }
 
 // cleanupPreviousRun kills leftover child processes and restores network state

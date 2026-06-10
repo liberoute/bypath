@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.6.3 (2026-06-10)
+
+### Bug Fixes
+- **TUI: subscription group resets to "default" after action** — After running any action (update, bench, start), the TUI reloaded groups alphabetically and restored `activeGroup` by saved index. If a new group was inserted before the current one, the index shifted — pointing to "default" instead of the user's selected group. Fixed by saving the group *name* before reload and restoring by name after.
+- **dnsmasq conflict on port 53 (Armbian / Debian / Raspbian)** — On boards like Orange Pi and Raspberry Pi running Armbian or Raspbian, `dnsmasq` starts at boot and holds port 53. When bypath tried to start `dns2socks`, it exited immediately — but `waitForPort(53)` returned a false positive because dnsmasq was already there. Bypath incorrectly believed DNS was running and started the gateway with a broken DNS proxy. Fixed with two changes: (1) `stopDnsmasq()` is called before starting `dns2socks`; (2) after `waitForPort` succeeds, the dns2socks process is verified to still be alive via `/proc/<pid>` so a false positive from another process on port 53 is caught immediately.
+
+### Changed
+- **install.sh: sudo auto-escalation** — Non-root users no longer need to know about `sudo`. Running `./install.sh` as a regular user automatically re-executes with `sudo` (prompting for password if needed). Previously the installer exited with "must be run as root".
+- **install.sh: dnsmasq conflict handled at install time** — `check_deps()` now stops `dnsmasq` if active, so bypath works immediately after first install on Armbian/Debian/Raspbian systems without a manual reboot or service tweak.
+- **install.sh: `Conflicts=dnsmasq.service` in generated systemd unit** — The generated `/etc/systemd/system/bypath.service` now includes `Conflicts=dnsmasq.service`. Systemd stops dnsmasq automatically when bypath starts; bypath restarts dnsmasq when it exits. Previously this required a manual unit edit after install.
+
 ## v2.6.2 (2026-06-08)
 
 ### Bug Fixes

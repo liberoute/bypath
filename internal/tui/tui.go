@@ -212,9 +212,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.output += "\n" + errorMsgStyle.Render(fmt.Sprintf("Error: %v", msg.err))
 		}
-		// Reload groups in case they changed
+		// Reload groups, preserving the active group by name (not index) so that
+		// newly-added groups inserted earlier alphabetically don't shift the pointer.
+		prevGroup := ""
+		if m.activeGroup < len(m.groups) {
+			prevGroup = m.groups[m.activeGroup]
+		}
 		m.groups = findGroups()
-		if m.activeGroup >= len(m.groups) { m.activeGroup = 0 }
+		restored := false
+		for i, g := range m.groups {
+			if g == prevGroup {
+				m.activeGroup = i
+				restored = true
+				break
+			}
+		}
+		if !restored {
+			// Previous group gone; land on first non-default group, or 0.
+			m.activeGroup = 0
+			for i, g := range m.groups {
+				if g != "default" {
+					m.activeGroup = i
+					break
+				}
+			}
+		}
 		return m, tea.Batch(loadActiveInfoCmd, loadStatusCmd)
 	case tea.KeyMsg:
 		return m.handleKey(msg)

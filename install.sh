@@ -309,6 +309,16 @@ check_deps() {
         fi
     fi
 
+    # dnsmasq conflicts with bypath's DNS on port 53 (common on Armbian/Debian/Raspbian)
+    # Stop it now so first run works; Conflicts= in the service unit handles subsequent reboots.
+    if [ "$OS" = "linux" ] && command -v systemctl &>/dev/null; then
+        if systemctl is-active dnsmasq &>/dev/null; then
+            info "dnsmasq is active (conflicts with port 53) — stopping temporarily..."
+            systemctl stop dnsmasq 2>/dev/null || true
+            ok "dnsmasq stopped (bypath restarts it automatically when it exits)"
+        fi
+    fi
+
     # iptables (required for gateway mode on Linux)
     if [ "$OS" = "linux" ]; then
         if ! command -v iptables &>/dev/null; then
@@ -454,6 +464,9 @@ install_systemd() {
 Description=Bypath Network Gateway
 After=network-online.target
 Wants=network-online.target
+# Stop dnsmasq when bypath starts (it holds port 53 on Armbian/Debian/Raspbian).
+# bypath restarts dnsmasq automatically when it exits.
+Conflicts=dnsmasq.service
 # Disable start-attempt limit so systemd never enters "failed" state.
 # bypath itself handles retry with backoff when no server is reachable.
 StartLimitIntervalSec=0
@@ -582,9 +595,14 @@ main() {
     echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
     echo ""
 
-    # Check root
+    # Auto-escalate to root if needed — non-technical users shouldn't have to know about sudo
     if [ "$(id -u)" -ne 0 ]; then
-        die "This installer must be run as root. Try: sudo ./install.sh"
+        if command -v sudo &>/dev/null; then
+            echo -e "${YELLOW}⚠️${NC}  Root required — re-running with sudo (you may be asked for your password)..."
+            exec sudo "$0" "$@"
+        else
+            die "Root required and sudo not found. Run as root or install sudo."
+        fi
     fi
 
     # Ensure curl is available — it may be absent on Debian/Ubuntu minimal installs.

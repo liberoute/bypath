@@ -34,23 +34,25 @@ Or with a specific version and variant:
 curl -fsSL https://raw.githubusercontent.com/liberoute/bypath/main/install.sh | sudo bash -s -- v2.6.2 full
 ```
 
-Or download and run manually:
+Or download and run manually (no `sudo` needed — the installer escalates automatically):
 
 ```bash
 curl -fsSL -o install.sh https://raw.githubusercontent.com/liberoute/bypath/main/install.sh
 chmod +x install.sh
-sudo ./install.sh
+./install.sh
 ```
 
 The installer will:
+- **Auto-escalate to root** via sudo if needed (v2.6.3+) — no manual `sudo` required
 - Detect your OS and architecture automatically
 - Download the correct binary from GitHub releases (or use `BYPATH_LOCAL_BINARY` for a local binary)
 - **Auto-install dependencies** (sing-box, iptables, iproute2, curl — tun2socks only needed in legacy mode)
+- **Free port 53** — stops `systemd-resolved` (Debian/Ubuntu) and `dnsmasq` (Armbian/Raspbian) if active
 - Install to `/opt/bypath/` with proper directory structure
 - Download geo rule sets (`geoip-ir.srs`, `geosite-ir.srs`) for Iran IP/domain whitelist
 - **`bypath run` auto-downloads** any missing geoip files at startup (clean-machine safe)
 - **Prompt for a server link** to add right after install (in interactive mode)
-- Optionally create a systemd service
+- Create a systemd service with `Conflicts=dnsmasq.service` (port 53 freed automatically on every boot)
 
 ### Installer options
 
