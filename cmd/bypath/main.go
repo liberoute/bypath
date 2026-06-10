@@ -5,13 +5,11 @@ import (
 	"os"
 
 	"github.com/liberoute/bypath/internal/build"
-	"github.com/liberoute/bypath/internal/tui"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		menu := tui.New()
-		menu.Run()
+		openTUI()
 		os.Exit(0)
 	}
 
