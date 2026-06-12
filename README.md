@@ -14,6 +14,7 @@ Iranian IPs go direct (no tunnel). Everything else goes through your proxy serve
 - **Interactive TUI** — tab-based terminal UI (Home / Servers / Subscriptions)
 - **Dual engine** — sing-box (default, embedded in full build) + xray as automatic fallback; configurable per-deployment
 - **Rule-based routing** — geoip/geosite/domain rules map traffic to direct or proxy outbounds
+- **Home DNS / private TLD support** — route `.home`, `.lan`, `.internal` (or any private TLD) to your local DNS server via `gateway.local_dns`
 - **Auto-fallback** — if a link or engine fails, tries the next one automatically
 - **Mixed proxy** — SOCKS5 + HTTP on configurable port (default: 2801)
 - **API authentication** — token-based auth for REST API
@@ -190,6 +191,9 @@ gateway:
   enabled: true
   native_tun: true        # sing-box native TUN (no tun2socks needed)
   interface: ""           # auto-detect
+  local_dns:              # optional: home DNS for private TLDs
+    - server: "192.168.1.1"
+      domains: ["home", "lan"]
 
 engines:
   prefer_system: true

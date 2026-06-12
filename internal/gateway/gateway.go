@@ -281,6 +281,9 @@ func (gw *Gateway) Reload(newCfg *config.Config) []string {
 	if strings.Join(newCfg.Gateway.DNSUpstream, ",") != strings.Join(old.Gateway.DNSUpstream, ",") {
 		needRestart = append(needRestart, "gateway.dns_upstream")
 	}
+	if localDNSChanged(old.Gateway.LocalDNS, newCfg.Gateway.LocalDNS) {
+		needRestart = append(needRestart, "gateway.local_dns")
+	}
 	if newCfg.Engines.PreferredEngine != old.Engines.PreferredEngine {
 		needRestart = append(needRestart, "engines.preferred")
 	}
@@ -719,6 +722,15 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 		configGen.ForceProxyDomains = gw.config.Whitelist.ForceProxyDomains
 	}
 	configGen.DNSUpstream = gw.config.Gateway.DNSUpstream
+	if len(gw.config.Gateway.LocalDNS) > 0 {
+		rules := make([]tunnel.LocalDNSRule, 0, len(gw.config.Gateway.LocalDNS))
+		for _, entry := range gw.config.Gateway.LocalDNS {
+			if entry.Server != "" && len(entry.Domains) > 0 {
+				rules = append(rules, tunnel.LocalDNSRule{Server: entry.Server, Domains: entry.Domains})
+			}
+		}
+		configGen.LocalDNSRules = rules
+	}
 	configGen.SOCKSPort = gw.socksPort
 	if gw.config.SNISpoof.Enabled {
 		configGen.SNISpoof = gw.config.SNISpoof.SNI
@@ -864,6 +876,14 @@ func (gw *Gateway) startDNS() error {
 		upstream = []string{"1.1.1.1", "8.8.8.8"}
 	}
 
+	// When local_dns rules are configured, dns2socks cannot handle per-domain routing —
+	// it forwards everything to a single upstream through the tunnel. Skip it and use
+	// the built-in DNS forwarder which routes local suffixes directly to the home DNS.
+	if len(gw.config.Gateway.LocalDNS) > 0 {
+		log.Printf("  ℹ️  local_dns configured — using built-in DNS for per-domain routing")
+		return gw.startBuiltinDNS(upstream)
+	}
+
 	// Try dns2socks first (routes DNS through the tunnel — preferred).
 	// dns2socks takes a single upstream; use the first configured one.
 	dns2socksPath, err := exec.LookPath("dns2socks")
@@ -950,7 +970,44 @@ func (gw *Gateway) startBuiltinDNS(upstreams []string) error {
 	// Fallback: plain UDP client (direct, no proxy) for when proxy isn't ready.
 	udpClient := &dns.Client{Net: "udp", Timeout: 4 * time.Second}
 
+	// Local DNS clients: per-domain, sent directly to home DNS (not through tunnel).
+	type localDNSEntry struct {
+		suffixes []string
+		server   string
+	}
+	var localDNS []localDNSEntry
+	for _, entry := range gw.config.Gateway.LocalDNS {
+		if entry.Server != "" && len(entry.Domains) > 0 {
+			localDNS = append(localDNS, localDNSEntry{
+				suffixes: entry.Domains,
+				server:   entry.Server + ":53",
+			})
+		}
+	}
+
 	queryFn := func(ctx context.Context, r *dns.Msg) *dns.Msg {
+		// Check local DNS rules first — private TLDs (e.g. .home) go directly to the
+		// home DNS server, bypassing the tunnel entirely.
+		if len(r.Question) > 0 && len(localDNS) > 0 {
+			qname := strings.TrimSuffix(strings.ToLower(r.Question[0].Name), ".")
+			for _, entry := range localDNS {
+				for _, suffix := range entry.suffixes {
+					sfx := strings.ToLower(suffix)
+					if qname == sfx || strings.HasSuffix(qname, "."+sfx) {
+						resp, _, err := udpClient.ExchangeContext(ctx, r, entry.server)
+						if err == nil {
+							return resp
+						}
+						// Local DNS unreachable — return NXDOMAIN so clients don't hang.
+						log.Printf("⚠️  local DNS %s unreachable for %s: %v", entry.server, qname, err)
+						nxd := new(dns.Msg)
+						nxd.SetRcode(r, dns.RcodeNameError)
+						return nxd
+					}
+				}
+			}
+		}
+
 		packed, err := r.Pack()
 		if err == nil {
 			for _, dohURL := range dohURLs {
@@ -1467,6 +1524,21 @@ func (gw *Gateway) GetTunnelManager() *tunnel.Manager   { return gw.tunnelMgr }
 func (gw *Gateway) GetActiveEngine() string             { return gw.activeEngine }
 
 // --- Helpers ---
+
+func localDNSChanged(a, b []config.LocalDNSEntry) bool {
+	if len(a) != len(b) {
+		return true
+	}
+	for i := range a {
+		if a[i].Server != b[i].Server {
+			return true
+		}
+		if strings.Join(a[i].Domains, ",") != strings.Join(b[i].Domains, ",") {
+			return true
+		}
+	}
+	return false
+}
 
 func run(name string, args ...string) error {
 	cmd := exec.Command(name, args...)

@@ -32,10 +32,17 @@ type ServerConfig struct {
 }
 
 type GatewayConfig struct {
-	Enabled     bool     `yaml:"enabled"`
-	Interface   string   `yaml:"interface"`
-	DNSUpstream []string `yaml:"dns_upstream"`
-	NativeTUN   bool     `yaml:"native_tun"`
+	Enabled     bool           `yaml:"enabled"`
+	Interface   string         `yaml:"interface"`
+	DNSUpstream []string       `yaml:"dns_upstream"`
+	NativeTUN   bool           `yaml:"native_tun"`
+	LocalDNS    []LocalDNSEntry `yaml:"local_dns,omitempty"`
+}
+
+// LocalDNSEntry routes specific domain suffixes to a local DNS server (e.g. home DNS for .home TLD).
+type LocalDNSEntry struct {
+	Server  string   `yaml:"server"`            // IP of the local DNS server (e.g. "192.168.1.1")
+	Domains []string `yaml:"domains,omitempty"` // domain suffixes without leading dot (e.g. ["home", "lan"])
 }
 
 type FallbackConfig struct {

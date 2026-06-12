@@ -25,6 +25,12 @@ type RoutingRule struct {
 	Outbound string
 }
 
+// LocalDNSRule routes domain suffixes to a specific local DNS server (e.g. home DNS for .home).
+type LocalDNSRule struct {
+	Server  string   // IP of the local DNS server
+	Domains []string // domain suffixes without leading dot (e.g. ["home", "lan"])
+}
+
 // ConfigGenerator creates engine-specific configuration files from a Link.
 type ConfigGenerator struct {
 	tempDir            string
@@ -45,6 +51,9 @@ type ConfigGenerator struct {
 	// sing-box's internal DNS resolver doesn't need to resolve the hostname itself —
 	// avoiding bootstrap loops and ISP DNS interception for the proxy server.
 	PinnedHosts map[string]string // hostname → IP (e.g. "dl8.okarimi.ir" → "104.16.6.70")
+	// LocalDNSRules routes specific domain suffixes to a local DNS server (e.g. .home → 192.168.1.1).
+	// Traffic to these domains is also routed direct (not through the tunnel).
+	LocalDNSRules []LocalDNSRule
 }
 
 // proxyDNSServer returns the DoH server to use for DNS queries routed through the
@@ -410,7 +419,7 @@ func (cg *ConfigGenerator) singboxDNS(link *profile.Link) map[string]interface{}
 		geositeCountries = cg.WhitelistCountries
 	}
 
-	if !cg.GatewayMode && len(geositeCountries) == 0 && len(cg.RoutingRules) == 0 {
+	if !cg.GatewayMode && len(geositeCountries) == 0 && len(cg.RoutingRules) == 0 && len(cg.LocalDNSRules) == 0 {
 		// Fallback: simple DNS, direct only (proxy-only mode with no routing rules)
 		return map[string]interface{}{
 			"servers": []map[string]interface{}{
@@ -541,6 +550,31 @@ func (cg *ConfigGenerator) singboxDNS(link *profile.Link) map[string]interface{}
 		}
 	}
 
+	// Local DNS rules: route specific domain suffixes to a local DNS server (e.g. .home → 192.168.1.1).
+	// These rules are inserted BEFORE other direct rules so .home doesn't fall through to dns-tunnel.
+	// Local DNS servers use plain UDP — they're on the LAN, no need for encrypted DNS.
+	localDNSRules := make([]map[string]interface{}, 0, len(cg.LocalDNSRules))
+	for i, rule := range cg.LocalDNSRules {
+		if rule.Server == "" || len(rule.Domains) == 0 {
+			continue
+		}
+		tag := fmt.Sprintf("dns-local-%d", i)
+		servers = append(servers, map[string]interface{}{
+			"tag":         tag,
+			"type":        "udp",
+			"server":      rule.Server,
+			"server_port": 53,
+		})
+		localDNSRules = append(localDNSRules, map[string]interface{}{
+			"domain_suffix": rule.Domains,
+			"server":        tag,
+		})
+	}
+	// Local DNS rules come first so private TLDs are resolved before the catch-all tunnel rule.
+	if len(localDNSRules) > 0 {
+		dnsRules = append(localDNSRules, dnsRules...)
+	}
+
 	if len(dnsRules) > 0 {
 		dns["rules"] = dnsRules
 	}
@@ -605,6 +639,18 @@ func (cg *ConfigGenerator) singboxRouteFromRules() map[string]interface{} {
 		"action":        "route",
 		"outbound":      "direct",
 	})
+
+	// Local DNS domains (e.g. .home, .lan) → direct before applying user routing rules.
+	for _, rule := range cg.LocalDNSRules {
+		if len(rule.Domains) == 0 {
+			continue
+		}
+		rules = append(rules, map[string]interface{}{
+			"domain_suffix": rule.Domains,
+			"action":        "route",
+			"outbound":      "direct",
+		})
+	}
 
 	for _, rule := range cg.RoutingRules {
 		if rule.Match == "default" {
@@ -800,6 +846,18 @@ func (cg *ConfigGenerator) singboxRoute(link *profile.Link) map[string]interface
 		})
 	}
 
+	// Rule: local DNS domains (e.g. .home, .lan) → direct (they live on the LAN, not the internet).
+	for _, rule := range cg.LocalDNSRules {
+		if len(rule.Domains) == 0 {
+			continue
+		}
+		rules = append(rules, map[string]interface{}{
+			"domain_suffix": rule.Domains,
+			"action":        "route",
+			"outbound":      "direct",
+		})
+	}
+
 	// Rule: domain bypass (VPN detection endpoints → direct)
 	if len(cg.BypassDomains) > 0 {
 		rules = append(rules, cg.singboxBypassDomainRule())
@@ -914,7 +972,7 @@ func (cg *ConfigGenerator) generateSingBox(link *profile.Link) (string, error) {
 	// Route and DNS sections:
 	// - Gateway mode: always include (needed for TUN routing and DNS serving)
 	// - Proxy mode: include when whitelist/bypass/geosite is configured OR routing rules are set
-	if cg.GatewayMode || len(cg.RoutingRules) > 0 || len(cg.WhitelistCountries) > 0 || len(cg.BypassDomains) > 0 || len(cg.GeositeCountries) > 0 {
+	if cg.GatewayMode || len(cg.RoutingRules) > 0 || len(cg.WhitelistCountries) > 0 || len(cg.BypassDomains) > 0 || len(cg.GeositeCountries) > 0 || len(cg.LocalDNSRules) > 0 {
 		cfg["route"] = cg.singboxRoute(link)
 		cfg["dns"] = cg.singboxDNS(link)
 	}
@@ -1062,6 +1120,22 @@ func (cg *ConfigGenerator) xrayDNSConfig(link *profile.Link) map[string]interfac
 
 	servers := []interface{}{}
 
+	// Local DNS rules: route private TLDs (e.g. .home, .lan) to the home DNS server.
+	// Must come first so these domains don't fall through to the proxy DNS.
+	for _, rule := range cg.LocalDNSRules {
+		if rule.Server == "" || len(rule.Domains) == 0 {
+			continue
+		}
+		domains := make([]string, len(rule.Domains))
+		for j, d := range rule.Domains {
+			domains[j] = "domain:" + d
+		}
+		servers = append(servers, map[string]interface{}{
+			"address": rule.Server,
+			"domains": domains,
+		})
+	}
+
 	// Bootstrap domains → direct DoH (no proxy).
 	if len(bootstrapDomains) > 0 {
 		servers = append(servers, map[string]interface{}{
@@ -1150,6 +1224,22 @@ func (cg *ConfigGenerator) generateXray(link *profile.Link) (string, error) {
 			})
 		}
 
+		// Local DNS domains (e.g. .home, .lan) → direct.
+		for _, rule := range cg.LocalDNSRules {
+			if len(rule.Domains) == 0 {
+				continue
+			}
+			domains := make([]string, len(rule.Domains))
+			for j, d := range rule.Domains {
+				domains[j] = "domain:" + d
+			}
+			rules = append(rules, map[string]interface{}{
+				"type":        "field",
+				"domain":      domains,
+				"outboundTag": "direct",
+			})
+		}
+
 		// Bypass domains → direct
 		if len(cg.BypassDomains) > 0 {
 			rules = append(rules, map[string]interface{}{
@@ -1231,6 +1321,22 @@ func (cg *ConfigGenerator) xrayRouteFromRules() map[string]interface{} {
 		"ip":          []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "fc00::/7", "::1/128"},
 		"outboundTag": "direct",
 	})
+
+	// Local DNS domains (e.g. .home, .lan) → direct.
+	for _, rule := range cg.LocalDNSRules {
+		if len(rule.Domains) == 0 {
+			continue
+		}
+		domains := make([]string, len(rule.Domains))
+		for j, d := range rule.Domains {
+			domains[j] = "domain:" + d
+		}
+		rules = append(rules, map[string]interface{}{
+			"type":        "field",
+			"domain":      domains,
+			"outboundTag": "direct",
+		})
+	}
 
 	for _, rule := range cg.RoutingRules {
 		if rule.Match == "default" {

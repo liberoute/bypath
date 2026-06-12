@@ -1,5 +1,22 @@
 # Changelog
 
+## v2.6.4 (2026-06-12)
+
+### Added
+- **`gateway.local_dns` — home DNS / private TLD support** — New config section routes specific domain suffixes to a designated local DNS server, bypassing the tunnel entirely. Useful when your home/office DNS serves private TLDs (e.g. `.home`, `.lan`, `.internal`) that public resolvers (1.1.1.1, 8.8.8.8) cannot answer. Both DNS resolution and traffic routing for matched domains are handled locally (direct, no tunnel).
+
+  ```yaml
+  gateway:
+    local_dns:
+      - server: "192.168.1.1"   # your home/local DNS server
+        domains: ["home", "lan"] # domain suffixes without leading dot
+  ```
+
+  Multiple entries are supported. Each entry routes its domains to a separate DNS server. Works with both **sing-box** (native TUN) and **xray** (legacy + routing-rules) engines.
+
+### Changed
+- **Built-in DNS forwarder gains per-domain routing** — When `local_dns` is configured, bypath uses the built-in DNS forwarder instead of `dns2socks` (which only supports a single upstream). Local-suffix queries are forwarded directly to the configured local DNS server via plain UDP; all other queries still go through DoH-over-proxy to avoid ISP poisoning. `dns2socks` and `dnsmasq` are skipped when local DNS rules are present.
+
 ## v2.6.3 (2026-06-10)
 
 ### Bug Fixes
