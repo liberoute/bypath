@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.6.5 (2026-06-16)
+
+### Bug Fixes
+- **TUI: selecting a server from a renamed group picks from the wrong group** — When a group was renamed (e.g. `ha-man2` → `mazin`), the link objects inside its JSON file still carried the old `"group"` field value. `SetActiveLink` then wrote the stale name to `.active`; on gateway restart `GetActiveLink` could not find that group and fell back to the first group in map iteration order (non-deterministic — often a different group entirely). Fixed in two places: `loadAll()` now always overwrites `link.Group` with the current group name from the file, and `cmd select` explicitly sets `link.Group = group` before calling `SetActiveLink`.
+- **TUI: live-status hangs indefinitely** — The connection test used `http://icanhazip.com` (domain-based), which could be matched by `bypass_domains` and route direct — making the test meaningless or slow. Replaced with `https://1.1.1.1/cdn-cgi/trace` (IP-based URL, never intercepted by domain rules). Added `--max-time 12` timeout. Country code is now parsed directly from the trace response (`loc=` field), removing one extra network round-trip.
+- **TUI: Country and ISP blank in live-status output** — Country was fetched via a geo API through the proxy (same bypass_domains problem). Now parsed from the Cloudflare trace response (`loc=`) directly. ISP lookup uses `ip-api.com` direct (no proxy) because the tunnel is already confirmed working by this point and `ip-api.com` might itself be in bypass_domains.
+- **Gateway restart race: new connection fails briefly** — Gateway stop used `SIGTERM` which left the SOCKS port bound for up to ~2 s while sub-processes shut down. The new `bypath run` would start before the port was free and immediately fail. Fixed by switching all engine kills in `cmdStop` to `SIGKILL` (`-9`) for immediate port release, and adding a polling loop in `restartGateway()` that waits until the SOCKS port is actually free (up to 3 s) before starting the new instance.
+
+### Changed
+- **TUI: live-status is cancellable** — Press `esc` or `q` while the status check is running to abort it immediately. Previously the TUI was locked for up to 20 s with no way out.
+
 ## v2.6.4 (2026-06-12)
 
 ### Added

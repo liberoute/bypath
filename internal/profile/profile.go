@@ -280,8 +280,12 @@ func (m *Manager) loadAll() error {
 			continue
 		}
 
-		// Mark CDN detection on each link at load time
+		// Always overwrite link.Group with the current group name from the file.
+		// Links may have a stale group name if the group was renamed — that causes
+		// SetActiveLink to write the old name to .active, and GetActiveLink then
+		// can't resolve it, falling back to a random group.
 		for _, link := range g.Links {
+			link.Group = g.Name
 			MarkCDNDetected(link)
 		}
 

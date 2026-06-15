@@ -316,8 +316,9 @@ func benchLinkOnPort(link *profile.Link, port int) (latency string, ok bool, htt
 	}
 
 	start := time.Now()
+	// Use 1.1.1.1 by IP so bypass_domains (domain-based) never intercepts this request.
 	testCmd := exec.CommandContext(ctx, "curl", "-s", "-x", fmt.Sprintf("socks5h://127.0.0.1:%d", port),
-		"--connect-timeout", "6", "-o", "/dev/null", "-w", "%{http_code}", "http://ip-api.com/json")
+		"--connect-timeout", "6", "-o", "/dev/null", "-w", "%{http_code}", "https://1.1.1.1/cdn-cgi/trace")
 	out, err := testCmd.Output()
 	elapsed := time.Since(start)
 

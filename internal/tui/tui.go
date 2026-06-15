@@ -3,6 +3,7 @@ package tui
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -98,10 +99,12 @@ type model struct {
 	benchResults []benchEntry
 	benchMode    string // "ping", "full", "single"
 	benchSortAsc bool   // true = ascending (fastest first), false = descending
+	// Cancellable action support
+	cancelFn context.CancelFunc
 }
 
 // Messages
-type actionDoneMsg struct{ output string; err error }
+type actionDoneMsg struct{ output string; err error; targetGroup string }
 type updateCheckMsg struct{ info string }
 type activeInfoMsg struct{ info string }
 type statusMsg struct{ info string }
@@ -206,6 +209,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case actionDoneMsg:
 		m.running = false
+		m.cancelFn = nil
 		m.showOutput = true
 		m.outputScroll = 0
 		m.output = msg.output
@@ -225,6 +229,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.activeGroup = i
 				restored = true
 				break
+			}
+		}
+		if !restored {
+			// If the active group was renamed, track it to its new name.
+			if msg.targetGroup != "" {
+				for i, g := range m.groups {
+					if g == msg.targetGroup {
+						m.activeGroup = i
+						restored = true
+						break
+					}
+				}
 			}
 		}
 		if !restored {
@@ -286,8 +302,16 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Running — ignore
+	// Running — allow esc/q to cancel if a cancellable action is active
 	if m.running {
+		switch msg.String() {
+		case "esc", "q":
+			if m.cancelFn != nil {
+				m.cancelFn()
+				m.cancelFn = nil
+			}
+			m.running = false
+		}
 		return m, nil
 	}
 
@@ -427,6 +451,14 @@ func (m model) executeHomeAction(item homeItem) (tea.Model, tea.Cmd) {
 		m.confirmYes = false
 		m.confirmAction = "stop-gateway"
 		return m, nil
+	case "live-status":
+		ctx, cancel := context.WithCancel(context.Background())
+		m.cancelFn = cancel
+		m.running = true
+		return m, func() tea.Msg {
+			defer cancel()
+			return executeLiveStatus(ctx)
+		}
 	default:
 		m.running = true
 		act := item.action
@@ -948,7 +980,11 @@ func (m model) View() string {
 
 	// Running overlay
 	if m.running {
-		b.WriteString("\n  ⏳ Working...\n")
+		if m.cancelFn != nil {
+			b.WriteString("\n  ⏳ Working...  " + dimStyle.Render("(esc to cancel)") + "\n")
+		} else {
+			b.WriteString("\n  ⏳ Working...\n")
+		}
 		return b.String()
 	}
 
@@ -1301,6 +1337,63 @@ func findGroups() []string {
 
 // --- Actions ---
 
+func executeLiveStatus(ctx context.Context) actionDoneMsg {
+	start := time.Now()
+	cmd := exec.CommandContext(ctx, "curl", "-s", "-x", socksAddr(),
+		"--connect-timeout", "8", "--max-time", "12", "https://1.1.1.1/cdn-cgi/trace")
+	out, err := cmd.Output()
+	elapsed := time.Since(start).Milliseconds()
+
+	if ctx.Err() != nil {
+		return actionDoneMsg{output: "⚠️  Cancelled"}
+	}
+	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+		return actionDoneMsg{output: "❌ Connection failed (no relay)"}
+	}
+
+	// Parse ip= and loc= from Cloudflare trace — country comes free, no extra request needed.
+	exitIP, countryCode := "", ""
+	for _, line := range strings.Split(string(out), "\n") {
+		switch {
+		case strings.HasPrefix(line, "ip="):
+			exitIP = strings.TrimSpace(strings.TrimPrefix(line, "ip="))
+		case strings.HasPrefix(line, "loc="):
+			countryCode = strings.TrimSpace(strings.TrimPrefix(line, "loc="))
+		}
+	}
+	if exitIP == "" {
+		return actionDoneMsg{output: "❌ Could not parse exit IP from response"}
+	}
+
+	// ISP lookup: direct (no proxy) — we already confirmed the tunnel works,
+	// and ip-api.com might be in bypass_domains so going through proxy is unreliable.
+	isp := ""
+	geoCmd := exec.CommandContext(ctx, "curl", "-s",
+		"--connect-timeout", "5", "--max-time", "8",
+		fmt.Sprintf("http://ip-api.com/json/%s?fields=isp", exitIP))
+	if geoOut, geoErr := geoCmd.Output(); geoErr == nil && ctx.Err() == nil {
+		var geo struct{ ISP string `json:"isp"` }
+		if json.Unmarshal(geoOut, &geo) == nil {
+			isp = geo.ISP
+		}
+	}
+
+	activeData, _ := os.ReadFile(filepath.Join(paths.Get().ProfileDir, ".active"))
+	lines := strings.Split(strings.TrimSpace(string(activeData)), "\n")
+	activeStr := ""
+	if len(lines) >= 2 {
+		activeStr = fmt.Sprintf("%s / %s", strings.TrimSpace(lines[0]), strings.TrimSpace(lines[1]))
+	}
+
+	return actionDoneMsg{output: fmt.Sprintf("✅ Gateway is RUNNING\n\n"+
+		"  Server:   %s\n"+
+		"  Relay:    %dms\n"+
+		"  Exit IP:  %s\n"+
+		"  Country:  %s\n"+
+		"  ISP:      %s",
+		activeStr, elapsed, exitIP, countryCode, isp)}
+}
+
 func executeAction(action, group string) actionDoneMsg {
 	exe, _ := os.Executable()
 	switch action {
@@ -1356,48 +1449,7 @@ func executeAction(action, group string) actionDoneMsg {
 	case "stop":
 		return runCmdCapture(exe, "stop")
 	case "live-status":
-		// Test current connection: get exit IP from icanhazip, then geo data from ip-api
-		start := time.Now()
-		cmd := exec.Command("curl", "-s", "-x", socksAddr(),
-			"--connect-timeout", "8", "http://icanhazip.com")
-		out, err := cmd.Output()
-		elapsed := time.Since(start).Milliseconds()
-		if err != nil || len(strings.TrimSpace(string(out))) == 0 {
-			return actionDoneMsg{output: "❌ Connection failed (no relay)"}
-		}
-		exitIP := strings.TrimSpace(string(out))
-
-		// Get geo data for the exit IP
-		var resp struct {
-			Query   string `json:"query"`
-			Country string `json:"country"`
-			City    string `json:"city"`
-			ISP     string `json:"isp"`
-		}
-		resp.Query = exitIP
-		geoCmd := exec.Command("curl", "-s", "-x", socksAddr(),
-			"--connect-timeout", "5", fmt.Sprintf("http://ip-api.com/json/%s", exitIP))
-		geoOut, geoErr := geoCmd.Output()
-		if geoErr == nil {
-			json.Unmarshal(geoOut, &resp)
-		}
-
-		// Read active link
-		activeData, _ := os.ReadFile(filepath.Join(paths.Get().ProfileDir, ".active"))
-		lines := strings.Split(strings.TrimSpace(string(activeData)), "\n")
-		activeStr := ""
-		if len(lines) >= 2 {
-			activeStr = fmt.Sprintf("%s / %s", strings.TrimSpace(lines[0]), strings.TrimSpace(lines[1]))
-		}
-
-		result := fmt.Sprintf("✅ Gateway is RUNNING\n\n"+
-			"  Server:   %s\n"+
-			"  Relay:    %dms\n"+
-			"  Exit IP:  %s\n"+
-			"  Country:  %s, %s\n"+
-			"  ISP:      %s",
-			activeStr, elapsed, resp.Query, resp.Country, resp.City, resp.ISP)
-		return actionDoneMsg{output: result}
+		return actionDoneMsg{output: "internal: use executeLiveStatus"}
 	case "status":
 		return runCmdCapture(exe, "version")
 	case "autostart-toggle":
@@ -1473,7 +1525,7 @@ func executeActionWithInput(action, input string) actionDoneMsg {
 			if err != nil {
 				return actionDoneMsg{output: fmt.Sprintf("❌ %v", err)}
 			}
-			return actionDoneMsg{output: fmt.Sprintf("✅ Renamed '%s' → '%s'", oldName, newName)}
+			return actionDoneMsg{output: fmt.Sprintf("✅ Renamed '%s' → '%s'", oldName, newName), targetGroup: newName}
 		}
 		return actionDoneMsg{output: "Unknown action"}
 	}
@@ -1520,7 +1572,18 @@ func restartGateway(exe string) {
 	}
 	// Manual restart
 	runCmdCapture(exe, "stop")
-	time.Sleep(2 * time.Second)
+	// Wait until the SOCKS port is released (engines killed with -9 die fast).
+	// Falls back to a hard 3s ceiling so we never block indefinitely.
+	port := socksPort()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
+		if err != nil {
+			break // port is free
+		}
+		conn.Close()
+		time.Sleep(200 * time.Millisecond)
+	}
 	logFile, _ := os.OpenFile("./bypath.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	cmd2 := exec.Command(exe, "run")
 	cmd2.Stdout = logFile

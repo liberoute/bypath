@@ -41,6 +41,7 @@ func cmdSelect(args []string) {
 			g, _ := mgr.GetGroup(group)
 			if g != nil && idx <= len(g.Links) {
 				link := g.Links[idx-1]
+				link.Group = group // defensive: ensure Group matches even after a rename
 				mgr.SetActiveLink(link)
 				fmt.Printf("✅ Active link: [%s] %s → %s:%d\n", link.Protocol, link.Remark, link.Address, link.Port)
 				warnIfCDN(link)

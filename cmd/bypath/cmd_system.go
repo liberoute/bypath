@@ -34,10 +34,11 @@ func cmdStop() {
 		exec.Command("pkill", "-f", "bypath run").Run()
 	}
 
-	exec.Command("pkill", "sing-box").Run()
-	exec.Command("pkill", "-f", "xray run -c /tmp/bypath").Run()
-	exec.Command("pkill", "dns2socks").Run()
-	exec.Command("pkill", "tun2socks").Run()
+	// SIGKILL so ports are released immediately — SIGTERM can leave them bound for seconds.
+	exec.Command("pkill", "-9", "sing-box").Run()
+	exec.Command("pkill", "-9", "-f", "xray run -c /tmp/bypath").Run()
+	exec.Command("pkill", "-9", "dns2socks").Run()
+	exec.Command("pkill", "-9", "tun2socks").Run()
 	exec.Command("ip", "link", "del", "tun0").Run()
 	exec.Command("iptables", "-t", "mangle", "-F").Run()
 	exec.Command("iptables", "-t", "nat", "-F", "POSTROUTING").Run()
