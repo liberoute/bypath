@@ -1,0 +1,46 @@
+# Stage 4 WP3B — Non-live Compose Promotion Proof Lane
+#
+# PURPOSE: Prove the digest-pinned OCI artifact promotion path.
+#          This file is NOT for production deployment.
+#
+# REQUIREMENTS:
+#   BYPATH_IMAGE_REF must be set to a digest-pinned reference, e.g.:
+#   BYPATH_IMAGE_REF=127.0.0.1:<port>/yaseen-holding/liberoute/bypath@sha256:<digest>
+#
+# USAGE (no-build, digest-pinned):
+#   BYPATH_IMAGE_REF=<digest-ref> docker compose -f docker-compose.stage4-proof.yml \
+#     run --no-deps --rm bypath-proof
+#
+# SAFETY INVARIANTS (all enforced):
+#   - NO build step (no 'build:' key)
+#   - NO host networking
+#   - NO NET_ADMIN / NET_RAW capability
+#   - NO privileged mode
+#   - NO production ports exposed
+#   - NO G10 dependency
+#   - NO production volumes
+#   - NO route / DNS modification
+#   - Does NOT depend on running production services
+#
+# Smoke verification: invokes 'bypath version' — a documented, side-effect-free
+# command that prints the baked-in version string and exits 0.
+# This proves the artifact is consumable and the binary is intact.
+
+name: bypath-stage4-proof
+
+services:
+  bypath-proof:
+    image: ${BYPATH_IMAGE_REF:?BYPATH_IMAGE_REF must be set to a digest-pinned OCI reference}
+    pull_policy: never
+    container_name: bypath-stage4-proof
+    entrypoint: ["/app/bypath"]
+    command: ["version"]
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    network_mode: none
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    restart: "no"
