@@ -3,9 +3,11 @@ package main
 import (
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"github.com/liberoute/bypath/internal/paths"
 )
@@ -66,8 +68,56 @@ func detectEngineFromFile(path, forceEngine string) string {
 	return "unknown"
 }
 
+// groupNameFromURL picks a profile group name for a subscription URL.
+//
+// Convention (v2rayN / Nekoray / many panels): the URL fragment after '#' is the
+// subscription remark/display name, e.g.
+//
+//	https://panel.example/sub/abc#tonysopranosjr_1  → group "tonysopranosjr_1"
+//
+// If there is no fragment, fall back to the registrable-ish domain label
+// (subcdn.sudonetwork.com → "sudonetwork").
 func groupNameFromURL(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return "sub"
+	}
+
+	if u, err := url.Parse(rawURL); err == nil {
+		// Prefer #remark — this is what clients show as the subscription name.
+		if frag := strings.TrimSpace(u.Fragment); frag != "" {
+			if name := sanitizeGroupName(frag); name != "" {
+				return name
+			}
+		}
+		// Domain fallback (ignore port)
+		host := u.Hostname()
+		if host != "" {
+			parts := strings.Split(host, ".")
+			if len(parts) >= 2 {
+				name := parts[len(parts)-2]
+				// foo.co.uk → foo
+				if len(name) <= 2 && len(parts) >= 3 {
+					name = parts[len(parts)-3]
+				}
+				if name = sanitizeGroupName(name); name != "" {
+					return name
+				}
+			}
+			if name := sanitizeGroupName(parts[0]); name != "" {
+				return name
+			}
+		}
+	}
+
+	// Last-resort string parse (malformed URL)
 	u := rawURL
+	if idx := strings.Index(u, "#"); idx != -1 {
+		if name := sanitizeGroupName(u[idx+1:]); name != "" {
+			return name
+		}
+		u = u[:idx]
+	}
 	if idx := strings.Index(u, "://"); idx != -1 {
 		u = u[idx+3:]
 	}
@@ -77,19 +127,56 @@ func groupNameFromURL(rawURL string) string {
 	if idx := strings.Index(u, ":"); idx != -1 {
 		u = u[:idx]
 	}
-
 	parts := strings.Split(u, ".")
 	if len(parts) >= 2 {
 		name := parts[len(parts)-2]
 		if len(name) <= 2 && len(parts) >= 3 {
 			name = parts[len(parts)-3]
 		}
-		return name
+		if name = sanitizeGroupName(name); name != "" {
+			return name
+		}
 	}
-	if len(parts) > 0 && parts[0] != "" {
-		return parts[0]
+	if len(parts) > 0 {
+		if name := sanitizeGroupName(parts[0]); name != "" {
+			return name
+		}
 	}
 	return "sub"
+}
+
+// sanitizeGroupName makes a subscription remark safe as a profile group filename.
+func sanitizeGroupName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	// URL-decode once if still escaped
+	if dec, err := url.QueryUnescape(name); err == nil {
+		name = strings.TrimSpace(dec)
+	}
+	var b strings.Builder
+	b.Grow(len(name))
+	for _, r := range name {
+		switch {
+		case r == '/' || r == '\\' || r == 0 || r == ':' || r == '*' || r == '?' || r == '"' || r == '<' || r == '>' || r == '|':
+			b.WriteByte('_')
+		case unicode.IsControl(r):
+			// skip
+		default:
+			b.WriteRune(r)
+		}
+	}
+	name = strings.Trim(b.String(), " ._")
+	if name == "" || name == "." || name == ".." || strings.EqualFold(name, "default") {
+		return ""
+	}
+	// Windows/Linux filename practical limit
+	runes := []rune(name)
+	if len(runes) > 64 {
+		name = string(runes[:64])
+	}
+	return name
 }
 
 func createDefaultConfig(path string) error {

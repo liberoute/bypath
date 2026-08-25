@@ -1,5 +1,24 @@
 # Changelog
 
+## v2.6.6-xhttp (2026-08-12) — local / edge deploy (not yet GitHub-tagged)
+
+Deployed on **Orange Pi Zero 3 Anzali** (`172.20.100.12`, host `orangepizero3`) as lite arm64 build (`Commit: local-remark`). GitHub release tag optional follow-up.
+
+### Bug Fixes
+- **VLESS XHTTP / SplitHTTP broken** — Subscriptions like sudo/sudonetwork ship `type=xhttp` with `mode`, `extra`/`xPaddingBytes`, path `?ed=…`. Parser dropped mode/extra; xray config never emitted `xhttpSettings` (only bare `network: xhttp`). Links worked in v2rayN, failed on bypath. Fixed: parse `mode`/`extra`/`x_padding_bytes`; xray `xhttpSettings` + fingerprint; sing-box transport pass-through; **auto-prefer xray** when `Network` is `xhttp`/`splithttp`.
+- **Subscription fetch TLS timeout in IR** — Direct GET to panel ports (e.g. `:2083`) often fails (`TLS handshake timeout`). Fetch now tries env proxy → local SOCKS if listening → direct (8.8.8.8 DNS). UA set to `v2rayN/6.45`. Offline path: `bypath sub import <file>`.
+- **Duplicate subscription entries** — Same URL with/without `#fragment` created two entries (or two mental “groups”). Normalized URLs strip fragment for identity; global duplicate check; `bypath sub dedupe`.
+
+### Added
+- **Subscription `#remark` → group name** — v2rayN convention: `https://panel/…/token#tonysopranosjr_1` names the group `tonysopranosjr_1` (not domain `sudonetwork`). Re-adding an existing URL renames a domain-named group to the `#remark` when free.
+- **`bypath sub import [-g group] <file>`** — Load plain/base64 sub dump from disk (scp from free network when panel blocked).
+- **`bypath sub dedupe`** — Normalize + unique subscription URLs across groups.
+- **`bypath sub list`** — Lists all groups by default (not only `default`).
+
+### Changed
+- xray outbounds use pinned host IPs when available (same bootstrap reason as sing-box).
+- `RenameGroup` on profile manager (disk + `.active` + in-memory links).
+
 ## v2.6.5 (2026-06-16)
 
 ### Bug Fixes
@@ -189,6 +208,7 @@
 - **xray Reality config** — Fixed vless Reality generation for xray (`security: "reality"` + `realitySettings` with publicKey/shortId/fingerprint).
 - **xray socks5 outbound** — Added socks5/http protocol support to xray config generation.
 - **xray xhttp transport** — Added xhttp/splithttp transport support for xray bench and config.
+- **XHTTP subscriptions (real fix)** — Parser now keeps `mode`/`extra`/`x_padding_bytes`; xray emits full `xhttpSettings`; engine auto-prefers **xray** for `type=xhttp` (sing-box cannot run these). Fixes sudo/sudonetwork-style subs that work in v2rayN but failed on bypath.
 - **TUI status detection** — Gateway status now checks multiple PID file paths + `pgrep` fallback for systemd-started processes.
 - **TUI bench selection** — Fixed: selecting a link from sorted bench results now picks the correct server (not wrong index).
 - **Bench DNS config** — Added proper DNS section and `default_domain_resolver` to bench sing-box configs for 1.13 compatibility.
@@ -202,7 +222,7 @@
 
 ### Improvements
 - **Expanded test coverage** — Added comprehensive tests for `internal/config` (YAML parsing, defaults, edge cases) and `internal/tunnel/configgen` (all protocols, Reality, chains, SNI spoofing).
-- **Documentation migrated to wiki** — Moved `docs/` content (API, architecture, configuration, deployment) to `.wiki/` for GitHub Wiki publishing. Removed stale markdown docs from repo.
+- **Documentation migrated to wiki** — Moved `knowledge/` content (API, architecture, configuration, deployment) to `.wiki/` for GitHub Wiki publishing. Removed stale markdown docs from repo.
 - **README cleanup** — Streamlined README with links to wiki instead of inline docs.
 - **Gitignore updates** — Added `.kiro/` and cleaned up patterns.
 

@@ -100,6 +100,84 @@ func TestGenerateXrayVless(t *testing.T) {
 	}
 }
 
+func TestGenerateXrayVlessXHTTP(t *testing.T) {
+	tmpDir := t.TempDir()
+	cg := NewConfigGenerator(tmpDir)
+
+	eng := &engine.Engine{Name: "xray"}
+	link := &profile.Link{
+		Protocol:      "vless",
+		Address:       "maincdn.example.com",
+		Port:          443,
+		UUID:          "4e309896-c656-4d25-811f-486cad6da138",
+		Network:       "xhttp",
+		TLS:           true,
+		SNI:           "cdn.example.com",
+		Host:          "cdn.example.com",
+		Path:          "/Sudo_Network?ed=2560",
+		TransportMode: "auto",
+		Fingerprint:   "firefox",
+		ExtraJSON:     `{"xPaddingBytes":"100-1000"}`,
+	}
+
+	configFile, err := cg.Generate(eng, link)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+
+	outbounds := cfg["outbounds"].([]interface{})
+	proxy := outbounds[0].(map[string]interface{})
+	if proxy["protocol"] != "vless" {
+		t.Fatalf("protocol: got %v", proxy["protocol"])
+	}
+	stream, ok := proxy["streamSettings"].(map[string]interface{})
+	if !ok {
+		t.Fatal("missing streamSettings")
+	}
+	if stream["network"] != "xhttp" {
+		t.Errorf("network: got %v want xhttp", stream["network"])
+	}
+	if stream["security"] != "tls" {
+		t.Errorf("security: got %v", stream["security"])
+	}
+	xh, ok := stream["xhttpSettings"].(map[string]interface{})
+	if !ok {
+		t.Fatal("missing xhttpSettings")
+	}
+	if xh["path"] != "/Sudo_Network?ed=2560" {
+		t.Errorf("path: got %v", xh["path"])
+	}
+	if xh["host"] != "cdn.example.com" {
+		t.Errorf("host: got %v", xh["host"])
+	}
+	if xh["mode"] != "auto" {
+		t.Errorf("mode: got %v", xh["mode"])
+	}
+	extra, ok := xh["extra"].(map[string]interface{})
+	if !ok {
+		t.Fatal("missing xhttpSettings.extra")
+	}
+	if extra["xPaddingBytes"] != "100-1000" {
+		t.Errorf("xPaddingBytes: got %v", extra["xPaddingBytes"])
+	}
+	tls, ok := stream["tlsSettings"].(map[string]interface{})
+	if !ok {
+		t.Fatal("missing tlsSettings")
+	}
+	if tls["fingerprint"] != "firefox" {
+		t.Errorf("fingerprint: got %v", tls["fingerprint"])
+	}
+}
+
 func TestGenerateWireGuard(t *testing.T) {
 	tmpDir := t.TempDir()
 	cg := NewConfigGenerator(tmpDir)

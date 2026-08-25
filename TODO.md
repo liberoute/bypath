@@ -31,11 +31,20 @@
 
 ## ⚠️ Known Issues
 
-- CDN-based vless links (Cloudflare Workers, port 443 with TLS) only relay HTTP traffic, not HTTPS.
+- **VLESS + XHTTP** — needs xray (not sing-box). Fixed in local `v2.6.6-xhttp` (parse mode/extra + `xhttpSettings` + auto-prefer xray). Ensure system xray is recent enough for XHTTP. **GitHub release tag still pending.**
+- **Sub fetch from IR** — panel `:2083` / some CDNs TLS-timeout on direct path. Use SOCKS-after-start, env proxy, or `sub import`.
+- CDN-based vless links (Cloudflare Workers, port 443 with TLS) only relay HTTP traffic, not HTTPS (older known issue; not the same as XHTTP config bug).
 - Some subscription server links only accept connections from Iranian IPs (server-side restriction).
 - sing-box 1.13 rejects `detour: "direct"` on DNS servers — must use no detour.
 - Gateway verify needs 2s delay after sing-box start (port ready ≠ outbound ready).
-- Some subscription URLs are only accessible via proxy (CLI `bypath sub update` now auto-routes via SOCKS if bypath is running; TUI also supports `o`/`p`).
 - `sub update` replaces ALL links in a group (by design — subscription is source of truth for that group).
 - geosite .srs only available for `ir` and `cn` from Chocolate4U; other countries have geoip only.
-- **sing-box 1.13 on ARM64 gets HTTP 403 from Cloudflare Workers** — VLESS+WebSocket through CDN Workers fails with sing-box on aarch64 (OPi Zero 3). xray connects fine to the same links. Workaround: set `preferred: "xray"` on affected machines. Root cause under investigation (TLS fingerprint or WebSocket handshake difference).
+- **sing-box 1.13 on ARM64 gets HTTP 403 from Cloudflare Workers** — VLESS+WS CDN Workers on aarch64. Workaround: `preferred: "xray"`.
+
+## 🧪 Next session (founder request 2026-08-12)
+
+Canonical priorities live in **`.knowledge/00_Product_Bible/99_CURRENT_STATE.md`**.
+
+- [ ] Full code pass: dead code / bugs
+- [ ] Clean test environment install + multi-sub smoke test (WS sub + XHTTP panel + import path)
+- [ ] Optional: tag/push `v2.6.6` GitHub release from current tree

@@ -234,21 +234,18 @@ func (cg *ConfigGenerator) BuildSingboxOutbound(link *profile.Link) map[string]i
 			"security":    link.Security,
 		}
 		if link.Network != "" && link.Network != "tcp" {
-			transport := map[string]interface{}{"type": link.Network}
-			if link.Path != "" {
-				transport["path"] = link.Path
-			}
-			if host != "" {
-				transport["headers"] = map[string]interface{}{
-					"Host": host,
-				}
-			}
-			outbound["transport"] = transport
+			outbound["transport"] = singboxTransport(link, host)
 		}
 		if link.TLS {
 			tls := map[string]interface{}{"enabled": true}
 			if sni != "" {
 				tls["server_name"] = sni
+			}
+			if link.Fingerprint != "" {
+				tls["utls"] = map[string]interface{}{
+					"enabled":     true,
+					"fingerprint": link.Fingerprint,
+				}
 			}
 			outbound["tls"] = tls
 		}
@@ -264,16 +261,7 @@ func (cg *ConfigGenerator) BuildSingboxOutbound(link *profile.Link) map[string]i
 			outbound["flow"] = link.Flow
 		}
 		if link.Network != "" && link.Network != "tcp" {
-			transport := map[string]interface{}{"type": link.Network}
-			if link.Path != "" {
-				transport["path"] = link.Path
-			}
-			if host != "" {
-				transport["headers"] = map[string]interface{}{
-					"Host": host,
-				}
-			}
-			outbound["transport"] = transport
+			outbound["transport"] = singboxTransport(link, host)
 		}
 		if link.Security == "reality" {
 			tls := map[string]interface{}{"enabled": true}
@@ -322,11 +310,7 @@ func (cg *ConfigGenerator) BuildSingboxOutbound(link *profile.Link) map[string]i
 		}
 		outbound["tls"] = tls
 		if link.Network != "" && link.Network != "tcp" {
-			transport := map[string]interface{}{"type": link.Network}
-			if link.Path != "" {
-				transport["path"] = link.Path
-			}
-			outbound["transport"] = transport
+			outbound["transport"] = singboxTransport(link, host)
 		}
 
 	case "shadowsocks":
@@ -395,6 +379,109 @@ func (cg *ConfigGenerator) BuildSingboxOutbound(link *profile.Link) map[string]i
 	}
 
 	return outbound
+}
+
+// singboxTransport builds a sing-box V2Ray transport object for the link.
+// xhttp/splithttp is passed through when the engine supports it; path/host/mode/extra preserved.
+func singboxTransport(link *profile.Link, host string) map[string]interface{} {
+	netType := link.Network
+	if netType == "splithttp" {
+		netType = "xhttp"
+	}
+	transport := map[string]interface{}{"type": netType}
+	if link.Path != "" {
+		transport["path"] = link.Path
+	}
+	if host != "" {
+		// xhttp uses top-level host; ws/http use headers.Host
+		if netType == "xhttp" {
+			transport["host"] = host
+		} else {
+			transport["headers"] = map[string]interface{}{"Host": host}
+		}
+	}
+	if netType == "xhttp" {
+		if link.TransportMode != "" {
+			transport["mode"] = link.TransportMode
+		}
+		if extra := parseExtraJSON(link.ExtraJSON); len(extra) > 0 {
+			transport["extra"] = extra
+		}
+	}
+	return transport
+}
+
+// parseExtraJSON decodes the URI extra= payload into a map for engine configs.
+func parseExtraJSON(raw string) map[string]interface{} {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return nil
+	}
+	return m
+}
+
+// xrayStreamNetwork applies network-specific streamSettings (ws, xhttp/splithttp, grpc, h2).
+func xrayStreamNetwork(stream map[string]interface{}, link *profile.Link) {
+	netType := link.Network
+	if netType == "" {
+		netType = "tcp"
+	}
+	// Canonical name for Xray 24.12+: xhttp (splithttp still accepted as alias on some builds)
+	if netType == "splithttp" {
+		netType = "xhttp"
+	}
+	stream["network"] = netType
+
+	switch netType {
+	case "ws":
+		ws := map[string]interface{}{}
+		if link.Path != "" {
+			ws["path"] = link.Path
+		}
+		if link.Host != "" {
+			// xray 25.x: Host is top-level (headers.Host deprecated)
+			ws["host"] = link.Host
+		}
+		stream["wsSettings"] = ws
+	case "xhttp":
+		xh := map[string]interface{}{}
+		if link.Path != "" {
+			xh["path"] = link.Path
+		}
+		if link.Host != "" {
+			xh["host"] = link.Host
+		}
+		if link.TransportMode != "" {
+			xh["mode"] = link.TransportMode
+		}
+		if extra := parseExtraJSON(link.ExtraJSON); len(extra) > 0 {
+			xh["extra"] = extra
+		}
+		stream["xhttpSettings"] = xh
+	case "grpc":
+		gs := map[string]interface{}{}
+		if link.Path != "" {
+			// grpc serviceName is carried in path for most subscription URIs
+			gs["serviceName"] = strings.TrimPrefix(link.Path, "/")
+		}
+		if link.Host != "" {
+			gs["authority"] = link.Host
+		}
+		stream["grpcSettings"] = gs
+	case "h2", "http":
+		h2 := map[string]interface{}{}
+		if link.Path != "" {
+			h2["path"] = link.Path
+		}
+		if link.Host != "" {
+			h2["host"] = []string{link.Host}
+		}
+		stream["httpSettings"] = h2
+	}
 }
 
 // --- sing-box config generation ---
@@ -1454,10 +1541,16 @@ func parseXrayExternalOutbound(tag, rawURL string) map[string]interface{} {
 func (cg *ConfigGenerator) xrayOutbounds(link *profile.Link) []map[string]interface{} {
 	var outbound map[string]interface{}
 
+	// Prefer pinned IP when available (same reason as sing-box: DNS bootstrap).
+	serverAddr := link.Address
+	if ip, ok := cg.PinnedHosts[link.Address]; ok && ip != "" {
+		serverAddr = ip
+	}
+
 	switch link.Protocol {
 	case "vmess":
 		vnext := map[string]interface{}{
-			"address": link.Address,
+			"address": serverAddr,
 			"port":    link.Port,
 			"users": []map[string]interface{}{
 				{
@@ -1474,28 +1567,24 @@ func (cg *ConfigGenerator) xrayOutbounds(link *profile.Link) []map[string]interf
 			"protocol": "vmess",
 			"settings": settings,
 		}
-		// Stream settings
-		stream := map[string]interface{}{"network": link.Network}
-		if link.Network == "ws" {
-			ws := map[string]interface{}{"path": link.Path}
-			if link.Host != "" {
-				// xray 25.x: Host moved to top-level field (headers.Host is deprecated)
-				ws["host"] = link.Host
-			}
-			stream["wsSettings"] = ws
-		}
+		stream := map[string]interface{}{}
+		xrayStreamNetwork(stream, link)
 		if link.TLS {
 			stream["security"] = "tls"
-			stream["tlsSettings"] = map[string]interface{}{
+			tlsSettings := map[string]interface{}{
 				"serverName":    link.SNI,
 				"allowInsecure": link.Insecure,
 			}
+			if link.Fingerprint != "" {
+				tlsSettings["fingerprint"] = link.Fingerprint
+			}
+			stream["tlsSettings"] = tlsSettings
 		}
 		outbound["streamSettings"] = stream
 
 	case "vless":
 		vnext := map[string]interface{}{
-			"address": link.Address,
+			"address": serverAddr,
 			"port":    link.Port,
 			"users": []map[string]interface{}{
 				{
@@ -1511,14 +1600,8 @@ func (cg *ConfigGenerator) xrayOutbounds(link *profile.Link) []map[string]interf
 				"vnext": []map[string]interface{}{vnext},
 			},
 		}
-		stream := map[string]interface{}{"network": link.Network}
-		if link.Network == "ws" {
-			ws := map[string]interface{}{"path": link.Path}
-			if link.Host != "" {
-				ws["host"] = link.Host
-			}
-			stream["wsSettings"] = ws
-		}
+		stream := map[string]interface{}{}
+		xrayStreamNetwork(stream, link)
 		if link.Security == "reality" {
 			stream["security"] = "reality"
 			realitySettings := map[string]interface{}{
@@ -1533,7 +1616,7 @@ func (cg *ConfigGenerator) xrayOutbounds(link *profile.Link) []map[string]interf
 		} else if link.TLS {
 			stream["security"] = "tls"
 			tlsSettings := map[string]interface{}{
-				"serverName":   link.SNI,
+				"serverName":    link.SNI,
 				"allowInsecure": link.Insecure,
 			}
 			if link.Fingerprint != "" {

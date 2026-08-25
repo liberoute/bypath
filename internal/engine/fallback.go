@@ -57,7 +57,12 @@ func NewFallbackController(mgr *Manager, cfg config.FallbackConfig, configGen Co
 // StartWithFallback tries engines in order until one starts and its SOCKS port is ready.
 // If fallback is disabled only the first engine in Order is tried.
 // If a preferred engine is configured via PreferredEngine it is placed first.
+// XHTTP/SplitHTTP links force xray first (sing-box has no reliable XHTTP transport).
 func (fc *FallbackController) StartWithFallback(ctx context.Context, link *profile.Link, preferredEngine string) (*FallbackResult, error) {
+	if preferredEngine == "" && RequiresXray(link) {
+		preferredEngine = "xray"
+		log.Printf("  ℹ️  Link uses %s transport — preferring xray", link.Network)
+	}
 	order := fc.engineOrder(preferredEngine)
 	timeout := fc.timeout()
 
@@ -175,4 +180,17 @@ func (fc *FallbackController) timeout() time.Duration {
 		return d
 	}
 	return 10 * time.Second
+}
+
+// RequiresXray reports transports that need the xray engine (not sing-box).
+func RequiresXray(link *profile.Link) bool {
+	if link == nil {
+		return false
+	}
+	switch link.Network {
+	case "xhttp", "splithttp":
+		return true
+	default:
+		return false
+	}
 }

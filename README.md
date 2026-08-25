@@ -2,17 +2,19 @@
 
 Network gateway that transparently routes LAN traffic through encrypted tunnels. Set your device's DNS and Gateway to the Bypath machine — done.
 
+End-user docs: see the project wiki (GitHub Wiki / `.wiki` checkout).
+
 Iranian IPs go direct (no tunnel). Everything else goes through your proxy server.
 
 ## Features
 
 - **Zero-config for clients** — just change DNS/Gateway
 - **Country whitelist** — IR traffic bypasses tunnel automatically (sing-box geoip)
-- **Multi-protocol** — VMess, VLESS, Trojan, Shadowsocks, WireGuard, SSH, SOCKS5, HTTP proxy
-- **Subscription support** — add URL, auto-fetch links, auto-group by domain
+- **Multi-protocol** — VMess, VLESS (Reality + **XHTTP**), Trojan, Shadowsocks, WireGuard, SSH, SOCKS5, HTTP proxy
+- **Subscription support** — add URL, auto-fetch (SOCKS/env/direct), `#remark` → group name, dedupe, offline `sub import`
 - **Parallel speed test** — test all servers simultaneously, auto-select best
 - **Interactive TUI** — tab-based terminal UI (Home / Servers / Subscriptions)
-- **Dual engine** — sing-box (default, embedded in full build) + xray as automatic fallback; configurable per-deployment
+- **Dual engine** — sing-box (default, embedded in full build) + xray as automatic fallback; **xray auto-preferred for XHTTP**
 - **Rule-based routing** — geoip/geosite/domain rules map traffic to direct or proxy outbounds
 - **Home DNS / private TLD support** — route `.home`, `.lan`, `.internal` (or any private TLD) to your local DNS server via `gateway.local_dns`
 - **Auto-fallback** — if a link or engine fails, tries the next one automatically
@@ -79,7 +81,9 @@ In interactive mode (TTY), the installer will prompt for a server link even with
 
 ```bash
 # After installation:
-bypath sub add "https://your-subscription-url"
+bypath sub add "https://your-subscription-url#my-sub-name"   # group = my-sub-name
+bypath sub update
+# If panel blocked on device: scp dump then → bypath sub import -g my-sub-name dump.txt
 bypath bench --auto
 bypath run
 ```

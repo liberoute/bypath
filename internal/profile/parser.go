@@ -100,6 +100,7 @@ func parseVmess(uri string) (*Link, error) {
 	if link.Security == "" {
 		link.Security = "auto"
 	}
+	link.Network = normalizeNetwork(link.Network)
 	if link.Network == "" {
 		link.Network = "tcp"
 	}
@@ -108,6 +109,34 @@ func parseVmess(uri string) (*Link, error) {
 	}
 
 	return link, nil
+}
+
+// normalizeNetwork maps legacy/alias transport names to canonical ones.
+func normalizeNetwork(net string) string {
+	switch strings.ToLower(strings.TrimSpace(net)) {
+	case "splithttp", "split":
+		return "xhttp"
+	case "h2", "http2":
+		return "h2"
+	default:
+		return net
+	}
+}
+
+// applyXHTTPParams copies mode/extra/x_padding_bytes from URI query into the link.
+func applyXHTTPParams(link *Link, params url.Values) {
+	if mode := params.Get("mode"); mode != "" {
+		link.TransportMode = mode
+	}
+	if extra := params.Get("extra"); extra != "" {
+		link.ExtraJSON = extra
+	}
+	// Standalone x_padding_bytes → merge into extra JSON if extra is empty/missing that key.
+	if pad := params.Get("x_padding_bytes"); pad != "" {
+		if link.ExtraJSON == "" {
+			link.ExtraJSON = fmt.Sprintf(`{"xPaddingBytes":%q}`, pad)
+		}
+	}
 }
 
 // parseVless parses a vless:// URI.
@@ -130,7 +159,7 @@ func parseVless(uri string) (*Link, error) {
 	}
 
 	params := u.Query()
-	link.Network = params.Get("type")
+	link.Network = normalizeNetwork(params.Get("type"))
 	if link.Network == "" {
 		link.Network = "tcp"
 	}
@@ -146,6 +175,9 @@ func parseVless(uri string) (*Link, error) {
 	link.RealityPublicKey = params.Get("pbk")
 	link.RealityShortID = params.Get("sid")
 	link.Fingerprint = params.Get("fp")
+
+	// XHTTP / SplitHTTP
+	applyXHTTPParams(link, params)
 
 	if link.Remark == "" {
 		link.Remark = fmt.Sprintf("%s:%d", link.Address, link.Port)
@@ -175,13 +207,15 @@ func parseTrojan(uri string) (*Link, error) {
 	}
 
 	params := u.Query()
-	link.Network = params.Get("type")
+	link.Network = normalizeNetwork(params.Get("type"))
 	if link.Network == "" {
 		link.Network = "tcp"
 	}
 	link.SNI = params.Get("sni")
 	link.Path = params.Get("path")
 	link.Host = params.Get("host")
+	link.Fingerprint = params.Get("fp")
+	applyXHTTPParams(link, params)
 
 	if link.Remark == "" {
 		link.Remark = fmt.Sprintf("%s:%d", link.Address, link.Port)

@@ -35,6 +35,10 @@ type Link struct {
 	RealityShortID   string `json:"reality_sid,omitempty"`  // sid param
 	Fingerprint      string `json:"fingerprint,omitempty"`  // fp param (UTLS)
 
+	// XHTTP / SplitHTTP transport fields
+	TransportMode string `json:"transport_mode,omitempty"` // mode=auto|packet-up|stream-up|stream-one
+	ExtraJSON     string `json:"extra_json,omitempty"`     // raw extra= JSON from URI
+
 	// WireGuard fields
 	PublicKey  string `json:"public_key,omitempty"`  // wireguard
 	PrivateKey string `json:"private_key,omitempty"` // wireguard
@@ -209,6 +213,70 @@ func (m *Manager) DeleteGroup(name string) error {
 
 	delete(m.groups, name)
 	return os.Remove(filepath.Join(m.directory, name+".json"))
+}
+
+// RenameGroup renames a group on disk and in memory, updating link.Group and .active.
+func (m *Manager) RenameGroup(oldName, newName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	oldName = strings.TrimSpace(oldName)
+	newName = strings.TrimSpace(newName)
+	if oldName == "" || newName == "" {
+		return fmt.Errorf("empty group name")
+	}
+	if oldName == newName {
+		return nil
+	}
+	if newName == "default" {
+		return fmt.Errorf("'default' is reserved")
+	}
+	g, ok := m.groups[oldName]
+	if !ok {
+		return fmt.Errorf("group '%s' not found", oldName)
+	}
+	if _, exists := m.groups[newName]; exists {
+		return fmt.Errorf("group '%s' already exists", newName)
+	}
+
+	g.Name = newName
+	for _, link := range g.Links {
+		link.Group = newName
+	}
+	m.groups[newName] = g
+	delete(m.groups, oldName)
+
+	if err := m.saveGroup(g); err != nil {
+		// rollback memory
+		g.Name = oldName
+		for _, link := range g.Links {
+			link.Group = oldName
+		}
+		m.groups[oldName] = g
+		delete(m.groups, newName)
+		return err
+	}
+	_ = os.Remove(filepath.Join(m.directory, oldName+".json"))
+
+	// Update .active if it pointed at the old group
+	activePath := filepath.Join(m.directory, ".active")
+	if data, err := os.ReadFile(activePath); err == nil {
+		lines := strings.Split(string(data), "\n")
+		if len(lines) >= 1 && strings.TrimSpace(lines[0]) == oldName {
+			remark := ""
+			if len(lines) >= 2 {
+				remark = lines[1]
+			}
+			_ = os.WriteFile(activePath, []byte(newName+"\n"+remark), 0644)
+		}
+	}
+	if m.activeGroup == oldName {
+		m.activeGroup = newName
+	}
+	if m.activeLink != nil && m.activeLink.Group == oldName {
+		m.activeLink.Group = newName
+	}
+	return nil
 }
 
 // SetActiveLink sets the currently active link and persists it.

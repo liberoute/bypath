@@ -74,6 +74,62 @@ func TestParseVless(t *testing.T) {
 	}
 }
 
+func TestParseVlessXHTTP(t *testing.T) {
+	uri := "vless://4e309896-c656-4d25-811f-486cad6da138@maincdn.example.com:443" +
+		"?encryption=none&extra=%7B%22xPaddingBytes%22%3A%22100-1000%22%7D&fp=firefox" +
+		"&host=cdn.example.com&mode=auto&path=%2FSudo_Network%3Fed%3D2560" +
+		"&security=tls&sni=cdn.example.com&type=xhttp&x_padding_bytes=100-1000" +
+		"#tony-xhttp"
+
+	link, err := ParseURI(uri)
+	if err != nil {
+		t.Fatalf("ParseURI failed: %v", err)
+	}
+	if link.Protocol != "vless" {
+		t.Errorf("protocol: got %s", link.Protocol)
+	}
+	if link.Network != "xhttp" {
+		t.Errorf("network: got %s want xhttp", link.Network)
+	}
+	if link.TransportMode != "auto" {
+		t.Errorf("mode: got %s want auto", link.TransportMode)
+	}
+	if link.Host != "cdn.example.com" {
+		t.Errorf("host: got %s", link.Host)
+	}
+	if link.Path != "/Sudo_Network?ed=2560" {
+		t.Errorf("path: got %s", link.Path)
+	}
+	if link.Fingerprint != "firefox" {
+		t.Errorf("fp: got %s", link.Fingerprint)
+	}
+	if link.SNI != "cdn.example.com" {
+		t.Errorf("sni: got %s", link.SNI)
+	}
+	if link.TLS != true {
+		t.Error("tls should be true")
+	}
+	if link.ExtraJSON == "" {
+		t.Error("extra_json should be set")
+	}
+	var extra map[string]interface{}
+	if err := json.Unmarshal([]byte(link.ExtraJSON), &extra); err != nil {
+		t.Fatalf("extra json: %v", err)
+	}
+	if extra["xPaddingBytes"] != "100-1000" {
+		t.Errorf("xPaddingBytes: got %v", extra["xPaddingBytes"])
+	}
+}
+
+func TestNormalizeSplitHTTP(t *testing.T) {
+	if got := normalizeNetwork("splithttp"); got != "xhttp" {
+		t.Errorf("normalizeNetwork(splithttp)=%s", got)
+	}
+	if got := normalizeNetwork("SplitHTTP"); got != "xhttp" {
+		t.Errorf("normalizeNetwork(SplitHTTP)=%s", got)
+	}
+}
+
 func TestParseTrojan(t *testing.T) {
 	uri := "trojan://mypassword@server.com:8443?type=grpc&sni=server.com#trojan-server"
 

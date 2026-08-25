@@ -742,6 +742,10 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 
 	// Try embedded (in-process) engine first if one is registered (full build only).
 	preferredName := gw.config.Engines.PreferredEngine
+	if preferredName == "" && engine.RequiresXray(link) {
+		// XHTTP is xray-only; skip embedded sing-box so we don't waste a start attempt.
+		preferredName = "xray"
+	}
 	if preferredName == "" && len(gw.config.Engines.Fallback.Order) > 0 {
 		preferredName = gw.config.Engines.Fallback.Order[0]
 	}

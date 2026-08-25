@@ -30,8 +30,16 @@ Desktop.ini
 *.swo
 *~
 
-# Wiki (separate git repo)
+# Wiki + AI knowledge (separate git repos — not part of source CODE)
 .wiki/
+.knowledge/
+
+# Agent entry is private (lives in .knowledge repo + optional local copy).
+# Do not publish Holding/agent operating files on public GitHub CODE.
+AGENTS.md
+CLAUDE.md
+.cursorrules
+.cursor/
 
 # Go
 *.exe
