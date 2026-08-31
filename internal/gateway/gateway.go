@@ -59,6 +59,9 @@ type Gateway struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	mu     sync.Mutex
+
+	// Prior dnsmasq.service runtime state for this Gateway instance.
+	dnsmasq dnsmasqPriorState
 }
 
 // New creates a new Gateway instance.
@@ -829,35 +832,6 @@ func disableSystemdResolved() {
 	log.Printf("  ✅ systemd-resolved disabled")
 }
 
-// stopDnsmasq temporarily stops the system dnsmasq service if it is running on
-// port 53, so that bypath's own dns2socks can bind to that port.
-// Unlike disableSystemdResolved, we do NOT disable the service permanently —
-// dnsmasq often provides DHCP too and must come back after bypath stops.
-func stopDnsmasq() {
-	out, err := exec.Command("systemctl", "is-active", "dnsmasq").Output()
-	if err != nil || strings.TrimSpace(string(out)) != "active" {
-		return
-	}
-	log.Printf("  ⚠️  dnsmasq is active (conflicts with port 53) — stopping temporarily...")
-	exec.Command("systemctl", "stop", "dnsmasq").Run()
-	log.Printf("  ✅ dnsmasq stopped (will restart on next boot or after bypath stops)")
-}
-
-// restartDnsmasq starts the dnsmasq service again after bypath releases port 53.
-func restartDnsmasq() {
-	// Only restart if the unit exists and is not already running
-	out, _ := exec.Command("systemctl", "is-active", "dnsmasq").Output()
-	if strings.TrimSpace(string(out)) == "active" {
-		return
-	}
-	// Check that the unit is known to systemd before trying to start it
-	if err := exec.Command("systemctl", "cat", "dnsmasq").Run(); err != nil {
-		return
-	}
-	exec.Command("systemctl", "start", "dnsmasq").Run()
-	log.Printf("🔀 dnsmasq restarted")
-}
-
 func (gw *Gateway) startDNS() error {
 	log.Printf("🔀 Starting DNS proxy on :%d...", gw.dnsPort)
 
@@ -866,7 +840,7 @@ func (gw *Gateway) startDNS() error {
 	// Also stop dnsmasq: it binds port 53 at boot on many Armbian/Debian setups and
 	// causes dns2socks to fail silently (waitForPort returns true because dnsmasq is
 	// already there, so bypath thinks dns2socks started when it actually crashed).
-	stopDnsmasq()
+	gw.stopDnsmasq()
 
 	// Kill only bypath's own previous DNS proxy (tracked by PID), not user processes.
 	if gw.dnsProc != nil && gw.dnsProc.Process != nil {
@@ -1469,8 +1443,8 @@ func (gw *Gateway) cleanupRouting() {
 	// modified resolv.conf, and we must leave the system working after stop.
 	gw.restoreResolvConf()
 	gw.unpinHostsFromEtcHosts()
-	// Restart dnsmasq if bypath stopped it to free port 53.
-	restartDnsmasq()
+	// Restore dnsmasq only if it was ACTIVE before this Gateway instance started.
+	gw.restoreDnsmasq()
 }
 
 // cleanupPreviousRun kills leftover child processes and restores network state

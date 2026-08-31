@@ -310,12 +310,12 @@ check_deps() {
     fi
 
     # dnsmasq conflicts with bypath's DNS on port 53 (common on Armbian/Debian/Raspbian)
-    # Stop it now so first run works; Conflicts= in the service unit handles subsequent reboots.
+    # Stop it now so first run works. Runtime restore is handled by Bypath from prior ACTIVE state, not systemd Conflicts=.
     if [ "$OS" = "linux" ] && command -v systemctl &>/dev/null; then
         if systemctl is-active dnsmasq &>/dev/null; then
             info "dnsmasq is active (conflicts with port 53) — stopping temporarily..."
             systemctl stop dnsmasq 2>/dev/null || true
-            ok "dnsmasq stopped (bypath restarts it automatically when it exits)"
+            ok "dnsmasq stopped (bypath restores it on exit only if it was active at startup)"
         fi
     fi
 
@@ -464,9 +464,6 @@ install_systemd() {
 Description=Bypath Network Gateway
 After=network-online.target
 Wants=network-online.target
-# Stop dnsmasq when bypath starts (it holds port 53 on Armbian/Debian/Raspbian).
-# bypath restarts dnsmasq automatically when it exits.
-Conflicts=dnsmasq.service
 # Disable start-attempt limit so systemd never enters "failed" state.
 # bypath itself handles retry with backoff when no server is reachable.
 StartLimitIntervalSec=0

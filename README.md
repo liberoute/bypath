@@ -55,7 +55,7 @@ The installer will:
 - Download geo rule sets (`geoip-ir.srs`, `geosite-ir.srs`) for Iran IP/domain whitelist
 - **`bypath run` auto-downloads** any missing geoip files at startup (clean-machine safe)
 - **Prompt for a server link** to add right after install (in interactive mode)
-- Create a systemd service with `Conflicts=dnsmasq.service` (port 53 freed automatically on every boot)
+- Create a systemd service. Bypath stops `dnsmasq` at runtime only if it was already active, and restores that same runtime state on exit (no `Conflicts=` — starting dnsmasq must not stop bypath)
 
 ### Installer options
 
