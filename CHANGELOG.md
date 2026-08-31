@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.6.7 (2026-08-31)
+
+### Fixed
+- **Bypath lifecycle / dnsmasq interaction** — Bypath could be stopped through its systemd interaction with dnsmasq. The generated unit included `Conflicts=dnsmasq.service`; when dnsmasq was started (on boot, manually, or by Bypath on shutdown), systemd would stop Bypath because of the symmetric conflict relation. Bypath now records whether dnsmasq was actually ACTIVE before it started, and restores it only when it was previously running. The symmetric `Conflicts=dnsmasq.service` directive has been removed from the generated unit.
+
+### Validation
+- Validated on Linux ARM64 (Anzali Orange Pi) and Linux ARMv7/GOARM=7 (Tehran Orange Pi).
+- XHTTP runtime connectivity validated on both architectures.
+- Long-running service stability verified without restart loops or unexpected self-shutdowns.
+- 15-minute stability window passed on both Tehran (ARMv7) and Anzali (ARM64).
+
 ## v2.6.6-xhttp (2026-08-12) — local / edge deploy (not yet GitHub-tagged)
 
 Deployed on **Orange Pi Zero 3 Anzali** (`172.20.100.12`, host `orangepizero3`) as lite arm64 build (`Commit: local-remark`). GitHub release tag optional follow-up.
