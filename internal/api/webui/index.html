@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Bypath</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230ea5e9'/%3E%3Cpath d='M8 22V10h7a4 4 0 0 1 0 8H8m0 0h8' stroke='white' stroke-width='3' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div id="boot" class="boot" role="status">
+  <div class="brand large">BYPATH</div>
+  <p id="boot-message">Loading the panel…</p>
+  <button id="boot-retry" class="btn ghost" type="button" hidden>Retry</button>
+</div>
+
+<section id="auth" hidden>
+  <div class="auth-card">
+    <div class="brand large">BYPATH</div>
+    <p id="auth-message" class="notice" role="alert"></p>
+
+    <form id="auth-login" hidden>
+      <h1>Sign in</h1>
+      <p class="muted">Manage this gateway from the browser.</p>
+      <label>Username
+        <input id="login-username" name="username" autocomplete="username" required>
+      </label>
+      <label>Password
+        <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <button id="login-submit" class="btn primary wide" type="submit">Sign in</button>
+    </form>
+
+    <form id="auth-setup" hidden>
+      <h1>Create the administrator</h1>
+      <p class="muted">This account only exists on this machine. Choose a strong password of at least 12 characters.</p>
+      <label>Username
+        <input id="setup-username" name="username" autocomplete="username" required maxlength="64">
+      </label>
+      <label>Password
+        <input id="setup-password" name="password" type="password" autocomplete="new-password" minlength="12" required>
+      </label>
+      <label>Confirm password
+        <input id="setup-confirm" name="confirm" type="password" autocomplete="new-password" minlength="12" required>
+      </label>
+      <label>Setup code (root daemons only)
+        <input id="setup-code" name="setup-code" autocomplete="off" maxlength="64" placeholder="Read it as root from the Bypath data directory">
+      </label>
+      <button id="setup-submit" class="btn primary wide" type="submit">Create account</button>
+    </form>
+  </div>
+</section>
+
+<div id="shell" hidden></div>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<noscript>
+  <div class="auth-card">
+    <h1>JavaScript is required</h1>
+    <p class="muted">The Bypath panel is a local application. Enable JavaScript in this browser, then reload.</p>
+  </div>
+</noscript>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

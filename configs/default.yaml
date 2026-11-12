@@ -1,0 +1,133 @@
+# Bypath default configuration.
+#
+# A fresh installation starts with no VPN provider, no subscription and no
+# selected connection. The gateway is disabled until a connection has been
+# imported, selected and verified, so an empty installation never forwards
+# client traffic into a tunnel that has no working exit.
+
+server:
+  api_port: 8080
+  dns_port: 53
+  socks_port: 2801        # SOCKS5/HTTP mixed proxy port (configurable)
+  # The proxy is unauthenticated, so it binds loopback unless the operator opts
+  # in. socks_allow_lan is required for a LAN bind and must be paired with the
+  # trusted-CIDR allow-list below. socks_username/socks_password are rejected
+  # at load time: internal clients cannot authenticate, so LAN exposure is
+  # firewalled instead.
+  socks_listen: "127.0.0.1"
+  socks_allow_lan: false
+  # Explicit source allow-list for a LAN bind. Needed when the host owns more
+  # than one private network, where a single derived LAN would be ambiguous.
+  # Every entry must be a private IPv4 subnet of an up, non-loopback interface.
+  socks_trusted_cidrs: []
+  ssh_host_key: "accept-new"   # accept-new (pin on first use) | strict | off
+  api_token: ""           # Set a token to allow TCP API access; a root daemon refuses tokenless TCP (TUI/CLI use the socket)
+
+  # Browser management panel, on its own listener. Disabled by default. It
+  # binds to loopback unless allow_lan is set; the first local visit creates
+  # the administrator account.
+  web:
+    enabled: false
+    listen: "127.0.0.1"
+    port: 8081              # defaults to api_port + 1
+    allow_lan: false        # required before binding a non-loopback address
+    allowed_origins: []     # e.g. ["https://bypath.example.net"] behind a reverse proxy
+
+# Self-update channel. Bypath only updates from a release feed that publishes
+# the GitHub releases JSON shape (tag_name, body, assets[].digest). Left unset,
+# `bypath update` reports that this build has no update channel.
+# The feed must be https; plain http is accepted only for a loopback test feed.
+# update:
+#   url: "https://releases.example.net/bypath/latest.json"
+
+# Gateway mode — clients set DNS/GW to this machine. Disabled until the
+# first-run wizard has verified a working connection.
+gateway:
+  enabled: false
+  native_tun: true        # use sing-box native TUN inbound (no tun2socks/dns2socks)
+  interface: ""           # auto-detect; set explicitly on multi-LAN hosts
+  dns_upstream:
+    - "1.1.1.1"
+    - "8.8.8.8"
+  # DNS leak policy. "strict" (default) resolves through the tunnel only and
+  # returns SERVFAIL instead of falling back to direct DNS. Set "local" only if
+  # you explicitly allow direct upstream DNS.
+  dns_mode: "strict"
+  # Route private TLDs to a DNS server on your own network:
+  # local_dns:
+  #   - server: "192.0.2.53"
+  #     domains: ["lan", "home.arpa"]
+
+# Engine settings
+engines:
+  directory: "./engines"
+  prefer_system: true
+  preferred: ""           # "sing-box" or "xray" (empty = auto-detect based on protocol)
+
+  # Automatic engine fallback — if the preferred engine fails, try the next one.
+  # Set enabled: false to disable fallback and fail hard if the primary engine doesn't start.
+  fallback:
+    enabled: true
+    timeout: "10s"        # per-engine startup timeout
+    endpoint_timeout: "90s"  # per-link attempt (engine + connectivity probes)
+    total_timeout: "5m"      # whole fallback chain across group links
+    order:
+      - sing-box
+      - xray
+
+# Rule-based routing — map traffic matchers to named outbounds.
+# Matchers: geoip:<cc>, geosite:<tag>, domain:<exact>, domain_suffix:<suffix>,
+# ip_cidr:<cidr>, default.
+# Outbounds: direct, proxy, or any name defined in external_outbounds below.
+# Rules are evaluated in order; the first match wins. Private IPs always go
+# direct regardless. A fresh install ships only the default rule, so no
+# geography or personal exception is assumed.
+routing:
+  rules:
+    - match: default
+      outbound: proxy
+
+  # Example country split: send one country direct and everything else through
+  # the tunnel. Uncomment and replace <cc> with an ISO 3166-1 alpha-2 code.
+  #   - match: geoip:<cc>
+  #     outbound: direct
+  #   - match: geosite:<cc>
+  #     outbound: direct
+  #   - match: domain_suffix:<cc>
+  #     outbound: direct
+
+  # External proxy servers not managed by bypath profiles.
+  # Format: <name>: <url>   (supported schemes: socks5, socks4, http, https)
+  # external_outbounds:
+  #   office-proxy: socks5://192.0.2.10:1080
+
+# Legacy whitelist config (deprecated — use routing.rules above instead)
+# whitelist:
+#   countries: ["<cc>"]
+#   bypass_domains:
+#     - "<cc>"
+#     - "example.com"
+#   update_interval: "24h"
+
+# Network namespace isolation for tunnel processes
+isolation:
+  enabled: true
+
+# SNI Spoofing — replace real SNI with a fake one to bypass DPI
+sni_spoof:
+  enabled: false
+  sni: "example.com"      # Fake SNI presented to the network
+
+# Tunnel chain — how traffic flows
+# A chain defines an ordered sequence of proxy hops.
+# Traffic flows: client → hop1 → hop2 → ... → internet
+#
+# Multi-hop example (uncomment and adjust):
+# chains:
+#   - name: "multi-hop"
+#     hops:
+#       - profile: "relay-profile"
+#         engine: "sing-box"    # optional: force engine (empty = auto-detect)
+#       - profile: "exit-profile"
+#     auto_start: false         # start this chain automatically on gateway startup
+chains: []

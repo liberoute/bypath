@@ -1,0 +1,209 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  BINARY_NAME: bypath
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Go vet
+        run: go vet ./...
+
+  embed:
+    name: Embedded payload
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Stage pinned tun2socks assets
+        run: make stage-tun2socks-amd64 stage-tun2socks-arm64 stage-tun2socks-armv7
+
+      # A missing asset must fail, not skip: BYPATH_REQUIRE_ASSETS turns the
+      # staged-asset tests into hard failures.
+      - name: Embed-tag tests
+        env:
+          BYPATH_REQUIRE_ASSETS: '1'
+        run: go test -tags "full embed_tun2socks" ./internal/embedbin/ ./internal/build/ ./internal/engine/ -count=1
+
+      # ARM test binaries cannot run on the x86 runner; compiling them is what
+      # proves each architecture selects its own embedded asset.
+      - name: Cross-compile embed tests for ARM
+        run: |
+          GOOS=linux GOARCH=arm64 go test -c -tags "full embed_tun2socks" -o /dev/null ./internal/embedbin/
+          GOOS=linux GOARCH=arm GOARM=7 go test -c -tags "full embed_tun2socks" -o /dev/null ./internal/embedbin/
+
+      # Any target without a staged asset must be rejected at compile time.
+      - name: Unsupported target must not compile
+        run: |
+          if GOOS=linux GOARCH=386 go build -tags "full embed_tun2socks" -o /dev/null ./cmd/bypath; then
+            echo "embed build unexpectedly succeeded on linux/386"
+            exit 1
+          fi
+
+  build:
+    name: Build (${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    strategy:
+      matrix:
+        include:
+          # Lite builds
+          - { os: linux, arch: amd64, variant: lite, tags: '' }
+          - { os: linux, arch: arm64, variant: lite, tags: '' }
+          - { os: linux, arch: arm, variant: lite, tags: '', goarm: '7' }
+          - { os: linux, arch: mipsle, variant: lite, tags: '', gomips: 'softfloat' }
+          - { os: windows, arch: amd64, variant: lite, tags: '' }
+          - { os: darwin, arch: amd64, variant: lite, tags: '' }
+          - { os: darwin, arch: arm64, variant: lite, tags: '' }
+          # Full builds
+          - { os: linux, arch: amd64, variant: full, tags: 'full' }
+          - { os: linux, arch: arm64, variant: full, tags: 'full' }
+          - { os: linux, arch: arm, variant: full, tags: 'full', goarm: '7' }
+          - { os: windows, arch: amd64, variant: full, tags: 'full' }
+          - { os: darwin, arch: amd64, variant: full, tags: 'full' }
+          - { os: darwin, arch: arm64, variant: full, tags: 'full' }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          else
+            echo "version=3.0.0-dev.$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
+          CGO_ENABLED: '0'
+        run: |
+          EXT=""
+          if [ "${{ matrix.os }}" = "windows" ]; then EXT=".exe"; fi
+
+          FILENAME="${{ env.BINARY_NAME }}-${{ matrix.variant }}-${{ matrix.os }}-${{ matrix.arch }}${EXT}"
+
+          LDFLAGS="-s -w"
+          LDFLAGS="$LDFLAGS -X github.com/liberoute/bypath/internal/build.Version=${{ steps.version.outputs.version }}"
+          LDFLAGS="$LDFLAGS -X github.com/liberoute/bypath/internal/build.Commit=${{ github.sha }}"
+          LDFLAGS="$LDFLAGS -X github.com/liberoute/bypath/internal/build.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          TAGS=""
+          if [ -n "${{ matrix.tags }}" ]; then TAGS="-tags ${{ matrix.tags }}"; fi
+
+          go build $TAGS -ldflags "$LDFLAGS" -o "dist/${FILENAME}" ./cmd/bypath
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ matrix.variant }}-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/
+
+  integration:
+    name: Integration Test (Docker)
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build test image
+        run: docker build -f test/integration/Dockerfile.test -t bypath-test .
+
+      - name: Run integration tests
+        run: docker run --rm bypath-test
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [build, integration]
+    # Version tags are published as GitHub Pre-releases by the explicit,
+    # manually verified release process; a tag push must not create a
+    # non-prerelease release. Only main pushes create the rolling dev build.
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set release tag
+        id: tag
+        run: |
+          echo "tag=dev" >> $GITHUB_OUTPUT
+          echo "name=Dev Build (latest)" >> $GITHUB_OUTPUT
+          echo "prerelease=true" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+
+      - name: Delete existing dev release
+        if: github.ref == 'refs/heads/main'
+        run: |
+          gh release delete "${{ steps.tag.outputs.tag }}" --yes --cleanup-tag 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.name }}
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ steps.tag.outputs.prerelease == 'true' }}

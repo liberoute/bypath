@@ -1,0 +1,26 @@
+BYPATH [FULL]  CONNECTED  pid 4242      
+ 9/12 Gateway                           
+                                        
+ ● CONNECTED   pid 4242   uptime 1h00m  
+                                        
+ Gateway mode     transparent TUN       
+ Running link     Maple-IPv4            
+ Selected link    Maple-IPv4            
+ Engine           sing-box              
+ DNS mode         strict                
+ Listeners        api :8080 socks :2801 
+                  dns :53               
+ Recovery         0 engine restart · 0  
+                  data-path · 0 retries 
+                                        
+ Changing the active connection requires
+ a gateway restart. 'a' in Connections  
+ only saves the selection; 'c' applies  
+ it now.                                
+                                        
+ Engines                                
+ No engine information available        
+ (gateway not running).                 
+                                        
+ c connect  d disconnect  R restart     
+ r refresh  1-9 sections  q quit        

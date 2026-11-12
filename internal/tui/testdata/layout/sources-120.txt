@@ -1,0 +1,11 @@
+BYPATH [FULL]  CONNECTED  pid 4242  ·  running Maple-IPv4                                                               
+ 4/12 Sources   tab/shift+tab: cycle · 1-9: jump                                                                        
+                                                                                                                        
+ 2 source(s) · URLs are shown redacted; tokens never reach a log or status surface. Removing a source is guarded like   
+ deleting a connection.                                                                                                 
+                                                                                                                        
+ examplevpn          https://panel.example/sub?token=<redacted>                                                 3 links 
+ imported-dump-202…  <pasted subscription dump>                                                                12 links 
+                                                                                                                        
+ enter details · a add · o organize · x remove source · r refresh · R refresh all · i import dump                       
+ ↑/↓ move  enter details  a add source  o organize  x remove source  r refresh  R refresh all  i import dump            

@@ -1,0 +1,12 @@
+BYPATH [FULL]  CONNECTED  pid 4242  ·  running Maple-IPv4                       
+ 3/12 Tests   tab/shift+tab: cycle · 1-9: jump                                  
+                                                                                
+ Tests ·  Run  Results  Compare    t cycles                                     
+ filter: all · kind: — · 4 result(s)                                            
+ eu-tcp LATENCY  FAILED       the DIRECT control failed, so route dec… 10 h ago 
+ Example VPN Europe… LATENCY  INCONCLUSIVE the exit matches the servi… 11 h ago 
+ Maple-IPv4 LATENCY  HEALTHY      41 ms                                12 h ago 
+ 东京节点-非常长-的… LATENCY  HEALTHY      180 ms                      12 h ago 
+ enter evidence · K kind · g connection · c clear · r reload                    
+ t run/results/compare  K kind  s scope  g group  l link  i hidden              
+ enter start/evidence  c cancel  r reload  ↑/↓ move                             

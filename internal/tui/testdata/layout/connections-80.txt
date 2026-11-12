@@ -1,0 +1,15 @@
+BYPATH [FULL]  CONNECTED  pid 4242  ·  running Maple-IPv4                       
+ 2/12 Connections   tab/shift+tab: cycle · 1-9: jump                            
+                                                                                
+ view: all   search: —   hidden: excluded   2 of 2 connection(s)                
+  Organisation is not set up yet. M adds labels only; links, .active and the    
+  serving tunnel are not rewritten.                                             
+   NAME                                  PROTO    ADDRESS                       
+ ▶ imported/Maple-IPv4                   VLESS    cdn.example.net:2083          
+   imported/东京节点-非常长-的-连接名称… OPENVPN  europe3.vpn.example.net:443   
+                                                                                
+ ● selected   ▶ running   (a saves the selection; c applies it)                 
+ credentials: none stored                                                       
+ ↑/↓ move  enter inspect  c connect  a next start  u credentials  e rename      
+ d display name  x delete  h hide  H hidden  m move  N group  R rename group    
+ X delete group  [ ] order  g filter  / search  f clear  M migrate  n import    

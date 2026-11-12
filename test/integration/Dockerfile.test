@@ -1,0 +1,31 @@
+# Clean-container smoke test.
+#
+# Builds both variants from source, installs them into a minimal image with no
+# configuration, and checks that the pinned-install contract holds: the binary
+# runs, the wizard produces a neutral configuration, and `bypath doctor` gives
+# a truthful read-only report without a provider or a connection.
+#
+#   docker build -f test/integration/Dockerfile.test -t bypath-test .
+#   docker run --rm bypath-test
+FROM golang:1.26-alpine AS build
+
+RUN apk add --no-cache git
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+RUN CGO_ENABLED=0 go build -o /out/bypath-lite ./cmd/bypath
+RUN CGO_ENABLED=0 go build -tags full -o /out/bypath-full ./cmd/bypath
+
+FROM alpine:3.20
+
+RUN apk add --no-cache bash ca-certificates
+COPY --from=build /out/bypath-lite /opt/bypath/bypath
+COPY --from=build /out/bypath-full /opt/bypath/bypath-full
+COPY test/integration/run-tests.sh /run-tests.sh
+RUN chmod +x /run-tests.sh
+
+# No configuration, no profiles, no geo data: a genuinely clean host.
+WORKDIR /tmp
+ENTRYPOINT ["/run-tests.sh"]

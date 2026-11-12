@@ -1,0 +1,14 @@
+BYPATH [FULL]  CONNECTED  pid 4242      
+ 7/12 Benchmark                         
+                                        
+ scope: all groups   0 link(s)          
+                                        
+ Press r to benchmark the stored links. 
+ Each link starts on a temporary        
+ loopback port and is judged by a real  
+ HTTPS request through it.              
+                                        
+ Press g first to limit the run to one  
+ group.                                 
+ ↑/↓ move  r run  enter/a select        
+ g scope  s sort  esc dashboard         

@@ -1,0 +1,30 @@
+BYPATH [FULL]  CONNECTED  pid 4242      
+ 5/12 Routing                           
+                                        
+ Effective routing policy read-only here
+ Mode          Rules · sing-box         
+ Default       PROXY · everything not   
+               matched above            
+ DNS           strict · gateway         
+               connected                
+ Revision      r-8fa2c1 · 8 effective   
+               rule(s)                  
+                                        
+ • geosite.dat is not installed where   
+ the engine looks for it: domain-list   
+ rules are inactive and the traffic they
+ would match falls through.             
+                                        
+ filter: — · 8 of 8 rule(s) · / filter ·
+ c clear                                
+ #  EFFECT   WHAT IT MATCHES            
+ 1  DIRECT   local DNS and loopback     
+ 2  DIRECT   geoip:de                   
+ 3  DIRECT   geosite:category-de        
+ 4  PROXY    domain_suffix:openai.com   
+ 5  PROXY    domain:chat.openai.com     
+ 6  BLOCK    domain:ads.example         
+ … 2 more                               
+                                        
+ ↑/↓ move  / filter  c clear  r reload  
+ read-only in terminal                  

@@ -1,0 +1,14 @@
+BYPATH [FULL]  CONNECTED  pid 4242      
+ 8/12 Import                            
+                                        
+ Everything imported here is validated  
+ and stored through the shared          
+ application service.                   
+                                        
+  1. Paste a proxy link (VLESS, VMess…  
+  2. Import an OpenVPN profile from a…  
+  3. Paste an OpenVPN profile           
+  4. Add a subscription URL             
+  5. Import a subscription dump (plai…  
+ ↑/↓ choose  enter start  r refresh     
+ esc dashboard                          

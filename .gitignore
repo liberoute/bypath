@@ -1,0 +1,79 @@
+# Build output
+/build/
+dist/
+
+# Engine binaries (downloaded at runtime)
+engines/
+
+# Embedded binaries (staged at build time via make stage-tun2socks-*)
+assets/embed/tun2socks
+assets/embed/tun2socks.zip
+internal/embedbin/assets/tun2socks
+internal/embedbin/assets/tun2socks.zip
+# Per-architecture staged helpers — digests are pinned in asset.go + Makefile.
+internal/embedbin/assets/tun2socks_linux_amd64
+internal/embedbin/assets/tun2socks_linux_arm64
+internal/embedbin/assets/tun2socks_linux_armv7
+
+# Runtime data
+data/profiles/
+data/ips/
+data/tmp/
+data/geo/
+logs/
+bypath.log
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Wiki + AI knowledge (separate git repos — not part of source CODE)
+.wiki/
+.knowledge/
+
+# Agent entry is private (lives in .knowledge repo + optional local copy).
+# Do not publish Holding/agent operating files on public GitHub CODE.
+AGENTS.md
+CLAUDE.md
+.cursorrules
+.cursor/
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.out
+vendor/
+# The panel's browser modules are source (embedded via go:embed), not a Go
+# vendor tree.
+!internal/api/webui/vendor/
+
+# Environment
+.env
+.env.local
+
+# Temporary
+tmp/
+.tmp/
+*.tmp
+*.bak
+
+# Test artifacts
+**/testdata/rapid/
+
+# AI Assistants
+.continue/
+.gemini/
+.kiro/
+.claude/

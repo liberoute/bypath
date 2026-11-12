@@ -1,0 +1,29 @@
+BYPATH [FULL]  CONNECTED  pid 4242      
+ 6/12 Settings                          
+                                        
+ Configuration changes are validated and
+ written atomically. Secrets are never  
+ displayed.                             
+                                        
+  Gateway mode                          
+    proxy only                          
+  DNS mode                              
+    —                                   
+  DNS upstreams                         
+    —                                   
+  Internal API bind                     
+    —                                   
+  SOCKS proxy endpoint                  
+    :0                                  
+  Native TUN                            
+    userspace stack                     
+  Preferred engine                      
+    —                                   
+  Health checks                         
+    disabled                            
+  Health URL                            
+    —                                   
+  Health interval                       
+    —                                   
+                                        
+ ↑/↓ move  enter edit  r reload  q quit 

@@ -1,0 +1,9 @@
+BYPATH [FULL]  CONNECTED  pid 4242  ·  running Maple-IPv4                       
+ 11/12 Logs   tab/shift+tab: cycle · 1-9: jump                                  
+                                                                                
+ 1/1 entries · filter: — · follow: off                                          
+ 14:30:00 error engine start failed for [openvpn] eu-tcp                        
+                local configuration error for link 'eu-tcp': OpenVPN profile is 
+                unreadable                                                      
+                falling back to the next link in the group                      
+ ↑/↓ scroll  f follow  / filter  c clear  e export  r refresh                   
