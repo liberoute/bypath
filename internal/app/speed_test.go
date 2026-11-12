@@ -17,6 +17,15 @@ import (
 	"github.com/liberoute/bypath/internal/profile"
 )
 
+// stubHostLoad pins the host-load guard so a busy CI runner cannot change the
+// outcome of a test that is about something else.
+func stubHostLoad(t *testing.T, under bool, why string) {
+	t.Helper()
+	prev := hostUnderLoad
+	hostUnderLoad = func() (bool, string) { return under, why }
+	t.Cleanup(func() { hostUnderLoad = prev })
+}
+
 func TestSpeedTargetURLRules(t *testing.T) {
 	rejected := []string{
 		"",
@@ -202,6 +211,7 @@ func TestSpeedJobRejectsUpload(t *testing.T) {
 
 func TestSpeedJobNeedsProvenRelay(t *testing.T) {
 	svc, _ := newTestLocal(t)
+	stubHostLoad(t, false, "")
 	// A unit test must not probe the network. A non-nil link measurement also
 	// makes the runner skip its uplink and serving-exit probes; the speed path
 	// has to refuse before it measures anything at all.
@@ -385,11 +395,32 @@ func (b *cancelledBody) Read(p []byte) (int, error) {
 
 func (b *cancelledBody) Close() error { return nil }
 
+// TestSpeedJobRefusesUnderHostLoad keeps the production overload protection
+// covered now that the measurement can be pinned by a test.
+func TestSpeedJobRefusesUnderHostLoad(t *testing.T) {
+	svc, _ := newTestLocal(t)
+	stubHostLoad(t, true, "load average 5.2 exceeds 4 CPUs")
+	ctx := context.Background()
+	if _, err := svc.ImportURI(ctx, "default", testVLESS); err != nil {
+		t.Fatal(err)
+	}
+	_, err := svc.StartTestJob(ctx, TestRequest{Kind: TestKindSpeed, Scope: TestScope{Kind: TestScopeAll}})
+	if err == nil || CodeOf(err) != CodeConflict {
+		t.Fatalf("start error = %v, want a conflict refusal", err)
+	}
+	for _, want := range []string{"too busy", "load average 5.2 exceeds 4 CPUs"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("refusal message = %q, want it to contain %q", err, want)
+		}
+	}
+}
+
 // TestMonthlyBudgetRefusalNeverShowsNegativeRemainder covers a cap that usage
 // already exceeds: the run must still be refused, but the message may not print
 // a negative remainder.
 func TestMonthlyBudgetRefusalNeverShowsNegativeRemainder(t *testing.T) {
 	svc, _ := newTestLocal(t)
+	stubHostLoad(t, false, "")
 	ctx := context.Background()
 	if _, err := svc.ImportURI(ctx, "default", testVLESS); err != nil {
 		t.Fatal(err)

@@ -17,10 +17,10 @@ const (
 	memoryFloorMB = 200
 )
 
-// hostUnderLoad reports whether a throughput job should be refused right now.
+// measureHostLoad reports whether a throughput job should be refused right now.
 // The check is deliberately conservative: a false refusal costs a retry, a
 // false start distorts the measurement and the serving tunnel.
-func hostUnderLoad() (bool, string) {
+func measureHostLoad() (bool, string) {
 	if data, err := os.ReadFile("/proc/loadavg"); err == nil {
 		fields := strings.Fields(string(data))
 		if len(fields) > 0 {
