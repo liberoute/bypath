@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/liberoute/bypath/internal/app"
 )
 
 // cmdStatus reports what the running gateway is doing. It is deliberately
@@ -44,7 +46,7 @@ func cmdStatus(args []string) {
 			os.Exit(1)
 		}
 		fmt.Println(string(data))
-		return
+		os.Exit(statusExitCode(st))
 	}
 
 	state := st.State
@@ -85,6 +87,16 @@ func cmdStatus(args []string) {
 	if st.Recovery > 0 {
 		fmt.Printf("Recovery:    attempt %d\n", st.Recovery)
 	}
+	os.Exit(statusExitCode(st))
+}
+
+// statusExitCode makes the exit status carry the probe result: success only
+// when a gateway was found running, so a monitoring check can rely on it.
+func statusExitCode(st app.Status) int {
+	if st.Running {
+		return 0
+	}
+	return 1
 }
 
 func formatUptime(seconds int64) string {
