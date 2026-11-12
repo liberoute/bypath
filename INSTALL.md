@@ -1,7 +1,7 @@
-# Installing Bypath v3.0.0-rc.1
+# Installing Bypath v3.0.0-rc.2
 
 This document covers the supported installation procedure for the
-`v3.0.0-rc.1` pre-release, the non-interactive form, upgrades, rollback and
+`v3.0.0-rc.2` pre-release, the non-interactive form, upgrades, rollback and
 uninstall.
 
 ## Supported targets
@@ -20,7 +20,7 @@ installer reports a missing tool instead of installing one.
 ## 1. Download and verify
 
 ```bash
-VERSION=v3.0.0-rc.1
+VERSION=v3.0.0-rc.2
 mkdir bypath-install && cd bypath-install
 
 curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/install.sh"
@@ -110,6 +110,7 @@ sudo ./install.sh --version "$VERSION" --non-interactive \
 | `--web off\|loopback\|lan` | `off`. |
 | `--uri` / `--subscription` | Nothing is imported. |
 | `--start-service` | Absent: the unit is left stopped. |
+| `--enable-service` | Absent: the unit is not enabled at boot, even after a verified start. |
 | `--enable-gateway` | Absent: gateway mode stays staged and disabled. |
 
 The wizard still prints the review block. In non-interactive mode it does not
@@ -146,14 +147,29 @@ A healthy proxy-only installation reports a passing configuration, a reachable
 proxy listener and, once the gateway runs, tunnel egress through an address
 different from the direct one. `doctor` exits non-zero when a check fails.
 
-## 6. Enable at boot
+## 6. Start, enable and gateway mode
 
-```bash
-sudo systemctl enable --now bypath
-```
+These are three separate decisions:
 
-This is the step that makes Bypath part of the boot path. Do it after the
-wizard has produced a verified connection.
+| Action | Command | Effect |
+|---|---|---|
+| Start now | `sudo systemctl start bypath` (or wizard `--start-service`) | Runs until the next reboot or stop. |
+| Enable at boot | `sudo systemctl enable bypath` (or wizard `--enable-service`) | Adds the unit to the boot path; it starts automatically. |
+| Enable gateway mode | wizard `--enable-gateway`, or the panel after verification | Makes the host the LAN gateway and DNS server. Only applied after a verified connection. |
+
+The first-run wizard offers the boot enable only after a start that reached
+`CONNECTED` and passed the exit-identity check; answering no leaves the unit
+running but not enabled. Installation alone never enables the unit. To remove
+boot persistence later: `sudo systemctl disable bypath`.
+
+### DNS port note
+
+The gateway DNS listener defaults to port 53. If another resolver already holds
+port 53, the wizard can use 5335 instead. Standard DHCP and ordinary DNS client
+settings cannot express a port, so with 5335 every client must be pointed at the
+gateway's address **and port** explicitly (or use a client-side port-53
+redirect). The wizard prints this warning whenever a nonstandard port is
+chosen.
 
 ## Upgrade
 

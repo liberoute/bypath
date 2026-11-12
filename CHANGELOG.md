@@ -4,6 +4,49 @@ This branch starts a new, independently constructed public history for Bypath.
 Earlier internal development history is not part of it. Entries below describe
 the public release candidate only.
 
+## v3.0.0-rc.2 — pre-release
+
+Reliability corrections for rc.1, with the public tree based on the rc.1
+release (`3518bef`). `main` and the `v3.0.0-rc.1` tag are unchanged.
+
+### Exit identity and activation
+
+- First-run activation and `doctor --egress` use the multi-oracle health-proof
+  architecture instead of one hardcoded `api.ipify.org` request. Every identity
+  service is probed with a bounded timeout, and an unreachable identity service
+  is reported as UNVERIFIED rather than as a dead tunnel.
+- Tunnel connectivity is proven separately by non-Cloudflare data-path
+  endpoints when no identity service answers. Gateway activation is allowed in
+  that case with an explicit UNVERIFIED warning.
+- Still fail closed: a tunnel with no passing data path is refused, and an exit
+  that equals the host's direct address (including one inconsistent oracle
+  answer that matches it) is refused.
+- Added tests for blocked oracles, inconsistent answers, a reachable tunnel and
+  an actually failed tunnel.
+
+### Service persistence
+
+- New `bypath setup --enable-service`: after a verified start, enable the unit
+  at boot and verify `systemctl is-enabled` reports `enabled`.
+- The interactive wizard offers the same choice only after a start that reached
+  `CONNECTED` and passed the exit-identity check. Installation alone still never
+  enables or starts the unit.
+- INSTALL.md and installer output document start vs. enable vs. gateway mode.
+
+### DNS and installer reliability
+
+- Native TUN no longer points `/etc/resolv.conf` at `127.0.0.1` when the gateway
+  DNS listener uses a nonstandard port (which made host DNS, and therefore an
+  installer rerun, fail). With the systemd-resolved stub, a bypath-managed
+  drop-in forwards host DNS to `127.0.0.1:<port>` and is removed on stop.
+  Without the stub, host DNS is left untouched and the limitation is logged.
+- `systemd-resolved` and `dnsmasq` are no longer stopped when the gateway uses a
+  nonstandard port and there is no conflict.
+- The wizard warns that DHCP and standard client DNS settings cannot express a
+  port when 5335 (or another nonstandard port) is used.
+- Uninstall and `--purge` remove `/run/bypath-control` along with the runtime
+  directory, so no control socket survives.
+
 ## v3.0.0-rc.1 — pre-release
 
 First public release candidate. Pre-release: not a stable release, not marked

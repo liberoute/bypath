@@ -1,13 +1,44 @@
-# Bypath v3.0.0-rc.1 — pre-release
+# Bypath v3.0.0-rc.2 — pre-release
 
-The first public release candidate of Bypath, a self-hosted network gateway and
-proxy manager. This is a **pre-release**: it is not marked "latest", it is not a
-stable release, and it makes no support claim beyond the targets below.
+The second public release candidate of Bypath, a self-hosted network gateway
+and proxy manager, containing reliability corrections for rc.1. This is a
+**pre-release**: it is not marked "latest", it is not a stable release, and it
+makes no support claim beyond the targets below.
+
+## Changes in rc.2
+
+rc.2 is built from the same public tree as rc.1. `main` and the
+`v3.0.0-rc.1` tag are unchanged; rc.1 remains available.
+
+- **Exit identity no longer depends on one service.** Activation probes several
+  independent address-echo services with bounded timeouts. Tunnel connectivity
+  is proven separately from exit identity: if every identity service is blocked
+  but traffic passes, the gateway is allowed with the exit marked UNVERIFIED —
+  never Healthy or VERIFIED. An exit equal to the direct address, or a tunnel
+  that carried no traffic, still fails closed. `bypath doctor --egress` uses the
+  same evidence.
+- **Service persistence is an explicit choice.** Installation still does not
+  enable the unit. After a verified first-run start the wizard offers to enable
+  it at boot (`--enable-service` for non-interactive runs) and verifies the
+  result. Starting, enabling and enabling gateway mode are documented as three
+  separate actions.
+- **Host DNS survives a nonstandard gateway DNS port.** With a listener on, for
+  example, 5335, `/etc/resolv.conf` is no longer pointed at a bare `127.0.0.1`
+  that cannot express the port. When the systemd-resolved stub is in use,
+  Bypath writes a managed drop-in to forward host DNS to the listener and
+  removes it on stop; otherwise host DNS is left untouched and the limitation is
+  logged. systemd-resolved and dnsmasq are not stopped when they do not hold the
+  gateway's port.
+- **The 5335 choice is explained up front.** The wizard warns that standard DHCP
+  and client DNS settings cannot specify a port, so every client must be pointed
+  at the gateway address and port explicitly.
+- **Purge is complete.** The runtime control-socket directory
+  `/run/bypath-control` is removed by uninstall and `--purge`.
 
 ## Install
 
 ```bash
-VERSION=v3.0.0-rc.1
+VERSION=v3.0.0-rc.2
 mkdir bypath-install && cd bypath-install
 curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/install.sh"
 curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/SHA256SUMS"

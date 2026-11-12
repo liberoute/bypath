@@ -26,6 +26,7 @@ import (
 type Contract interface {
 	Status(ctx context.Context) (Status, error)
 	ProbeExitIP(ctx context.Context) (string, error)
+	ProbeExitIdentity(ctx context.Context) (ExitProof, error)
 
 	ListConnections(ctx context.Context, filter ConnectionFilter) ([]Connection, error)
 	GetConnection(ctx context.Context, id string) (ConnectionDetail, error)

@@ -580,13 +580,18 @@ type EgressCheck struct {
 func (s *Local) CheckEgress(ctx context.Context) (EgressCheck, error) {
 	check := EgressCheck{}
 	if s.runtime != nil && s.runtime.Status().State == "CONNECTED" {
-		probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-		exit, err := s.ProbeExitIP(probeCtx)
+		probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		proof, err := s.ProbeExitIdentity(probeCtx)
 		cancel()
-		if err != nil {
+		switch {
+		case err != nil:
 			check.TunnelError = Redact(err.Error())
-		} else {
-			check.TunnelExit = exit
+		case len(proof.Exits) > 0:
+			check.TunnelExit = proof.Exits[0]
+		case proof.DataPathOK:
+			check.TunnelError = "the tunnel carried traffic, but no identity service answered, so the exit address is unverified"
+		default:
+			check.TunnelError = "the tunnel is connected but no traffic reached the internet"
 		}
 	} else {
 		check.TunnelError = "the tunnel is not connected, so it has no exit address"

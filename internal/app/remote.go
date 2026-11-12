@@ -185,6 +185,14 @@ func (r *Remote) ProbeExitIP(ctx context.Context) (string, error) {
 	return out.IP, err
 }
 
+// ProbeExitIdentity runs the daemon's multi-oracle identity probe. The budget
+// covers every oracle and, when needed, the separate data-path check.
+func (r *Remote) ProbeExitIdentity(ctx context.Context) (ExitProof, error) {
+	var out ExitProof
+	err := r.doWithin(ctx, 30*time.Second, http.MethodPost, "/api/v1/app/exit-identity", nil, &out)
+	return out, err
+}
+
 // CheckEgress asks the running gateway for its tunnel exit and the address its
 // direct path uses. Both probes are bounded server-side.
 func (r *Remote) CheckEgress(ctx context.Context) (EgressCheck, error) {

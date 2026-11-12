@@ -1,7 +1,7 @@
 # Third-party notices
 
 Bypath is distributed under the GNU General Public License, version 3 or later
-(see [LICENSE](LICENSE)). The `v3.0.0-rc.1` release binaries are built with
+(see [LICENSE](LICENSE)). The `v3.0.0-rc.2` release binaries are built with
 `-tags full`, which statically links the GPL-licensed sing-box libraries and,
 for the legacy datapath, the GPL-licensed tun2socks binary. The combined work is
 therefore distributed under GPL-3.0-or-later, and the corresponding source is
@@ -13,7 +13,7 @@ build. GPL-licensed components are obtained from their upstream repositories.
 
 | Component | Version | License | Copyright |
 |---|---|---|---|
-| Bypath | v3.0.0-rc.1 | GPL-3.0-or-later | Bypath contributors |
+| Bypath | v3.0.0-rc.2 | GPL-3.0-or-later | Bypath contributors |
 | sing-box (embedded library and CLI code) | 1.14.4 | GPL-3.0-or-later | Copyright (C) 2022 nekohasekai / SagerNet contributors |
 | sagernet/sing libraries (sing, sing-tun, sing-openvpn, sing-vmess, sing-shadowsocks, sing-quic, sing-mux, sing-shadowtls and related modules) | pinned in `go.mod` | GPL-3.0-or-later | Sagernet contributors |
 | tun2socks (embedded asset in `full embed_tun2socks` builds) | 2.5.2 | GPL-3.0 | xjasonlyu/tun2socks contributors |

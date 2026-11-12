@@ -146,9 +146,8 @@ func healthVerdict(answered bool, exit string, direct []string) (bool, string) {
 	return ev.Healthy(), ev.Detail
 }
 
-// ipFetcher returns the public address one oracle reported, or an error when
-// the observation failed.
-type ipFetcher func(ctx context.Context, target string) (string, error)
+// ipFetcher is the internal spelling of IdentityFetcher.
+type ipFetcher = IdentityFetcher
 
 // sampleIPs probes every oracle concurrently and returns the answers in oracle
 // order. Missing answers stay empty so callers can count attempts and wins.
@@ -205,6 +204,75 @@ func collectIdentity(ctx context.Context, through, direct ipFetcher) (exits, upl
 	}()
 	wg.Wait()
 	return knownIPs(throughSamples), knownIPs(directSamples), len(healthIdentityOracles)
+}
+
+// IdentityFetcher asks one oracle for the address it observes. Either side may
+// fail without invalidating the other side's evidence.
+type IdentityFetcher func(ctx context.Context, target string) (string, error)
+
+// ExitIdentityEvidence is the raw multi-oracle observation used outside the
+// periodic health loop, for example before a first-run gateway activation.
+// Connectivity is proven separately there, so an empty exit set is evidence
+// about identity, not about forwarding.
+type ExitIdentityEvidence struct {
+	Exits    []string
+	Uplink   []string
+	Attempts int
+}
+
+// CollectExitIdentity samples the tunnel and direct sides concurrently within
+// one bounded budget. Attempts counts the oracles offered, not the answers.
+func CollectExitIdentity(ctx context.Context, through, direct IdentityFetcher) ExitIdentityEvidence {
+	exits, uplink, attempts := collectIdentity(ctx, ipFetcher(through), ipFetcher(direct))
+	return ExitIdentityEvidence{Exits: exits, Uplink: uplink, Attempts: attempts}
+}
+
+// FetchExitIPThroughProxy observes the address the tunnel exit presents.
+func FetchExitIPThroughProxy(ctx context.Context, socksPort int, target string) (string, error) {
+	return fetchIPThroughProxy(ctx, socksPort, target)
+}
+
+// FetchExitIPDirect observes this host's address without the tunnel.
+func FetchExitIPDirect(ctx context.Context, target string) (string, error) {
+	return fetchIPDirect(ctx, target)
+}
+
+// ClassifyExitIdentity answers only the identity question. Because tunnel
+// connectivity is established by the caller, a blocked oracle set is
+// EXIT_UNKNOWN rather than TUNNEL_DOWN, and only an observed exit that differs
+// from every direct sample is VERIFIED.
+func ClassifyExitIdentity(id ExitIdentityEvidence) HealthEvidence {
+	exits := knownIPs(id.Exits)
+	uplink := knownIPs(id.Uplink)
+	ev := HealthEvidence{
+		TunnelAnswered: len(exits) > 0,
+		ExitIPs:        exits,
+		Uplink:         uplink,
+		UplinkAttempts: id.Attempts,
+	}
+	if len(exits) == 0 {
+		ev.Code = HealthExitUnknown
+		ev.Detail = fmt.Sprintf("no identity service answered through the tunnel (%d tried)", id.Attempts)
+		return ev
+	}
+	if len(uplink) == 0 {
+		ev.Code = HealthUplinkUnverified
+		ev.Detail = fmt.Sprintf("the tunnel exit was observed but this host's direct address could not be verified by any of %d identity services", id.Attempts)
+		return ev
+	}
+	known := make(map[string]bool, len(uplink))
+	for _, ip := range uplink {
+		known[ip] = true
+	}
+	for _, exit := range exits {
+		if known[exit] {
+			ev.Code = HealthExitIsUplink
+			ev.Detail = "the observed exit equals this host's direct address"
+			return ev
+		}
+	}
+	ev.Code = HealthVerified
+	return ev
 }
 
 // observeIdentity runs the real fetchers against this gateway's SOCKS port.

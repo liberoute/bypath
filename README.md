@@ -10,7 +10,7 @@ server, no credentials and no routing policy based on where you live. You add
 your own connection (a proxy URI or a subscription URL you are entitled to use)
 during first-run setup.
 
-> **Pre-release:** `v3.0.0-rc.1`. This is a release candidate for testing. It is
+> **Pre-release:** `v3.0.0-rc.2`. This is a release candidate for testing. It is
 > not marked "latest" on GitHub and it is not a stable release. Read
 > [RELEASE_NOTES.md](RELEASE_NOTES.md) and [SECURITY.md](SECURITY.md) before
 > exposing it to a network.
@@ -39,7 +39,7 @@ from the release you intend to install, verify them, then run the installer.
 Do not use a `/releases/latest` URL.
 
 ```bash
-VERSION=v3.0.0-rc.1
+VERSION=v3.0.0-rc.2
 curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/install.sh"
 curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/SHA256SUMS"
 sha256sum --check --ignore-missing SHA256SUMS
@@ -219,7 +219,7 @@ Proxy-only mode needs only the binary and a reachable proxy endpoint.
 ```bash
 git clone https://github.com/liberoute/bypath.git
 cd bypath
-git checkout v3.0.0-rc.1
+git checkout v3.0.0-rc.2
 make build          # host build, no embedded engines
 make build-full     # embedded sing-box + xray (matches release binaries)
 ```

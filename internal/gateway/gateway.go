@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -1035,36 +1036,51 @@ func (gw *Gateway) verifyConnection(ctx context.Context) bool {
 	if listen == "" || listen == "0.0.0.0" || listen == "::" {
 		listen = "127.0.0.1"
 	}
-	addr := net.JoinHostPort(listen, strconv.Itoa(port))
+	ok, _ := ProbeDataPath(ctx, net.JoinHostPort(listen, strconv.Itoa(port)), gw.probeTimeout())
+	return ok
+}
 
-	// Candidates: non-Cloudflare targets that return predictable HTTP responses.
-	// The in-process SOCKS client sends hostnames to the proxy (remote DNS), so
-	// no local resolver or external curl binary is required.
-	candidates := []struct {
-		url      string
-		wantCode int
-	}{
-		// Google's generate_204 — returns exactly 204, not Cloudflare.
-		{"http://www.gstatic.com/generate_204", 204},
-		// Microsoft connectivity check.
-		{"http://www.msftconnecttest.com/connecttest.txt", 200},
-		// Apple captive portal check.
-		{"http://captive.apple.com/hotspot-detect.html", 200},
+// dataPathCandidates are non-Cloudflare targets with predictable responses.
+// The in-process SOCKS client sends hostnames to the proxy (remote DNS), so no
+// local resolver or external curl binary is required.
+var dataPathCandidates = []struct {
+	url      string
+	wantCode int
+}{
+	// Google's generate_204 — returns exactly 204, not Cloudflare.
+	{"http://www.gstatic.com/generate_204", 204},
+	// Microsoft connectivity check.
+	{"http://www.msftconnecttest.com/connecttest.txt", 200},
+	// Apple captive portal check.
+	{"http://captive.apple.com/hotspot-detect.html", 200},
+}
+
+// ProbeDataPath reports whether a SOCKS listener reaches the public internet
+// through the tunnel and names the evidence. It is the connectivity half of
+// the proof chain: identity oracles may all be blocked while this still
+// succeeds, and a caller must not present that as a dead tunnel.
+func ProbeDataPath(ctx context.Context, socksAddr string, timeout time.Duration) (bool, string) {
+	if timeout <= 0 {
+		timeout = 6 * time.Second
 	}
-
-	probeTimeout := gw.probeTimeout()
-	for _, c := range candidates {
+	detail := "no endpoint was tried"
+	for _, c := range dataPathCandidates {
 		if ctx.Err() != nil {
-			return false
+			return false, ctx.Err().Error()
 		}
-		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
-		_, code, err := profile.GetThroughProxyAt(probeCtx, addr, c.url, nil, 4<<10)
+		probeCtx, cancel := context.WithTimeout(ctx, timeout)
+		_, code, err := profile.GetThroughProxyAt(probeCtx, socksAddr, c.url, nil, 4<<10)
 		cancel()
 		if err == nil && code == c.wantCode {
-			return true
+			return true, c.url
+		}
+		if err != nil {
+			detail = fmt.Sprintf("%s: %v", c.url, err)
+		} else {
+			detail = fmt.Sprintf("%s answered HTTP %d, want %d", c.url, code, c.wantCode)
 		}
 	}
-	return false
+	return false, detail
 }
 
 func isCatchAllMatcher(match string) bool {
@@ -1318,6 +1334,12 @@ func (gw *Gateway) disableSystemdResolved() (bool, error) {
 	// irrelevant: their port 53 belongs to another network stack, and stopping
 	// them would break host DNS for no benefit.
 	if networkNamespaceIsolated() {
+		return false, nil
+	}
+	// Only the standard port conflicts with systemd-resolved. On a nonstandard
+	// port the resolver keeps running and is the host's own upstream, so
+	// stopping it would be an unnecessary, silent service change.
+	if port := gw.dnsPort; port != 0 && port != 53 {
 		return false, nil
 	}
 	out, err := systemctlOutput("is-active", "systemd-resolved")
@@ -2238,10 +2260,108 @@ func (gw *Gateway) setupRouting() error {
 			return err
 		}
 	}
-	if err := gw.setResolvConf("127.0.0.1"); err != nil {
+	if err := gw.setHostResolver(); err != nil {
 		return err
 	}
 
+	return nil
+}
+
+// setHostResolver keeps this host's own name resolution working while the
+// native TUN carries its traffic. On the standard port /etc/resolv.conf can
+// name 127.0.0.1 directly. On a nonstandard port (for example 5335 because
+// another resolver owns port 53) resolv.conf cannot express a port, so writing
+// 127.0.0.1 there would blackhole host DNS — and an installer rerun could no
+// longer resolve its download host. The gateway therefore updates the
+// systemd-resolved drop-in when the stub is in use and otherwise leaves the
+// host resolver untouched with an explicit warning. It never stops a resolver
+// for this path.
+func (gw *Gateway) setHostResolver() error {
+	port := gw.config.Server.DNSPort
+	if port == 0 {
+		port = 53
+	}
+	if port == 53 {
+		return gw.setResolvConf("127.0.0.1")
+	}
+	if resolvedStubInUse() {
+		return gw.setResolvedDropIn(port)
+	}
+	log.Printf("⚠️  Host DNS is unchanged: the gateway answers on port %d and %s cannot express a port. Point this host at 127.0.0.1:%d explicitly, or use DNS port 53.", port, resolvConfPath, port)
+	return nil
+}
+
+// resolvedDropInPath is the bypath-owned drop-in. A distinct name keeps it away
+// from administrator snippets, and the managed-by marker makes cleanup refuse
+// to delete a file bypath did not write.
+var resolvedDropInPath = "/etc/systemd/resolved.conf.d/90-bypath.conf"
+
+const resolvedDropInMarker = "# Managed by bypath; removed when the gateway stops."
+
+// resolvedStubInUse reports whether /etc/resolv.conf is the systemd-resolved
+// stub, which is the only case where a drop-in can change host DNS. It is a
+// variable so tests can exercise the drop-in path without a real symlink.
+var resolvedStubInUse = func() bool {
+	target, err := os.Readlink(resolvConfPath)
+	if err != nil || !strings.Contains(target, "systemd") {
+		return false
+	}
+	out, err := commandOutput("systemctl", "is-active", "systemd-resolved")
+	return err == nil && strings.TrimSpace(out) == "active"
+}
+
+// setResolvedDropIn forwards the host's stub resolver to the gateway listener.
+// systemd-resolved keeps running; only its upstream is pointed at bypath.
+func (gw *Gateway) setResolvedDropIn(port int) error {
+	if existing, err := os.ReadFile(resolvedDropInPath); err == nil && !strings.Contains(string(existing), resolvedDropInMarker) {
+		return fmt.Errorf("%s already exists and was not written by bypath; refusing to overwrite it", resolvedDropInPath)
+	}
+	st, err := gw.ensureRunState("")
+	if err != nil {
+		return err
+	}
+	if !st.ResolvedDropIn {
+		st.ResolvedDropIn = true
+		if err := gw.persistRunState(); err != nil {
+			st.ResolvedDropIn = false
+			return err
+		}
+	}
+	content := fmt.Sprintf("%s\n[Resolve]\nDNS=127.0.0.1:%d\nDomains=~.\n", resolvedDropInMarker, port)
+	if err := os.MkdirAll(filepath.Dir(resolvedDropInPath), 0755); err != nil {
+		return fmt.Errorf("creating %s: %w", filepath.Dir(resolvedDropInPath), err)
+	}
+	if err := writeFileAtomic(resolvedDropInPath, []byte(content), 0644); err != nil {
+		return fmt.Errorf("writing %s: %w", resolvedDropInPath, err)
+	}
+	if err := systemctlRun("restart", "systemd-resolved"); err != nil {
+		return fmt.Errorf("restarting systemd-resolved with the bypath drop-in: %w", err)
+	}
+	log.Printf("🔧 systemd-resolved now forwards host DNS to 127.0.0.1:%d (service left enabled)", port)
+	return nil
+}
+
+// restoreResolvedDropIn removes only a drop-in carrying the bypath marker and
+// restarts the still-enabled resolver so the host returns to its own upstream.
+func (gw *Gateway) restoreResolvedDropIn() error {
+	content, err := os.ReadFile(resolvedDropInPath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("reading %s before removal: %w", resolvedDropInPath, err)
+	}
+	if err == nil {
+		if !strings.Contains(string(content), resolvedDropInMarker) {
+			return fmt.Errorf("%s was not written by bypath; refusing to remove it", resolvedDropInPath)
+		}
+		if err := os.Remove(resolvedDropInPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing %s: %w", resolvedDropInPath, err)
+		}
+	}
+	if out, statErr := commandOutput("systemctl", "is-active", "systemd-resolved"); statErr == nil && strings.TrimSpace(out) == "active" {
+		if err := systemctlRun("restart", "systemd-resolved"); err != nil {
+			return fmt.Errorf("restarting systemd-resolved after removing the bypath drop-in: %w", err)
+		}
+	}
+	log.Printf("🔧 removed %s; host DNS restored", resolvedDropInPath)
 	return nil
 }
 

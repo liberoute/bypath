@@ -90,6 +90,10 @@ type gatewayRunState struct {
 	ForwardingWasOff bool `json:"forwarding_was_off,omitempty"`
 	ResolvChanged    bool `json:"resolv_changed,omitempty"`
 	ResolvedStopped  bool `json:"resolved_stopped,omitempty"`
+	// ResolvedDropIn marks a bypath-owned systemd-resolved drop-in that points
+	// the host's stub resolver at the gateway listener's nonstandard port. It is
+	// separate from ResolvChanged because /etc/resolv.conf is left untouched.
+	ResolvedDropIn bool `json:"resolved_drop_in,omitempty"`
 	DnsmasqStopped   bool `json:"dnsmasq_stopped,omitempty"`
 	HostsPinned      bool `json:"hosts_pinned,omitempty"`
 	V6Isolated       bool `json:"v6_isolated,omitempty"`

@@ -23,6 +23,7 @@ func (s *Server) registerAppRoutesOn(r *mux.Router) {
 	r.Use(s.serviceOperationGate)
 	r.HandleFunc("/status", s.appStatus).Methods("GET")
 	r.HandleFunc("/exit-ip", s.appExitIP).Methods("POST")
+	r.HandleFunc("/exit-identity", s.appExitIdentity).Methods("POST")
 
 	r.HandleFunc("/connections", s.appListConnections).Methods("GET")
 	r.HandleFunc("/connection", s.appGetConnection).Methods("GET")
@@ -157,6 +158,15 @@ func (s *Server) appExitIP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, http.StatusOK, info)
+}
+
+func (s *Server) appExitIdentity(w http.ResponseWriter, r *http.Request) {
+	proof, err := s.svc.ProbeExitIdentity(r.Context())
+	if err != nil {
+		appError(w, err)
+		return
+	}
+	jsonResponse(w, http.StatusOK, proof)
 }
 
 func (s *Server) appListConnections(w http.ResponseWriter, r *http.Request) {

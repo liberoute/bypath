@@ -5,7 +5,7 @@ it does not, and how to report a problem.
 
 ## Scope of this pre-release
 
-`v3.0.0-rc.1` is a release candidate. It has been exercised on fresh amd64
+`v3.0.0-rc.2` is a release candidate. It has been exercised on fresh amd64
 installations and an emulated arm64 environment, with the test matrix described
 in [RELEASE_NOTES.md](RELEASE_NOTES.md). It has not been through an external
 security audit. Treat it accordingly.

@@ -1,4 +1,4 @@
-# Quick start (v3.0.0-rc.1)
+# Quick start (v3.0.0-rc.2)
 
 This is the shortest path from a fresh Debian/Ubuntu machine to a working
 proxy. It assumes Linux amd64 or arm64 and root access via `sudo`.
@@ -9,7 +9,7 @@ If you want the gateway (whole-network) mode or a non-interactive install, read
 ## 1. Verify the release artifacts
 
 ```bash
-VERSION=v3.0.0-rc.1
+VERSION=v3.0.0-rc.2
 mkdir bypath-install && cd bypath-install
 curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/install.sh"
 curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/SHA256SUMS"

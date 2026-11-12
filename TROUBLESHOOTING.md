@@ -20,7 +20,7 @@ hostnames and interface names are visible.
   artefact for other targets.
 - **"sha256sum is required"** — install `coreutils` (Debian/Ubuntu) and rerun.
   The installer never proceeds without a checksum tool.
-- **"an exact release tag is required"** — pass `--version v3.0.0-rc.1`. The
+- **"an exact release tag is required"** — pass `--version v3.0.0-rc.2`. The
   installer deliberately rejects `latest`.
 - **"failed its version check when executed from /opt"** — the binary could not
   run where it is installed. Usually `/opt` is mounted `noexec`; install
@@ -42,6 +42,17 @@ Gateway DNS needs UDP/TCP 53. Common holders are `systemd-resolved`, `dnsmasq`,
   port yourself, or install in proxy-only mode.
 - If you disable `systemd-resolved`, understand that other software on the host
   may depend on it. Bypath will not do this for you.
+
+### Nonstandard DNS port (5335)
+
+A port other than 53 cannot be expressed by DHCP or by ordinary client DNS
+settings: those carry only an address. If the wizard selected 5335, every LAN
+client must be pointed at the gateway address **and port 5335** explicitly, or
+the client needs a local port-53 redirect. The gateway's own host resolution is
+handled separately: when `systemd-resolved` is in use, Bypath writes a
+bypath-owned drop-in that forwards the stub resolver to `127.0.0.1:5335` and
+removes it when the gateway stops. On hosts without the resolved stub, host DNS
+is left untouched and the gateway logs that it could not be redirected.
 
 ## The wizard refuses gateway mode
 

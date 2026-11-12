@@ -233,3 +233,93 @@ func TestCollectIdentityHonoursCancellation(t *testing.T) {
 		t.Fatalf("collectIdentity took %s, want it bounded by %s", elapsed, healthIdentityTimeout)
 	}
 }
+
+// TestClassifyExitIdentity pins the pre-activation rule: identity oracles are
+// not a connectivity test. A blocked oracle set is EXIT_UNKNOWN, an observed
+// exit that matches the direct uplink is EXIT_IS_UPLINK, and only a distinct
+// observed exit is VERIFIED.
+func TestClassifyExitIdentity(t *testing.T) {
+	cases := []struct {
+		name     string
+		id       ExitIdentityEvidence
+		wantCode string
+		want     bool
+	}{
+		{
+			name:     "all oracles blocked through the tunnel",
+			id:       ExitIdentityEvidence{Uplink: []string{"192.0.2.9"}, Attempts: 4},
+			wantCode: HealthExitUnknown,
+		},
+		{
+			name:     "tunnel exit observed but direct side blocked",
+			id:       ExitIdentityEvidence{Exits: []string{"203.0.113.7"}, Attempts: 4},
+			wantCode: HealthUplinkUnverified,
+		},
+		{
+			name:     "exit equals the direct address",
+			id:       ExitIdentityEvidence{Exits: []string{"192.0.2.9"}, Uplink: []string{"192.0.2.9"}, Attempts: 4},
+			wantCode: HealthExitIsUplink,
+		},
+		{
+			name:     "inconsistent answers: one exit matches the direct address",
+			id:       ExitIdentityEvidence{Exits: []string{"203.0.113.7", "192.0.2.9"}, Uplink: []string{"192.0.2.9"}, Attempts: 4},
+			wantCode: HealthExitIsUplink,
+		},
+		{
+			name:     "reachable tunnel with a rotating exit set",
+			id:       ExitIdentityEvidence{Exits: []string{"203.0.113.7", "203.0.113.8"}, Uplink: []string{"192.0.2.9"}, Attempts: 4},
+			wantCode: HealthVerified,
+			want:     true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := ClassifyExitIdentity(tc.id)
+			if ev.Code != tc.wantCode {
+				t.Fatalf("code = %q (%q), want %q", ev.Code, ev.Detail, tc.wantCode)
+			}
+			if ev.Healthy() != tc.want {
+				t.Fatalf("Healthy = %v, want %v", ev.Healthy(), tc.want)
+			}
+		})
+	}
+}
+
+// TestCollectExitIdentityBlockedThroughOracle proves one unreachable oracle
+// does not abort the sample and that no answer is invented for it.
+func TestCollectExitIdentityBlockedThroughOracle(t *testing.T) {
+	through := fetchMap(map[string]string{
+		healthIdentityOracles[1]: "203.0.113.7",
+	}, map[string]bool{healthIdentityOracles[0]: true})
+	direct := fetchMap(map[string]string{healthIdentityOracles[0]: "192.0.2.9"}, nil)
+
+	id := CollectExitIdentity(context.Background(), through, direct)
+	if id.Attempts != len(healthIdentityOracles) {
+		t.Fatalf("attempts = %d, want %d", id.Attempts, len(healthIdentityOracles))
+	}
+	if len(id.Exits) != 1 || id.Exits[0] != "203.0.113.7" {
+		t.Fatalf("exits = %v, want [203.0.113.7]", id.Exits)
+	}
+	if len(id.Uplink) != 1 || id.Uplink[0] != "192.0.2.9" {
+		t.Fatalf("uplink = %v, want [192.0.2.9]", id.Uplink)
+	}
+	if ev := ClassifyExitIdentity(id); ev.Code != HealthVerified {
+		t.Fatalf("code = %q, want %q", ev.Code, HealthVerified)
+	}
+}
+
+// TestCollectExitIdentityDeadOracles keeps a fully blocked identity path out
+// of the VERIFIED state without claiming the tunnel is down.
+func TestCollectExitIdentityDeadOracles(t *testing.T) {
+	unreachable := func(context.Context, string) (string, error) {
+		return "", errors.New("blocked")
+	}
+	id := CollectExitIdentity(context.Background(), unreachable, unreachable)
+	ev := ClassifyExitIdentity(id)
+	if ev.Code != HealthExitUnknown {
+		t.Fatalf("code = %q, want %q", ev.Code, HealthExitUnknown)
+	}
+	if ev.Healthy() {
+		t.Fatal("blocked oracles were certified")
+	}
+}

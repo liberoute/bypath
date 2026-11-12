@@ -7,10 +7,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/liberoute/bypath/internal/engine"
+	"github.com/liberoute/bypath/internal/gateway"
 	"github.com/liberoute/bypath/internal/profile"
 )
 
@@ -33,6 +35,113 @@ func (s *Local) ProbeExitIP(ctx context.Context) (string, error) {
 		return "", errorf(CodeUnavailable, "exit IP probe returned an unexpected response")
 	}
 	return candidate, nil
+}
+
+// ExitProof is the pre-activation evidence for a first-run gateway. It keeps
+// three questions apart: did the tunnel carry traffic (DataPathOK, sampled
+// only when no identity oracle answered), what did the identity services see
+// through the tunnel (Exits), and what does this host look like directly
+// (Uplink). Empty sides mean the oracles were unreachable, not that the tunnel
+// failed.
+type ExitProof struct {
+	Exits          []string `json:"exits,omitempty"`
+	Uplink         []string `json:"uplink,omitempty"`
+	Oracles        int      `json:"oracles"`
+	DataPathOK     bool     `json:"data_path_ok"`
+	DataPathDetail string   `json:"data_path_detail,omitempty"`
+}
+
+// ActivationVerdict is the outcome a caller may act on. Allowed says the
+// gateway may be enabled; Verified says the exit was positively identified and
+// differs from the direct uplink. Only Verified evidence may be reported as
+// healthy or verified.
+type ActivationVerdict struct {
+	Allowed  bool
+	Verified bool
+	Detail   string
+}
+
+// Verdict applies the activation rule. A blocked oracle set is not a dead
+// tunnel: when the data-path check passed, activation is allowed but the exit
+// stays UNVERIFIED. A refused verdict is reserved for a tunnel that carried no
+// traffic or an exit that equals this host's own address.
+func (p ExitProof) Verdict() ActivationVerdict {
+	exits := distinctIPs(p.Exits)
+	uplink := distinctIPs(p.Uplink)
+	if len(exits) == 0 {
+		if p.DataPathOK {
+			return ActivationVerdict{
+				Allowed: true,
+				Detail:  fmt.Sprintf("the tunnel carried traffic, but none of %d identity services answered; the exit address is UNVERIFIED", p.Oracles),
+			}
+		}
+		detail := "the tunnel is connected but no traffic reached the internet"
+		if p.DataPathDetail != "" {
+			detail += ": " + p.DataPathDetail
+		}
+		return ActivationVerdict{Detail: detail}
+	}
+	if len(uplink) == 0 {
+		return ActivationVerdict{
+			Allowed: true,
+			Detail:  "the tunnel exit was observed, but this host's direct address could not be verified; the exit is UNVERIFIED",
+		}
+	}
+	known := make(map[string]bool, len(uplink))
+	for _, ip := range uplink {
+		known[ip] = true
+	}
+	for _, exit := range exits {
+		if known[exit] {
+			return ActivationVerdict{Detail: "the observed exit equals this host's direct address, so the tunnel is not carrying traffic"}
+		}
+	}
+	return ActivationVerdict{Allowed: true, Verified: true, Detail: "the exit differs from the direct address"}
+}
+
+// ProbeExitIdentity observes the tunnel exit through every independent oracle
+// and, only when none of them answered, verifies the data path separately. It
+// never reports the tunnel as failed merely because an identity service is
+// unreachable.
+func (s *Local) ProbeExitIdentity(ctx context.Context) (ExitProof, error) {
+	if s.runtime == nil {
+		return ExitProof{}, ErrNotRunning()
+	}
+	if rs := s.runtime.Status(); rs.State != "CONNECTED" {
+		return ExitProof{}, errorf(CodeUnavailable, "gateway is %s; the exit identity is unknown", strings.ToLower(rs.State))
+	}
+	port := s.Config().Server.SOCKSPort
+	through := func(ctx context.Context, target string) (string, error) {
+		return gateway.FetchExitIPThroughProxy(ctx, port, target)
+	}
+	id := gateway.CollectExitIdentity(ctx, through, gateway.FetchExitIPDirect)
+	proof := ExitProof{Exits: id.Exits, Uplink: id.Uplink, Oracles: id.Attempts}
+	if len(id.Exits) == 0 {
+		proof.DataPathOK, proof.DataPathDetail = gateway.ProbeDataPath(ctx, socksProbeAddress(s.Config().Server.SOCKSListen, port), 6*time.Second)
+	}
+	return proof, nil
+}
+
+func socksProbeAddress(listen string, port int) string {
+	listen = strings.TrimSpace(listen)
+	if listen == "" || listen == "0.0.0.0" || listen == "::" {
+		listen = "127.0.0.1"
+	}
+	return net.JoinHostPort(listen, strconv.Itoa(port))
+}
+
+func distinctIPs(samples []string) []string {
+	seen := make(map[string]bool, len(samples))
+	out := make([]string, 0, len(samples))
+	for _, sample := range samples {
+		ip := net.ParseIP(strings.TrimSpace(sample))
+		if ip == nil || seen[ip.String()] {
+			continue
+		}
+		seen[ip.String()] = true
+		out = append(out, ip.String())
+	}
+	return out
 }
 
 // ExitInfo is what an operator needs to see: the address the world sees and

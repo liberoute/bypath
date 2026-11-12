@@ -65,6 +65,11 @@ func (gw *Gateway) stopDnsmasq() error {
 	if networkNamespaceIsolated() {
 		return nil
 	}
+	// A nonstandard listener port does not conflict with dnsmasq's port 53;
+	// stopping it anyway would be a silent change to a host DNS service.
+	if port := gw.dnsPort; port != 0 && port != 53 {
+		return nil
+	}
 	exists := dnsmasqServiceExists()
 	active := false
 	if exists {

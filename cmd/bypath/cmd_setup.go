@@ -48,6 +48,7 @@ type setupOptions struct {
 	selectName    string
 
 	startService  bool
+	enableService bool
 	enableGateway bool
 }
 
@@ -77,9 +78,10 @@ type answers struct {
 	webPort      int
 	group        string
 	selectName   string
-	uris         []string
-	subs         []string
-	startService bool
+	uris           []string
+	subs           []string
+	startService   bool
+	persistService bool
 	// deferActivation keeps gateway.enabled false at write time when a systemd
 	// unit exists: startAndVerify turns it on only after the connection works.
 	deferActivation bool
@@ -173,6 +175,61 @@ func cmdSetup(args []string) {
 	if ok := startAndVerify(cfgPath, ans); !ok {
 		os.Exit(1)
 	}
+	if err := offerServicePersistence(&p, opts, ans); err != nil {
+		fmt.Printf("❌ %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// offerServicePersistence runs only after a verified start. Starting and
+// enabling are different: installation never enables the unit, a wizard start
+// runs it until the next reboot, and an explicit yes (or --enable-service)
+// makes it return at boot. Gateway mode is a third, independent switch.
+func offerServicePersistence(p *prompter, opts *setupOptions, ans *answers) error {
+	if !unitInstalled() || serviceState() != "active" {
+		return nil
+	}
+	enable := ans.persistService
+	if !opts.nonInteractive && !enable {
+		answer, err := p.confirm("Enable the service at boot so it returns after a reboot (systemctl enable bypath)", false)
+		if err != nil {
+			return err
+		}
+		enable = answer
+	}
+	if !enable {
+		fmt.Println("\nℹ️  The service is running now but will NOT start after a reboot.")
+		fmt.Println("   start = run now; enable = also run at boot; gateway mode = carry the LAN.")
+		fmt.Println("   Enable later with `sudo systemctl enable bypath`.")
+		return nil
+	}
+	if err := enableServiceAtBoot(); err != nil {
+		return fmt.Errorf("enabling the service at boot: %v", err)
+	}
+	fmt.Println("\n✅ The service is enabled and will start after a reboot.")
+	fmt.Println("   start = run now; enable = also run at boot; gateway mode = carry the LAN.")
+	return nil
+}
+
+// enableServiceAtBoot verifies the result instead of trusting `systemctl
+// enable`: a unit without an [Install] section or a masked unit exits 0 on some
+// systemd versions while remaining disabled.
+func enableServiceAtBoot() error {
+	if err := exec.Command("systemctl", "enable", "bypath").Run(); err != nil {
+		return err
+	}
+	out, err := exec.Command("systemctl", "is-enabled", "bypath").Output()
+	if err != nil {
+		return fmt.Errorf("systemctl is-enabled reported an error: %v", err)
+	}
+	switch state := strings.TrimSpace(string(out)); state {
+	case "enabled":
+		return nil
+	case "enabled-runtime":
+		return fmt.Errorf("the unit is enabled only for this boot (%q); a permanent enable failed", state)
+	default:
+		return fmt.Errorf("systemctl is-enabled reports %q, not enabled", state)
+	}
 }
 
 func exitCode(err error) int {
@@ -205,8 +262,9 @@ func parseSetupFlags(args []string) (*setupOptions, error) {
 	fs.Var(&opts.subscriptions, "subscription", "subscription URL to import (repeatable)")
 	fs.StringVar(&opts.group, "group", "", "organisation group for imported connections (default \"default\")")
 	fs.StringVar(&opts.selectName, "select", "", "name of the connection to select after import")
-	fs.BoolVar(&opts.startService, "start-service", false, "start/restart the systemd unit and verify the first connection")
-	fs.BoolVar(&opts.enableGateway, "enable-gateway", false, "write gateway.enabled: true after you verified a connection yourself")
+	fs.BoolVar(&opts.startService, "start-service", false, "start/restart the systemd unit now and verify the first connection (does not enable it at boot)")
+	fs.BoolVar(&opts.enableService, "enable-service", false, "after a verified start, enable the unit at boot (implies --start-service; does not enable gateway mode)")
+	fs.BoolVar(&opts.enableGateway, "enable-gateway", false, "write gateway.enabled: true after you verified a connection yourself (does not start or enable the unit)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -328,7 +386,8 @@ func collectAnswers(p *prompter, opts *setupOptions, cfg *config.Config) (*answe
 		selectName:   strings.TrimSpace(opts.selectName),
 		uris:         append([]string{}, opts.uris...),
 		subs:         append([]string{}, opts.subscriptions...),
-		startService: opts.startService,
+		startService:   opts.startService || opts.enableService,
+		persistService: opts.enableService,
 	}
 	if ans.group == "" {
 		ans.group = cfg.Profiles.ActiveGroup
@@ -531,6 +590,15 @@ func collectAnswers(p *prompter, opts *setupOptions, cfg *config.Config) (*answe
 				return nil, fmt.Errorf("setup cancelled")
 			}
 		}
+		// A DNS port other than 53 cannot be expressed by DHCP or by ordinary
+		// client DNS settings: those carry an address, not a port. Say that
+		// before anything is activated instead of surprising the operator later.
+		if ans.dnsPort != 53 {
+			fmt.Printf("⚠️  DNS runs on port %d, which is nonstandard: standard DHCP and DNS\n", ans.dnsPort)
+			fmt.Println("   client settings cannot specify a port. Every client must be pointed at")
+			fmt.Printf("   this gateway's address and port %d explicitly (or use a client-side\n", ans.dnsPort)
+			fmt.Println("   port-53 redirect). Choose port 53 if clients must use plain DHCP DNS.")
+		}
 		upstreams := append([]string{}, opts.dnsUpstreams...)
 		if len(upstreams) == 0 {
 			upstreams = cfg.Gateway.DNSUpstream
@@ -613,7 +681,7 @@ func collectAnswers(p *prompter, opts *setupOptions, cfg *config.Config) (*answe
 			}
 			ans.enableNow = ok
 		}
-		if !opts.startService {
+		if !ans.startService {
 			ok, err := p.confirm("Start the service at the end and verify the first connection", false)
 			if err != nil {
 				return nil, err
@@ -680,6 +748,11 @@ func printReview(ans *answers, cfg *config.Config) error {
 	fmt.Printf("  group:       %s\n", ans.group)
 	fmt.Printf("  imports:     %d URI(s), %d subscription(s)\n", len(ans.uris), len(ans.subs))
 	fmt.Printf("  verify:      %t\n", ans.startService)
+	if ans.persistService {
+		fmt.Println("  at boot:     enable after the verified start")
+	} else {
+		fmt.Println("  at boot:     not enabled (starting now is not the same as enabling)")
+	}
 	return nil
 }
 
@@ -1050,27 +1123,30 @@ func startAndVerify(cfgPath string, ans *answers) bool {
 	}
 	fmt.Println("✅ Gateway reports CONNECTED")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 	svc, err := app.OpenDefault()
 	if err != nil {
 		fmt.Printf("⚠️  Could not query the gateway: %v\n", err)
 		return false
 	}
-	exit, exitErr := svc.ProbeExitIP(ctx)
-	if exitErr != nil {
-		fmt.Printf("⚠️  The tunnel is connected but its exit address could not be measured: %v\n", exitErr)
+	proof, proofErr := svc.ProbeExitIdentity(ctx)
+	if proofErr != nil {
+		fmt.Printf("⚠️  The tunnel is connected but its exit identity could not be checked: %v\n", proofErr)
 		return false
 	}
-	direct, directErr := app.DirectPublicIP(ctx)
-	fmt.Printf("   tunnel exit: %s\n", exit)
-	if directErr == nil {
-		fmt.Printf("   direct path: %s\n", direct)
-	}
-	if directErr == nil && direct == exit {
-		fmt.Println("⚠️  The tunnel exit equals this host's direct address, so the tunnel is not carrying traffic.")
+	verdict := proof.Verdict()
+	if !verdict.Allowed {
+		fmt.Printf("❌ %s\n", verdict.Detail)
 		fmt.Println("   Gateway mode stays disabled.")
 		return false
+	}
+	if verdict.Verified {
+		fmt.Printf("✅ Exit identity verified: tunnel %s, direct path %s\n",
+			strings.Join(proof.Exits, ", "), strings.Join(proof.Uplink, ", "))
+	} else {
+		fmt.Printf("⚠️  Tunnel connectivity is proven, but the exit identity is UNVERIFIED: %s\n", verdict.Detail)
+		fmt.Println("   The gateway stays usable; verify the exit later with `bypath doctor --egress`.")
 	}
 	if !ans.gatewayMode {
 		fmt.Println("✅ The proxy tier is working. Enable gateway mode when you are ready.")

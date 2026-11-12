@@ -11,9 +11,9 @@
 # setup`, and only when no configuration exists yet.
 #
 # Usage (download and verify the pinned installer first; see INSTALL.md):
-#   sudo ./install.sh --version v3.0.0-rc.1
+#   sudo ./install.sh --version v3.0.0-rc.2
 #   sudo ./install.sh --dry-run
-#   sudo ./install.sh --version v3.0.0-rc.1 --non-interactive --mode proxy
+#   sudo ./install.sh --version v3.0.0-rc.2 --non-interactive --mode proxy
 #   sudo ./install.sh --uninstall            # keep configuration and data
 #   sudo ./install.sh --uninstall --purge    # also remove configuration and data
 #   sudo ./install.sh --rollback             # restore the previous binary
@@ -25,13 +25,14 @@ set -Eeuo pipefail
 
 # ─── Constants ───────────────────────────────────────────────
 REPO="liberoute/bypath"
-DEFAULT_VERSION="v3.0.0-rc.1"
+DEFAULT_VERSION="v3.0.0-rc.2"
 INSTALL_DIR="/opt/bypath"
 BIN_LINK="/usr/local/bin/bypath"
 CONFIG_DIR="/etc/bypath"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 LOG_DIR="/var/log/bypath"
 RUN_DIR="/run/bypath"
+CONTROL_DIR="/run/bypath-control"
 UNIT_FILE="/etc/systemd/system/bypath.service"
 MIN_DISK_MB=100
 MIN_MEM_MB=128
@@ -84,7 +85,7 @@ usage() {
     cat <<'EOF'
 Bypath installer — one pinned release, verified, no network changes.
 
-  --version VERSION        Release tag to install (default v3.0.0-rc.1)
+  --version VERSION        Release tag to install (default v3.0.0-rc.2)
   --dry-run                Report the host and the plan; change nothing
   --non-interactive        Never prompt; pass answers as flags
   --allow-unsupported      Continue on a platform outside the tested matrix
@@ -105,7 +106,14 @@ First-run answers (passed to `bypath setup`):
   --listen-ip ADDR         --dns-port N          --dns-upstream ADDR
   --web off|loopback|lan   --web-port N          --uri URI
   --subscription URL       --group NAME          --select NAME
-  --start-service          --enable-gateway
+  --start-service          start now and verify the first connection
+  --enable-service         also enable the unit at boot (verified start first)
+  --enable-gateway         carry the LAN after a verified start
+
+  Starting, enabling and gateway mode are three different things:
+    --start-service   runs the service until the next reboot
+    --enable-service  also starts it automatically at boot
+    --enable-gateway  routes the LAN through the tunnel (after verification)
 EOF
 }
 
@@ -131,14 +139,14 @@ while [ $# -gt 0 ]; do
         --trusted-cidr|--dns-upstream|--uri|--subscription)
                             [ $# -ge 2 ] || usage_die "$1 needs a value"
                             SETUP_ARGS+=("$1" "$2"); shift 2 ;;
-        --start-service|--enable-gateway)
+        --start-service|--enable-service|--enable-gateway)
                             SETUP_ARGS+=("$1"); shift ;;
         *)                  usage_die "unknown option: $1 (see --help)" ;;
     esac
 done
 
 if [ "$VERSION" = "latest" ]; then
-    usage_die "this installer is pinned to one release; pass an exact tag such as v3.0.0-rc.1"
+    usage_die "this installer is pinned to one release; pass an exact tag such as v3.0.0-rc.2"
 fi
 if ! printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
     usage_die "--version '$VERSION' is not a release tag"
@@ -477,8 +485,12 @@ EOF
     cat <<EOF
 
   The unit exists but is deliberately not enabled or started: installation
-  must not take over this host. After the wizard has a verified connection:
-      sudo systemctl enable --now bypath
+  must not take over this host. Starting, enabling and gateway mode differ:
+      start now:      sudo systemctl start bypath
+      start at boot:  sudo systemctl enable bypath
+      carry the LAN:  gateway mode, enabled only after a verified connection
+  The first-run wizard offers the boot enable after a verified start, or pass
+  --enable-service.
 
 EOF
 }
@@ -547,6 +559,11 @@ do_install() {
     sudo bypath setup        change the first-run answers
     sudo bypath geo status   optional geo databases (none are downloaded)
 
+  Starting, enabling and gateway mode are separate steps:
+    start    runs the service now (wizard --start-service)
+    enable   also starts it at boot (wizard --enable-service)
+    gateway  routes the LAN through the tunnel (wizard --enable-gateway)
+
   This installer changed no interface, route, DNS resolver, DHCP lease or
   global firewall rule.
 EOF
@@ -570,6 +587,7 @@ do_uninstall() {
     if [ "$DRY_RUN" -eq 1 ]; then
         info "would stop and remove the bypath unit, ${INSTALL_DIR} and ${BIN_LINK}"
         if [ "$PURGE" -eq 1 ]; then info "would also remove ${CONFIG_DIR}, ${LOG_DIR} and ${RUN_DIR}"; else info "would keep ${CONFIG_DIR} and ${LOG_DIR}"; fi
+        info "would remove the runtime directories ${RUN_DIR} and ${CONTROL_DIR} (control socket)"
         info "no file was changed"
         return 0
     fi
@@ -585,12 +603,15 @@ do_uninstall() {
     fi
     rm -f "$BIN_LINK"
     rm -rf "$INSTALL_DIR"
-    ok "removed ${INSTALL_DIR} and ${BIN_LINK}"
+    # Runtime state, including the control socket directory, must not outlive
+    # the binary even when the configuration is kept.
+    rm -rf "$RUN_DIR" "$CONTROL_DIR"
+    ok "removed ${INSTALL_DIR}, ${BIN_LINK} and the runtime directories ${RUN_DIR} ${CONTROL_DIR}"
 
     if [ "$PURGE" -eq 1 ]; then
         if confirm "Delete configuration, profiles, geo data and logs? This cannot be undone."; then
-            rm -rf "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR"
-            ok "removed ${CONFIG_DIR}, ${LOG_DIR} and ${RUN_DIR}"
+            rm -rf "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR" "$CONTROL_DIR"
+            ok "removed ${CONFIG_DIR}, ${LOG_DIR}, ${RUN_DIR} and ${CONTROL_DIR}"
         else
             info "configuration preserved"
         fi

@@ -339,6 +339,14 @@ func (gw *Gateway) undoNetworkStateWith(st *gatewayRunState, keepChains, keepFor
 			prune()
 		}
 	}
+	if st.ResolvedDropIn {
+		if err := gw.restoreResolvedDropIn(); err != nil {
+			errs = append(errs, err)
+		} else {
+			st.ResolvedDropIn = false
+			prune()
+		}
+	}
 	if st.ResolvChanged {
 		if err := gw.restoreResolvConf(); err != nil {
 			errs = append(errs, err)

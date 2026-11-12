@@ -75,6 +75,13 @@ func (s *stubService) Status(context.Context) (app.Status, error) { return s.sta
 
 func (s *stubService) ProbeExitIP(context.Context) (string, error) { return s.exitIP, s.exitErr }
 
+func (s *stubService) ProbeExitIdentity(context.Context) (app.ExitProof, error) {
+	if s.exitErr != nil {
+		return app.ExitProof{}, s.exitErr
+	}
+	return app.ExitProof{Exits: []string{s.exitIP}}, nil
+}
+
 func (s *stubService) ListConnections(_ context.Context, f app.ConnectionFilter) ([]app.Connection, error) {
 	s.lastFilter = f
 	if f.Search == "" || f.Group != "" {
