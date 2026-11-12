@@ -50,9 +50,20 @@ settings: those carry only an address. If the wizard selected 5335, every LAN
 client must be pointed at the gateway address **and port 5335** explicitly, or
 the client needs a local port-53 redirect. The gateway's own host resolution is
 handled separately: when `systemd-resolved` is in use, Bypath writes a
-bypath-owned drop-in that forwards the stub resolver to `127.0.0.1:5335` and
-removes it when the gateway stops. On hosts without the resolved stub, host DNS
-is left untouched and the gateway logs that it could not be redirected.
+bypath-owned drop-in under `/run/systemd/resolved.conf.d` that forwards the stub
+resolver to `127.0.0.1:5335`, and removes it when the gateway stops. The
+installed unit also sweeps it in `ExecStartPre` and `ExecStopPost`, so a crash,
+a SIGKILL or a failed start cannot leave the host on a dead listener; a reboot
+clears the `/run` file even after a power loss. The sweep deletes only a file
+whose content is exactly what Bypath wrote, and skips the restart while the
+gateway listener is still answering. If you ever need it by hand:
+
+```bash
+sudo bypath host-dns restore
+```
+
+On hosts without the resolved stub, host DNS is left untouched and the gateway
+logs that it could not be redirected.
 
 ## The wizard refuses gateway mode
 

@@ -45,6 +45,10 @@ func main() {
 		cmdChain(args)
 	case "service-worker":
 		cmdServiceWorker(args)
+	case "host-dns":
+		// Internal: the systemd unit's ExecStartPre/ExecStopPost hook that
+		// restores the host resolver after an abnormal daemon exit.
+		cmdHostDNS(args)
 	case "test-worker":
 		// Internal: started by a daemon that runs inside the gateway network
 		// namespace so an isolated measurement can execute in the host

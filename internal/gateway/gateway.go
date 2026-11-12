@@ -2291,13 +2291,6 @@ func (gw *Gateway) setHostResolver() error {
 	return nil
 }
 
-// resolvedDropInPath is the bypath-owned drop-in. A distinct name keeps it away
-// from administrator snippets, and the managed-by marker makes cleanup refuse
-// to delete a file bypath did not write.
-var resolvedDropInPath = "/etc/systemd/resolved.conf.d/90-bypath.conf"
-
-const resolvedDropInMarker = "# Managed by bypath; removed when the gateway stops."
-
 // resolvedStubInUse reports whether /etc/resolv.conf is the systemd-resolved
 // stub, which is the only case where a drop-in can change host DNS. It is a
 // variable so tests can exercise the drop-in path without a real symlink.
@@ -2327,7 +2320,10 @@ func (gw *Gateway) setResolvedDropIn(port int) error {
 			return err
 		}
 	}
-	content := fmt.Sprintf("%s\n[Resolve]\nDNS=127.0.0.1:%d\nDomains=~.\n", resolvedDropInMarker, port)
+	if err := removeLegacyResolvedDropIn(); err != nil {
+		return err
+	}
+	content := resolvedDropInContent(port)
 	if err := os.MkdirAll(filepath.Dir(resolvedDropInPath), 0755); err != nil {
 		return fmt.Errorf("creating %s: %w", filepath.Dir(resolvedDropInPath), err)
 	}
@@ -2338,30 +2334,6 @@ func (gw *Gateway) setResolvedDropIn(port int) error {
 		return fmt.Errorf("restarting systemd-resolved with the bypath drop-in: %w", err)
 	}
 	log.Printf("🔧 systemd-resolved now forwards host DNS to 127.0.0.1:%d (service left enabled)", port)
-	return nil
-}
-
-// restoreResolvedDropIn removes only a drop-in carrying the bypath marker and
-// restarts the still-enabled resolver so the host returns to its own upstream.
-func (gw *Gateway) restoreResolvedDropIn() error {
-	content, err := os.ReadFile(resolvedDropInPath)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("reading %s before removal: %w", resolvedDropInPath, err)
-	}
-	if err == nil {
-		if !strings.Contains(string(content), resolvedDropInMarker) {
-			return fmt.Errorf("%s was not written by bypath; refusing to remove it", resolvedDropInPath)
-		}
-		if err := os.Remove(resolvedDropInPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("removing %s: %w", resolvedDropInPath, err)
-		}
-	}
-	if out, statErr := commandOutput("systemctl", "is-active", "systemd-resolved"); statErr == nil && strings.TrimSpace(out) == "active" {
-		if err := systemctlRun("restart", "systemd-resolved"); err != nil {
-			return fmt.Errorf("restarting systemd-resolved after removing the bypath drop-in: %w", err)
-		}
-	}
-	log.Printf("🔧 removed %s; host DNS restored", resolvedDropInPath)
 	return nil
 }
 

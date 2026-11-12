@@ -467,7 +467,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# The resolver override lives under /run and these hooks sweep it on every exit
+# and before every start, so a crash, SIGKILL or failed start cannot leave the
+# host pointing at a dead local DNS listener. A non-zero exit is ignored: the
+# hook is a correction, not a condition for running.
+ExecStartPre=-${INSTALL_DIR}/bypath host-dns restore
 ExecStart=${INSTALL_DIR}/bypath run
+ExecStopPost=-${INSTALL_DIR}/bypath host-dns restore
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535

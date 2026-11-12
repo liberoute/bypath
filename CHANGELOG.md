@@ -47,6 +47,21 @@ release (`3518bef`). `main` and the `v3.0.0-rc.1` tag are unchanged.
 - Uninstall and `--purge` remove `/run/bypath-control` along with the runtime
   directory, so no control socket survives.
 
+### Host DNS crash recovery
+
+- The bypath resolver override now lives in `/run/systemd/resolved.conf.d` and
+  is swept by the unit's `ExecStartPre`/`ExecStopPost`
+  (`bypath host-dns restore`). A stop, a failed start, SIGKILL and a supervised
+  restart all return the host to its own upstream; a reboot clears the `/run`
+  file even if the daemon never got to clean up.
+- The hook removes only a file whose content is exactly what bypath writes,
+  never touches an administrator's snippet, and steps aside when the gateway
+  listener is still answering so it cannot race a healthy instance. A legacy
+  drop-in left in `/etc/systemd/resolved.conf.d` by an earlier build is removed
+  as well.
+- `systemd-resolved` is still never disabled; only its upstream is redirected
+  while the gateway runs, and the restart is skipped during shutdown.
+
 ## v3.0.0-rc.1 — pre-release
 
 First public release candidate. Pre-release: not a stable release, not marked
