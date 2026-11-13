@@ -135,10 +135,13 @@ jobs:
           LDFLAGS="$LDFLAGS -X github.com/liberoute/bypath/internal/build.Commit=${{ github.sha }}"
           LDFLAGS="$LDFLAGS -X github.com/liberoute/bypath/internal/build.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-          TAGS=""
-          if [ -n "${{ matrix.tags }}" ]; then TAGS="-tags ${{ matrix.tags }}"; fi
+          # The tag set can contain several space-separated tags; an unquoted
+          # string would hand go one argument per word and treat the rest as
+          # packages. Build the argument list instead.
+          TAGS=()
+          if [ -n "${{ matrix.tags }}" ]; then TAGS=(-tags "${{ matrix.tags }}"); fi
 
-          go build $TAGS -ldflags "$LDFLAGS" -o "dist/${FILENAME}" ./cmd/bypath
+          go build "${TAGS[@]}" -ldflags "$LDFLAGS" -o "dist/${FILENAME}" ./cmd/bypath
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
