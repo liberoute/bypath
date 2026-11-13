@@ -61,19 +61,19 @@ jobs:
       - name: Embed-tag tests
         env:
           BYPATH_REQUIRE_ASSETS: '1'
-        run: go test -tags "full embed_tun2socks" ./internal/embedbin/ ./internal/build/ ./internal/engine/ -count=1
+        run: go test -tags "full with_utls embed_tun2socks" ./internal/embedbin/ ./internal/build/ ./internal/engine/ -count=1
 
       # ARM test binaries cannot run on the x86 runner; compiling them is what
       # proves each architecture selects its own embedded asset.
       - name: Cross-compile embed tests for ARM
         run: |
-          GOOS=linux GOARCH=arm64 go test -c -tags "full embed_tun2socks" -o /dev/null ./internal/embedbin/
-          GOOS=linux GOARCH=arm GOARM=7 go test -c -tags "full embed_tun2socks" -o /dev/null ./internal/embedbin/
+          GOOS=linux GOARCH=arm64 go test -c -tags "full with_utls embed_tun2socks" -o /dev/null ./internal/embedbin/
+          GOOS=linux GOARCH=arm GOARM=7 go test -c -tags "full with_utls embed_tun2socks" -o /dev/null ./internal/embedbin/
 
       # Any target without a staged asset must be rejected at compile time.
       - name: Unsupported target must not compile
         run: |
-          if GOOS=linux GOARCH=386 go build -tags "full embed_tun2socks" -o /dev/null ./cmd/bypath; then
+          if GOOS=linux GOARCH=386 go build -tags "full with_utls embed_tun2socks" -o /dev/null ./cmd/bypath; then
             echo "embed build unexpectedly succeeded on linux/386"
             exit 1
           fi
