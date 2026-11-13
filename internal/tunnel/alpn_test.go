@@ -7,11 +7,11 @@ import (
 	"github.com/liberoute/bypath/internal/profile"
 )
 
-// A WebSocket upgrade is HTTP/1.1. Offering h2 (the value YO subscriptions
-// publish in their links) makes the server negotiate HTTP/2, the upgrade is
-// rejected, and every tunnelled request fails with EOF even though the
-// endpoint resolves and its certificate verifies. This was reproduced live
-// against NL-03: alpn=h2 → EOF, alpn=http/1.1 → HTTP 204.
+// A WebSocket upgrade is HTTP/1.1. Offering h2 (which some providers publish
+// in their links) makes the server negotiate HTTP/2, the upgrade is rejected,
+// and every tunnelled request fails with EOF even though the endpoint resolves
+// and its certificate verifies. Reproduced live: alpn=h2 → EOF,
+// alpn=http/1.1 → HTTP 204.
 func TestALPNForTransportRestrictsWebsocketToHTTP11(t *testing.T) {
 	cases := []struct {
 		name    string
