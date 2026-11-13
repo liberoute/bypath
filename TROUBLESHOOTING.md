@@ -46,9 +46,10 @@ Gateway DNS needs UDP/TCP 53. Common holders are `systemd-resolved`, `dnsmasq`,
 ### Nonstandard DNS port (5335)
 
 A port other than 53 cannot be expressed by DHCP or by ordinary client DNS
-settings: those carry only an address. If the wizard selected 5335, every LAN
-client must be pointed at the gateway address **and port 5335** explicitly, or
-the client needs a local port-53 redirect. The gateway's own host resolution is
+settings: those carry only an address. Clients therefore keep the gateway
+address on port 53. While gateway mode runs, Bypath redirects DNS on port 53
+arriving from the LAN subnet on the gateway interface to its 5335 listener, so
+no client setting has to change. The gateway's own host resolution is
 handled separately: when `systemd-resolved` is in use, Bypath writes a
 bypath-owned drop-in under `/run/systemd/resolved.conf.d` that forwards the stub
 resolver to `127.0.0.1:5335`, and removes it when the gateway stops. The
@@ -120,9 +121,12 @@ chain.
 
 - It is disabled by default. Enable it in configuration or from the setup
   wizard, then restart the service.
-- A loopback panel is only reachable from the host itself. A LAN panel requires
-  `server.web.allow_lan: true` and explicit confirmation; the administrator
-  account is created on the first local visit.
+- A loopback panel is only reachable from the host itself. To use it from
+  another computer without exposing it, tunnel the configured panel port over
+  SSH, for example `ssh -N -L 8081:127.0.0.1:8081 user@gateway-address`, then
+  open `http://127.0.0.1:8081` there (the wizard prints the exact command with
+  your port). A LAN panel requires `server.web.allow_lan: true` and explicit
+  confirmation; the administrator account is created on the first local visit.
 - The panel, the management API and the proxy are three separate listeners with
   separate ports. Changing one does not move the others.
 

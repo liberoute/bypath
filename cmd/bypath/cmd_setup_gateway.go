@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/liberoute/bypath/internal/config"
 )
 
 // gatewayRequirement is one host capability gateway mode cannot start without.
@@ -44,6 +46,22 @@ func defaultSetupHost() setupHost {
 		},
 	}
 }
+
+// setupHostFor withholds command execution from a dry run, so no code path
+// reached by --dry-run can install a package, even with --install-packages.
+func setupHostFor(opts *setupOptions) setupHost {
+	h := defaultSetupHost()
+	if opts.dryRun {
+		h.run = func(_ context.Context, name string, args ...string) error {
+			return fmt.Errorf("dry run: refusing to execute %s %s", name, strings.Join(args, " "))
+		}
+	}
+	return h
+}
+
+// errDryRunPrerequisites marks a dry run whose real counterpart would stop at
+// the prerequisite gate; the preview continues and setup exits non-zero.
+var errDryRunPrerequisites = errors.New("dry run: gateway prerequisites are not met")
 
 func (h setupHost) canRun(bin string) bool {
 	_, err := h.lookPath(bin)
@@ -136,6 +154,22 @@ func ensureGatewayPrerequisites(p *prompter, opts *setupOptions, h setupHost) er
 		fmt.Printf("  ✗ %s\n      fix: %s\n", req.Label, req.Manual)
 	}
 	fmt.Println("  Nothing has been written; an existing configuration is untouched.")
+	pkgs := missingPackages(missing)
+
+	if opts.dryRun {
+		if len(pkgs) > 0 {
+			switch {
+			case !h.canRun("apt-get"):
+				fmt.Printf("  Dry run: a real run would stop here; install `%s` manually (apt-get is not available).\n", strings.Join(pkgs, " "))
+			case opts.installPackages:
+				fmt.Printf("  Dry run: a real run would execute `apt-get update && apt-get install -y %s` (approved by --install-packages).\n", strings.Join(pkgs, " "))
+			default:
+				fmt.Printf("  Dry run: a real run would offer `apt-get install -y %s` and continue only after an explicit yes.\n", strings.Join(pkgs, " "))
+			}
+		}
+		fmt.Println("  Dry run: no package was installed and nothing was executed.")
+		return errDryRunPrerequisites
+	}
 
 	for _, req := range missing {
 		if req.Key == "root" {
@@ -143,7 +177,6 @@ func ensureGatewayPrerequisites(p *prompter, opts *setupOptions, h setupHost) er
 		}
 	}
 
-	pkgs := missingPackages(missing)
 	if len(pkgs) == 0 {
 		return errors.New("the TUN device is missing: run `sudo modprobe tun`, then re-run setup (or use --mode proxy); nothing was changed")
 	}
@@ -420,46 +453,100 @@ func renderAddressWarning(iface, addr, reason string) string {
 		iface, addr, reason)
 }
 
-// clientExample derives a concrete client address from the LAN subnet.
-func clientExample(cidr string) (network, client string) {
+// subnetMask renders the IPv4 mask for a CIDR such as 192.168.1.118/24.
+func subnetMask(cidr string) (mask, prefix string) {
 	_, ipnet, err := net.ParseCIDR(cidr)
 	if err != nil || ipnet.IP.To4() == nil {
-		return "the same LAN subnet", "a free address on the same LAN subnet"
+		return "", ""
 	}
-	ip := make(net.IP, net.IPv4len)
-	copy(ip, ipnet.IP.To4())
-	ip[3] += 50
-	if !ipnet.Contains(ip) {
-		ip = make(net.IP, net.IPv4len)
-		copy(ip, ipnet.IP.To4())
-		ip[3] += 2
-	}
-	return ipnet.String(), ip.String()
+	ones, _ := ipnet.Mask.Size()
+	m := ipnet.Mask
+	return fmt.Sprintf("%d.%d.%d.%d", m[0], m[1], m[2], m[3]), fmt.Sprint(ones)
 }
 
-func cidrPrefix(cidr string) string {
-	if _, prefix, ok := strings.Cut(cidr, "/"); ok && prefix != "" {
-		return prefix
-	}
-	return "24"
+// renderDNSPortNote explains a nonstandard DNS listener in terms a client can
+// act on. Client DNS settings and DHCP carry an address only; the gateway's
+// LAN intercept (setupDNSIntercept) redirects port 53 to the listener, so
+// clients keep the ordinary port.
+func renderDNSPortNote(iface string, dnsPort int) string {
+	return fmt.Sprintf("   Bypath's own DNS listener uses port %d. Clients still use this gateway's\n"+
+		"   address on the ordinary port 53 — client DNS settings and DHCP cannot carry\n"+
+		"   a port, and they do not need to: while gateway mode runs, Bypath redirects\n"+
+		"   DNS on port 53 arriving from the LAN on %s to port %d.\n", dnsPort, iface, dnsPort)
 }
 
-// renderLANClientGuidance is the concrete recipe printed after activation.
+// renderLANClientGuidance is the recipe printed after activation. It never
+// proposes a client address: Bypath cannot see the router's DHCP pool or the
+// other devices, so only the administrator can confirm an address is free.
 func renderLANClientGuidance(ans *answers) string {
-	network, client := clientExample(ans.ifaceCIDR)
-	var b strings.Builder
-	b.WriteString("\nPoint one LAN client at this gateway\n")
-	fmt.Fprintf(&b, "  Client address:  %s (any free address in %s)\n", client, network)
-	fmt.Fprintf(&b, "  Default gateway: %s\n", ans.ifaceAddr)
-	if ans.dnsPort == 53 {
-		fmt.Fprintf(&b, "  DNS server:      %s\n", ans.ifaceAddr)
-	} else {
-		fmt.Fprintf(&b, "  DNS server:      %s, port %d (set the port explicitly; DHCP cannot carry one)\n", ans.ifaceAddr, ans.dnsPort)
+	mask, prefix := subnetMask(ans.ifaceCIDR)
+	maskLine, linuxPrefix := "the same subnet mask the client has now", "<prefix>"
+	if mask != "" {
+		maskLine, linuxPrefix = fmt.Sprintf("%s (/%s)", mask, prefix), prefix
 	}
-	b.WriteString("  Windows: adapter IPv4 properties → Use the following IP address; enter the client address, gateway and DNS above.\n")
-	b.WriteString("  macOS:   System Settings → Network → Details → TCP/IP → Manual; enter the same values.\n")
-	fmt.Fprintf(&b, "  Linux:   nmcli con mod \"<connection>\" ipv4.method manual ipv4.addresses %s/%s ipv4.gateway %s ipv4.dns %s\n",
-		client, cidrPrefix(ans.ifaceCIDR), ans.ifaceAddr, ans.ifaceAddr)
-	b.WriteString("  Then verify from the client: reach the gateway, open a site, and check `bypath status` on this host.\n")
+	var b strings.Builder
+	b.WriteString("\nPoint one LAN client at this gateway (every other device keeps using the router)\n")
+	b.WriteString("  1. On the client, note the IPv4 address it has now\n")
+	b.WriteString("     (Windows: ipconfig · macOS: ipconfig getifaddr en0 · Linux: ip -4 addr).\n")
+	b.WriteString("  2. In the router, reserve that address for this client (DHCP reservation), so\n")
+	b.WriteString("     no other device can receive it. Or use an address you have confirmed is\n")
+	b.WriteString("     unused and outside the router's DHCP pool. Bypath cannot check this for you.\n")
+	b.WriteString("  3. Set the client's IPv4 configuration to manual with that address and:\n")
+	fmt.Fprintf(&b, "       Subnet mask:     %s\n", maskLine)
+	fmt.Fprintf(&b, "       Default gateway: %s\n", ans.ifaceAddr)
+	fmt.Fprintf(&b, "       DNS server:      %s\n", ans.ifaceAddr)
+	if ans.dnsPort != 53 {
+		b.WriteString(renderDNSPortNote(ans.iface, ans.dnsPort))
+	}
+	b.WriteString("     Windows: Settings → Network → adapter → IP assignment → Edit → Manual, IPv4.\n")
+	b.WriteString("     macOS:   System Settings → Network → Details → TCP/IP → Manually; DNS tab.\n")
+	fmt.Fprintf(&b, "     Linux:   nmcli con mod \"<connection>\" ipv4.method manual ipv4.addresses <reserved-address>/%s ipv4.gateway %s ipv4.dns %s\n",
+		linuxPrefix, ans.ifaceAddr, ans.ifaceAddr)
+	b.WriteString("  4. Verify from the client: open a site, then run `bypath status` on this host.\n")
+	b.WriteString("  If the router also hands out IPv6, the client can reach IPv6 sites directly,\n")
+	b.WriteString("  outside this gateway; turn IPv6 off on that client for a strict test.\n")
+	b.WriteString("  Undo: switch the client back to automatic (DHCP).\n")
 	return b.String()
+}
+
+// renderPanelAccess explains how to reach a loopback-only panel from another
+// computer without exposing it to the LAN. user and host fill the ssh command;
+// placeholders are used when they are unknown.
+func renderPanelAccess(cfg *config.Config, user, host string) string {
+	web := cfg.Server.Web
+	if !web.Enabled || !config.IsLoopbackHost(web.Listen) {
+		return ""
+	}
+	if user == "" {
+		user = "<user>"
+	}
+	if host == "" {
+		host = "<this-host-address>"
+	}
+	target := web.Listen
+	if strings.Contains(target, ":") {
+		target = "[" + target + "]"
+	}
+	port := web.Port
+	codePath := filepath.Join(filepath.Dir(cfg.Profiles.Directory), "web", "setup-code")
+	var b strings.Builder
+	b.WriteString("\nWeb panel (loopback only; it is not reachable from the LAN)\n")
+	fmt.Fprintf(&b, "  On this host:  http://%s:%d\n", target, port)
+	b.WriteString("  From another computer, tunnel it over SSH instead of exposing it:\n")
+	fmt.Fprintf(&b, "    ssh -N -L %d:%s:%d %s@%s\n", port, target, port, user, host)
+	fmt.Fprintf(&b, "    then open http://127.0.0.1:%d on that computer (keep ssh running).\n", port)
+	fmt.Fprintf(&b, "  First visit, no administrator yet: the one-time setup code is\n    `sudo cat %s` on this host.\n", codePath)
+	return b.String()
+}
+
+// panelSSHUser is the account an operator most likely logs in with: the one
+// that invoked sudo, not root.
+func panelSSHUser() string {
+	if u := strings.TrimSpace(os.Getenv("SUDO_USER")); u != "" && u != "root" {
+		return u
+	}
+	if u := strings.TrimSpace(os.Getenv("USER")); u != "" && u != "root" {
+		return u
+	}
+	return ""
 }

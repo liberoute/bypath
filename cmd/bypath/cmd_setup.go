@@ -87,6 +87,9 @@ type answers struct {
 	// the review and the final client recipe repeat the DHCP warning.
 	addressMayChange bool
 	addressReason    string
+	// prerequisitesUnmet is set only by a dry run, which previews past the
+	// prerequisite gate that a real run would stop at.
+	prerequisitesUnmet bool
 	// deferActivation keeps gateway.enabled false at write time when a systemd
 	// unit exists: startAndVerify turns it on only after the connection works.
 	deferActivation bool
@@ -145,7 +148,11 @@ func cmdSetup(args []string) {
 	if opts.dryRun {
 		fmt.Println("--- configuration that would be written (api_token redacted) ---")
 		fmt.Print(redactConfigYAML(string(data)))
-		fmt.Println("--- dry run: nothing was written, imported or started ---")
+		fmt.Println("--- dry run: nothing was written, installed, imported or started ---")
+		if ans.prerequisitesUnmet {
+			fmt.Println("❌ A real run would stop at the gateway prerequisites listed above.")
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -436,7 +443,9 @@ func collectAnswers(p *prompter, opts *setupOptions, cfg *config.Config) (*answe
 
 	lans := discoverLANs()
 	if ans.gatewayMode {
-		if err := ensureGatewayPrerequisites(p, opts, defaultSetupHost()); err != nil {
+		if err := ensureGatewayPrerequisites(p, opts, setupHostFor(opts)); errors.Is(err, errDryRunPrerequisites) {
+			ans.prerequisitesUnmet = true
+		} else if err != nil {
 			return nil, err
 		}
 		if opts.iface == "" {
@@ -601,7 +610,7 @@ func collectAnswers(p *prompter, opts *setupOptions, cfg *config.Config) (*answe
 			fmt.Printf("⚠️  Port %d is already in use: %s\n", ans.dnsPort, strings.Join(busy, ", "))
 			fmt.Println("   Bypath never stops systemd-resolved, dnsmasq or another resolver.")
 			idx, err := p.choice("DNS port", []string{
-				"use 5335 — the gateway answers DNS on 5335; point clients at it explicitly",
+				"use 5335 — Bypath listens on 5335; LAN clients keep using port 53, which the gateway redirects to it",
 				"keep " + fmt.Sprint(ans.dnsPort) + " — I will free the port myself and rerun",
 				"cancel setup",
 			}, 0)
@@ -617,14 +626,11 @@ func collectAnswers(p *prompter, opts *setupOptions, cfg *config.Config) (*answe
 				return nil, fmt.Errorf("setup cancelled")
 			}
 		}
-		// A DNS port other than 53 cannot be expressed by DHCP or by ordinary
-		// client DNS settings: those carry an address, not a port. Say that
-		// before anything is activated instead of surprising the operator later.
+		// Client DNS settings and DHCP carry an address, never a port. Explain
+		// how clients still reach a nonstandard listener before activation.
 		if ans.dnsPort != 53 {
-			fmt.Printf("⚠️  DNS runs on port %d, which is nonstandard: standard DHCP and DNS\n", ans.dnsPort)
-			fmt.Println("   client settings cannot specify a port. Every client must be pointed at")
-			fmt.Printf("   this gateway's address and port %d explicitly (or use a client-side\n", ans.dnsPort)
-			fmt.Println("   port-53 redirect). Choose port 53 if clients must use plain DHCP DNS.")
+			fmt.Printf("ℹ️  DNS port %d is nonstandard.\n", ans.dnsPort)
+			fmt.Print(renderDNSPortNote(ans.iface, ans.dnsPort))
 		}
 		upstreams := append([]string{}, opts.dnsUpstreams...)
 		if len(upstreams) == 0 {
@@ -1077,6 +1083,13 @@ func reportPlan(cfg *config.Config, ans *answers, cfgPath string) {
 	}
 	if cfg.Server.Web.Enabled {
 		fmt.Printf("  panel:   %s:%d\n", cfg.Server.Web.Listen, cfg.Server.Web.Port)
+		host := ans.ifaceAddr
+		if host == "" {
+			if lans := discoverLANs(); len(lans) == 1 {
+				host = lans[0].Addr
+			}
+		}
+		fmt.Print(renderPanelAccess(cfg, panelSSHUser(), host))
 	}
 }
 

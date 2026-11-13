@@ -7,6 +7,8 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -321,17 +323,173 @@ func TestRenderAddressWarningMentionsReservation(t *testing.T) {
 func TestRenderLANClientGuidanceUsesGatewayAndDNS(t *testing.T) {
 	ans := &answers{iface: "eth0", ifaceAddr: "192.168.1.118", ifaceCIDR: "192.168.1.118/24", dnsPort: 53}
 	msg := renderLANClientGuidance(ans)
-	for _, want := range []string{"Default gateway: 192.168.1.118", "DNS server:      192.168.1.118", "192.168.1.50", "nmcli"} {
+	for _, want := range []string{
+		"Default gateway: 192.168.1.118",
+		"DNS server:      192.168.1.118\n",
+		"255.255.255.0 (/24)",
+		"DHCP reservation",
+		"Bypath cannot check this for you",
+		"ipv4.addresses <reserved-address>/24 ipv4.gateway 192.168.1.118 ipv4.dns 192.168.1.118",
+		"back to automatic (DHCP)",
+	} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("guidance missing %q:\n%s", want, msg)
 		}
 	}
+}
 
-	ans.dnsPort = 5335
-	msg = renderLANClientGuidance(ans)
-	if !strings.Contains(msg, "port 5335") {
-		t.Fatalf("nonstandard DNS port must be explicit:\n%s", msg)
+// TestRenderLANClientGuidanceNeverInventsAnAddress pins that the only IPv4
+// literals in the recipe are the gateway itself and the subnet mask: Bypath
+// cannot know which client addresses are free.
+func TestRenderLANClientGuidanceNeverInventsAnAddress(t *testing.T) {
+	ipv4 := regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}\b`)
+	for _, tc := range []struct{ addr, cidr, mask string }{
+		{"192.168.1.118", "192.168.1.118/24", "255.255.255.0"},
+		{"10.20.0.1", "10.20.0.1/16", "255.255.0.0"},
+		{"172.16.5.2", "172.16.5.2/28", "255.255.255.240"},
+		{"192.168.50.1", "bogus", ""},
+	} {
+		msg := renderLANClientGuidance(&answers{iface: "eth0", ifaceAddr: tc.addr, ifaceCIDR: tc.cidr, dnsPort: 53})
+		for _, lit := range ipv4.FindAllString(msg, -1) {
+			if lit != tc.addr && lit != tc.mask {
+				t.Fatalf("%s: guidance suggests address %s that nobody confirmed is free:\n%s", tc.cidr, lit, msg)
+			}
+		}
 	}
+}
+
+func TestRenderLANClientGuidanceNonstandardDNSPort(t *testing.T) {
+	ans := &answers{iface: "eth0", ifaceAddr: "192.168.1.118", ifaceCIDR: "192.168.1.118/24", dnsPort: 5335}
+	msg := renderLANClientGuidance(ans)
+	if !strings.Contains(msg, "DNS server:      192.168.1.118\n") {
+		t.Fatalf("the client DNS setting must be the bare address:\n%s", msg)
+	}
+	for _, bad := range []string{"192.168.1.118:5335", ", port 5335", "set the port explicitly"} {
+		if strings.Contains(msg, bad) {
+			t.Fatalf("guidance implies a client DNS setting can carry a port (%q):\n%s", bad, msg)
+		}
+	}
+	for _, want := range []string{"ordinary port 53", "cannot carry", "redirects", "on eth0 to port 5335"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("nonstandard-port explanation missing %q:\n%s", want, msg)
+		}
+	}
+}
+
+func TestRenderPanelAccessUsesConfiguredPort(t *testing.T) {
+	cfg, err := config.Parse(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Server.Web.Enabled = true
+	cfg.Server.Web.Listen = "127.0.0.1"
+	cfg.Server.Web.Port = 9443
+	msg := renderPanelAccess(cfg, "dietpi", "192.168.1.118")
+	codePath := filepath.Join(filepath.Dir(cfg.Profiles.Directory), "web", "setup-code")
+	for _, want := range []string{
+		"loopback only",
+		"http://127.0.0.1:9443",
+		"ssh -N -L 9443:127.0.0.1:9443 dietpi@192.168.1.118",
+		"open http://127.0.0.1:9443 on that computer",
+		"sudo cat " + codePath,
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("panel guidance missing %q:\n%s", want, msg)
+		}
+	}
+	if cfg.Server.Web.AllowLAN || cfg.Server.Web.Listen != "127.0.0.1" {
+		t.Fatalf("rendering guidance must not widen the panel listener: %+v", cfg.Server.Web)
+	}
+
+	if msg := renderPanelAccess(cfg, "", ""); !strings.Contains(msg, "<user>@<this-host-address>") {
+		t.Fatalf("unknown user/host must be placeholders, not guesses:\n%s", msg)
+	}
+
+	cfg.Server.Web.Listen = "::1"
+	if msg := renderPanelAccess(cfg, "u", "h"); !strings.Contains(msg, "-L 9443:[::1]:9443") {
+		t.Fatalf("IPv6 loopback must be bracketed for ssh -L:\n%s", msg)
+	}
+
+	cfg.Server.Web.Listen = "192.168.1.118"
+	if msg := renderPanelAccess(cfg, "u", "h"); msg != "" {
+		t.Fatalf("a LAN panel needs no tunnel recipe, got:\n%s", msg)
+	}
+	cfg.Server.Web.Listen = "127.0.0.1"
+	cfg.Server.Web.Enabled = false
+	if msg := renderPanelAccess(cfg, "u", "h"); msg != "" {
+		t.Fatalf("a disabled panel needs no tunnel recipe, got:\n%s", msg)
+	}
+}
+
+func TestGatewayPrerequisitesDryRunNeverInstalls(t *testing.T) {
+	cases := []struct {
+		name string
+		opts setupOptions
+		in   string
+		tty  bool
+		want string
+	}{
+		{"approved by flag", setupOptions{dryRun: true, installPackages: true, nonInteractive: true}, "", false, "a real run would execute `apt-get update && apt-get install -y iptables`"},
+		{"interactive yes is never asked", setupOptions{dryRun: true}, "y\n", true, "a real run would offer `apt-get install -y iptables`"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeSetupHost()
+			f.bins = map[string]bool{"ip": true, "apt-get": true}
+			var out bytes.Buffer
+			p := &prompter{in: bufio.NewReader(strings.NewReader(tc.in)), tty: tc.tty, out: &out}
+			stdout := captureStdout(t, func() {
+				if err := ensureGatewayPrerequisites(p, &tc.opts, f.host()); !errors.Is(err, errDryRunPrerequisites) {
+					t.Fatalf("err = %v, want the dry-run marker", err)
+				}
+			})
+			if len(f.runs) != 0 || len(f.installed) != 0 {
+				t.Fatalf("dry run executed commands: %v", f.runs)
+			}
+			if out.Len() != 0 {
+				t.Fatalf("dry run prompted: %q", out.String())
+			}
+			if !strings.Contains(stdout, tc.want) || !strings.Contains(stdout, "no package was installed") {
+				t.Fatalf("dry-run report missing %q:\n%s", tc.want, stdout)
+			}
+		})
+	}
+
+	f := newFakeSetupHost()
+	f.euid = 1000
+	f.bins = map[string]bool{"apt-get": true}
+	err := ensureGatewayPrerequisites(promptWith(""), &setupOptions{dryRun: true, installPackages: true}, f.host())
+	if !errors.Is(err, errDryRunPrerequisites) || len(f.runs) != 0 {
+		t.Fatalf("non-root dry run must preview, not fail or run: err=%v runs=%v", err, f.runs)
+	}
+}
+
+func TestSetupHostForDryRunRefusesExecution(t *testing.T) {
+	h := setupHostFor(&setupOptions{dryRun: true, installPackages: true})
+	err := h.run(context.Background(), "apt-get", "install", "-y", "iptables")
+	if err == nil || !strings.Contains(err.Error(), "dry run: refusing to execute apt-get install -y iptables") {
+		t.Fatalf("dry-run host must refuse execution, got %v", err)
+	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stdout
+	os.Stdout = w
+	done := make(chan string)
+	go func() {
+		data, _ := io.ReadAll(r)
+		done <- string(data)
+	}()
+	defer func() { os.Stdout = orig }()
+	fn()
+	w.Close()
+	os.Stdout = orig
+	return <-done
 }
 
 func TestGatewayModeKeepsSOCKSOnLoopback(t *testing.T) {

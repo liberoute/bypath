@@ -15,7 +15,7 @@ expect_contains() { # label, needle, command...
     shift 2
     local output
     output="$("$@" 2>&1)"
-    if printf '%s' "$output" | grep -qF "$needle"; then
+    if printf '%s' "$output" | grep -qF -- "$needle"; then
         pass "$label"
     else
         fail "$label" "'$needle' not found in: $(printf '%s' "$output" | head -n 3 | tr '\n' ' ')"
@@ -63,6 +63,56 @@ if /opt/bypath/bypath-full status >/tmp/status.log 2>&1; then
 else
     pass "status without a daemon reports failure instead of pretending"
 fi
+
+echo "== setup --dry-run never installs packages =="
+# A recording apt-get: any invocation leaves a trace, so its absence proves the
+# dry run executed nothing even with package installation approved.
+cat >/usr/local/bin/apt-get <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>/tmp/apt-calls
+exit 0
+EOF
+chmod 0755 /usr/local/bin/apt-get
+rm -f /tmp/apt-calls
+DRY=/tmp/bypath-dry/config.yaml
+mkdir -p /tmp/bypath-dry
+/opt/bypath/bypath-full setup --non-interactive --dry-run --install-packages --config "$DRY" \
+    --mode gateway --interface eth0 >/tmp/dry.log 2>&1
+rc=$?
+if [ -e /tmp/apt-calls ]; then
+    fail "dry run with --install-packages runs no apt-get" "$(tr '\n' ' ' </tmp/apt-calls)"
+else
+    pass "dry run with --install-packages runs no apt-get"
+fi
+if [ -e "$DRY" ]; then fail "dry run writes no configuration" "$DRY exists"; else pass "dry run writes no configuration"; fi
+if [ "$rc" -ne 0 ] && grep -qF "a real run would execute" /tmp/dry.log; then
+    pass "dry run previews the approved install and exits non-zero"
+else
+    fail "dry run previews the approved install and exits non-zero" "rc=$rc $(tr '\n' ' ' </tmp/dry.log | cut -c1-300)"
+fi
+# With a connection the preview runs to the end and still refuses to claim success.
+/opt/bypath/bypath-full setup --non-interactive --dry-run --install-packages --config "$DRY" \
+    --mode gateway --interface eth0 --uri "socks5://192.0.2.10:1080#doc" >/tmp/dry.log 2>&1
+rc=$?
+if [ "$rc" -ne 0 ] && grep -qF "real run would stop at the gateway prerequisites" /tmp/dry.log \
+        && grep -qF "nothing was written, installed, imported or started" /tmp/dry.log \
+        && [ ! -e /tmp/apt-calls ] && [ ! -e "$DRY" ]; then
+    pass "full dry-run preview ends with the prerequisite verdict and changes nothing"
+else
+    fail "full dry-run preview ends with the prerequisite verdict and changes nothing" "rc=$rc $(tail -n 3 /tmp/dry.log | tr '\n' ' ')"
+fi
+/opt/bypath/bypath-full setup --non-interactive --install-packages --config "$DRY" \
+    --mode gateway --interface eth0 >/tmp/real.log 2>&1
+if grep -qF "install -y" /tmp/apt-calls 2>/dev/null; then
+    pass "control: the same command without --dry-run does reach apt-get"
+else
+    fail "control: the same command without --dry-run does reach apt-get" "$(tail -n 3 /tmp/real.log | tr '\n' ' ')"
+fi
+if [ -e "$DRY" ]; then fail "unsatisfied prerequisites write no configuration" "$DRY exists"; else pass "unsatisfied prerequisites write no configuration"; fi
+rm -f /usr/local/bin/apt-get /tmp/apt-calls
+
+# Installer checks replace /opt/bypath/bypath, so they run last.
+. /installer-tests.sh
 
 echo
 echo "passed: $PASS  failed: $FAIL"

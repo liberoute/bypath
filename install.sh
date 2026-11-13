@@ -14,6 +14,8 @@
 #   sudo ./install.sh --version v3.0.0-rc.2
 #   sudo ./install.sh --dry-run
 #   sudo ./install.sh --version v3.0.0-rc.2 --non-interactive --mode proxy
+#   sudo ./install.sh --version v3.0.0-rc.2 --non-interactive --mode gateway \
+#        --interface eth0 --install-packages   # approve apt for gateway packages
 #   sudo ./install.sh --uninstall            # keep configuration and data
 #   sudo ./install.sh --uninstall --purge    # also remove configuration and data
 #   sudo ./install.sh --rollback             # restore the previous binary
@@ -44,6 +46,7 @@ ALLOW_UNSUPPORTED=0
 NO_SYSTEMD=0
 NO_SETUP=0
 ASSUME_YES=0
+INSTALL_PACKAGES=0
 LOCAL_BINARY=""
 LOCAL_SHA256=""
 PROXY_URL=""
@@ -109,6 +112,8 @@ First-run answers (passed to `bypath setup`):
   --start-service          start now and verify the first connection
   --enable-service         also enable the unit at boot (verified start first)
   --enable-gateway         carry the LAN after a verified start
+  --install-packages       let the wizard apt-get install missing gateway
+                           packages (iproute2, iptables); never implied
 
   Starting, enabling and gateway mode are three different things:
     --start-service   runs the service until the next reboot
@@ -141,9 +146,14 @@ while [ $# -gt 0 ]; do
                             SETUP_ARGS+=("$1" "$2"); shift 2 ;;
         --start-service|--enable-service|--enable-gateway)
                             SETUP_ARGS+=("$1"); shift ;;
+        --install-packages) INSTALL_PACKAGES=1; SETUP_ARGS+=("$1"); shift ;;
         *)                  usage_die "unknown option: $1 (see --help)" ;;
     esac
 done
+
+if [ "$INSTALL_PACKAGES" -eq 1 ] && [ "$NO_SETUP" -eq 1 ]; then
+    usage_die "--install-packages approves package installation inside the first-run wizard; it has no effect with --no-setup"
+fi
 
 if [ "$VERSION" = "latest" ]; then
     usage_die "this installer is pinned to one release; pass an exact tag such as v3.0.0-rc.2"
@@ -207,6 +217,28 @@ port_in_use() { # $1 = port, $2 = t|u
 }
 
 service_active() { have systemctl && systemctl is-active --quiet "$1" 2>/dev/null; }
+
+# Packages that gateway mode needs and apt can provide. TUN is a kernel module,
+# so it is reported but never part of the package list.
+gateway_missing_packages() {
+    local pkgs=""
+    have ip || pkgs="iproute2"
+    if ! have iptables || ! have ip6tables; then pkgs="${pkgs:+$pkgs }iptables"; fi
+    printf '%s' "$pkgs"
+}
+
+gateway_prereq_summary() {
+    local pkgs tun_note=""
+    pkgs="$(gateway_missing_packages)"
+    [ -c /dev/net/tun ] || tun_note="; TUN missing (sudo modprobe tun)"
+    if [ -z "$pkgs" ] && [ -z "$tun_note" ]; then
+        printf 'prerequisites present (ip, iptables, ip6tables, TUN)'
+    elif [ -z "$pkgs" ]; then
+        printf 'packages present%s' "$tun_note"
+    else
+        printf 'missing %s (sudo apt install %s, or --install-packages)%s' "$pkgs" "$pkgs" "$tun_note"
+    fi
+}
 
 # ─── Preflight ───────────────────────────────────────────────
 OS_ID=""; OS_LIKE=""; OS_NAME=""; OS_VERSION=""; ARCH=""; ARCH_RAW=""
@@ -298,6 +330,7 @@ report_host() {
     if [ "$IPTABLES" -eq 1 ]; then fw="iptables "; fi
     if [ "$NFTABLES" -eq 1 ]; then fw+="nft "; fi
     printf '  Firewall:  %s\n' "${fw:-none detected}"
+    printf '  Gateway:   %s\n' "$(gateway_prereq_summary)"
     printf '  DNS:       %s\n' "${DNS_SERVICES:-no known resolver service active}"
     printf '  Existing:  %s\n' "$([ "$EXISTING" = 1 ] && echo "${EXISTING_VERSION:-installed}" || echo none)"
     if [ -n "$PORT_NOTES" ]; then
@@ -524,7 +557,9 @@ run_setup() {
         # Piped installers have a script on stdin; the wizard needs the terminal.
         "${cmd[@]}" </dev/tty || rc=$?
     else
-        if [ "$NONINTERACTIVE" -eq 0 ]; then cmd+=(--non-interactive); fi
+        # --non-interactive, or no terminal to prompt on: the wizard must not
+        # prompt either way.
+        cmd+=(--non-interactive)
         "${cmd[@]}" || rc=$?
     fi
     if [ "$rc" -ne 0 ]; then
@@ -543,7 +578,27 @@ do_install() {
         info "would install ${VERSION} (${ASSET:-bypath-linux-${ARCH}}) to ${INSTALL_DIR}"
         info "$unit_note"
         info "would leave existing configuration at ${CONFIG_FILE} untouched"
-        info "no file was written and no service was changed"
+        if [ "$NO_SETUP" -eq 0 ] && [ "${#SETUP_ARGS[@]}" -gt 0 ]; then
+            # Connection URIs and subscription URLs can embed credentials.
+            local -a shown=()
+            local arg redact_next=0
+            for arg in "${SETUP_ARGS[@]}"; do
+                if [ "$redact_next" -eq 1 ]; then shown+=("<redacted>"); redact_next=0; continue; fi
+                case "$arg" in --uri|--subscription) redact_next=1 ;; esac
+                shown+=("$arg")
+            done
+            info "would run: ${INSTALL_DIR}/bypath setup ${shown[*]}"
+        fi
+        if [ "$INSTALL_PACKAGES" -eq 1 ]; then
+            local pkgs
+            pkgs="$(gateway_missing_packages)"
+            if [ -n "$pkgs" ]; then
+                info "--install-packages: the gateway wizard may run 'apt-get install -y ${pkgs}'; nothing is installed in a dry run"
+            else
+                info "--install-packages: no gateway package is missing; nothing would be installed"
+            fi
+        fi
+        info "no file was written, no package was installed and no service was changed"
         return 0
     fi
     need_root

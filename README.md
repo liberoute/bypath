@@ -75,6 +75,7 @@ Useful installer options:
 | `--web off\|loopback\|lan`, `--web-port` | Management panel listener. |
 | `--uri`, `--subscription`, `--group`, `--select` | Import and select a connection during setup. |
 | `--start-service`, `--enable-gateway` | Explicitly start the unit / enable gateway mode after review. |
+| `--install-packages` | Let the wizard `apt-get install` missing gateway packages (iproute2, iptables). Never implied; nothing is installed without it or an explicit yes. |
 | `--uninstall`, `--purge`, `--rollback` | Remove (keep data), remove everything, or restore the previous binary. |
 
 See [INSTALL.md](INSTALL.md) for the full procedure, the non-interactive form

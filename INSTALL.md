@@ -112,6 +112,7 @@ sudo ./install.sh --version "$VERSION" --non-interactive \
 | `--start-service` | Absent: the unit is left stopped. |
 | `--enable-service` | Absent: the unit is not enabled at boot, even after a verified start. |
 | `--enable-gateway` | Absent: gateway mode stays staged and disabled. |
+| `--install-packages` | Absent: missing gateway packages (iproute2, iptables) are reported with the `sudo apt install` command and setup stops; nothing is installed. Never applied by `--dry-run`. |
 
 The wizard still prints the review block. In non-interactive mode it does not
 wait for confirmation.
@@ -165,11 +166,12 @@ boot persistence later: `sudo systemctl disable bypath`.
 ### DNS port note
 
 The gateway DNS listener defaults to port 53. If another resolver already holds
-port 53, the wizard can use 5335 instead. Standard DHCP and ordinary DNS client
-settings cannot express a port, so with 5335 every client must be pointed at the
-gateway's address **and port** explicitly (or use a client-side port-53
-redirect). The wizard prints this warning whenever a nonstandard port is
-chosen.
+port 53, the wizard can use 5335 instead. Clients still use the gateway's
+address on the ordinary port 53: DHCP and client DNS settings cannot express a
+port, and they do not need to. While gateway mode runs, Bypath redirects DNS on
+port 53 that arrives from the LAN subnet on the gateway interface to its own
+listener, so a client never has to know about 5335. The wizard explains this
+whenever a nonstandard port is chosen.
 
 ## Upgrade
 
@@ -259,9 +261,12 @@ at `sudo bypath setup`. Nothing was started.
   installs an unverified binary.
 - A missing TUN device does not block a proxy-only install, but gateway mode
   will not work and the wizard says so before it asks you to proceed.
-- Gateway mode additionally requires `iptables` and `ip6tables`. The wizard
-  refuses a gateway configuration when either is missing, because it will not
-  start a gateway whose routing and fail-closed rules it cannot enforce.
+- Gateway mode additionally requires root, `iproute2`, `iptables` and
+  `ip6tables`. The wizard checks them before writing anything and refuses a
+  gateway configuration while one is missing, because it will not start a
+  gateway whose routing and fail-closed rules it cannot enforce. On
+  Debian/DietPi it offers `apt-get install` only after an explicit yes (or
+  `--install-packages`); a normal account using `sudo` is supported.
 - Gateway mode manages `/etc/resolv.conf` and refuses if that file is a bind
   mount (the usual case inside a container). Install Bypath on the LAN host
   itself, or use proxy-only mode in a container.

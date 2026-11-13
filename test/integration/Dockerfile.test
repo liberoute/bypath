@@ -24,6 +24,8 @@ RUN apk add --no-cache bash ca-certificates
 COPY --from=build /out/bypath-lite /opt/bypath/bypath
 COPY --from=build /out/bypath-full /opt/bypath/bypath-full
 COPY test/integration/run-tests.sh /run-tests.sh
+COPY test/integration/installer-tests.sh /installer-tests.sh
+COPY install.sh /install.sh
 RUN chmod +x /run-tests.sh
 
 # No configuration, no profiles, no geo data: a genuinely clean host.
