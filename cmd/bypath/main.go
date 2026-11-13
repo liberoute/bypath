@@ -130,6 +130,7 @@ Commands:
   setup                   First-run configuration wizard
     --non-interactive     Take every answer from flags (see 'bypath setup --help')
     --dry-run             Show the resulting configuration without writing it
+    --install-packages    Approve apt installation of missing gateway packages
 
   doctor                  Read-only installation and safety report
     --json                Structured output for automation

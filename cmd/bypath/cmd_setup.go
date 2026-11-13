@@ -47,9 +47,10 @@ type setupOptions struct {
 	group         string
 	selectName    string
 
-	startService  bool
-	enableService bool
-	enableGateway bool
+	startService    bool
+	enableService   bool
+	enableGateway   bool
+	installPackages bool
 }
 
 type multiFlag []string
@@ -61,27 +62,31 @@ func (m *multiFlag) Set(v string) error {
 }
 
 type answers struct {
-	gatewayMode  bool
-	enableNow    bool
-	iface        string
-	ifaceAddr    string
-	ifaceCIDR    string
-	listenAddr   string
-	allowLAN     bool
-	trusted      []string
-	socksPort    int
-	dnsPort      int
-	upstreams    []string
-	webEnabled   bool
-	webListen    string
-	webAllowLAN  bool
-	webPort      int
-	group        string
-	selectName   string
+	gatewayMode    bool
+	enableNow      bool
+	iface          string
+	ifaceAddr      string
+	ifaceCIDR      string
+	listenAddr     string
+	allowLAN       bool
+	trusted        []string
+	socksPort      int
+	dnsPort        int
+	upstreams      []string
+	webEnabled     bool
+	webListen      string
+	webAllowLAN    bool
+	webPort        int
+	group          string
+	selectName     string
 	uris           []string
 	subs           []string
 	startService   bool
 	persistService bool
+	// addressMayChange records that the LAN address is not proven static, so
+	// the review and the final client recipe repeat the DHCP warning.
+	addressMayChange bool
+	addressReason    string
 	// deferActivation keeps gateway.enabled false at write time when a systemd
 	// unit exists: startAndVerify turns it on only after the connection works.
 	deferActivation bool
@@ -265,6 +270,7 @@ func parseSetupFlags(args []string) (*setupOptions, error) {
 	fs.BoolVar(&opts.startService, "start-service", false, "start/restart the systemd unit now and verify the first connection (does not enable it at boot)")
 	fs.BoolVar(&opts.enableService, "enable-service", false, "after a verified start, enable the unit at boot (implies --start-service; does not enable gateway mode)")
 	fs.BoolVar(&opts.enableGateway, "enable-gateway", false, "write gateway.enabled: true after you verified a connection yourself (does not start or enable the unit)")
+	fs.BoolVar(&opts.installPackages, "install-packages", false, "approve apt-get installation of missing gateway prerequisites (never implied; nothing is installed without it)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -355,6 +361,22 @@ func printEnvironment(cfgPath string, exists bool) {
 	} else {
 		fmt.Println("  TUN:      not available (gateway mode will not work; proxy-only still will)")
 	}
+	var missingTools []string
+	for _, bin := range []string{"ip", "iptables", "ip6tables"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			missingTools = append(missingTools, bin)
+		}
+	}
+	if len(missingTools) == 0 {
+		fmt.Println("  tools:    ip, iptables and ip6tables present")
+	} else {
+		fmt.Printf("  tools:    missing %s — gateway mode needs them (Debian/DietPi: `sudo apt install iproute2 iptables`)\n", strings.Join(missingTools, ", "))
+	}
+	if os.Geteuid() != 0 {
+		fmt.Println("  account:  normal user — gateway mode needs sudo; `sudo bypath setup …` is supported")
+	} else {
+		fmt.Println("  account:  root")
+	}
 	if _, err := exec.LookPath("systemctl"); err == nil {
 		fmt.Println("  systemd:  available")
 	} else {
@@ -382,10 +404,10 @@ func printEnvironment(cfgPath string, exists bool) {
 
 func collectAnswers(p *prompter, opts *setupOptions, cfg *config.Config) (*answers, error) {
 	ans := &answers{
-		group:        strings.TrimSpace(opts.group),
-		selectName:   strings.TrimSpace(opts.selectName),
-		uris:         append([]string{}, opts.uris...),
-		subs:         append([]string{}, opts.subscriptions...),
+		group:          strings.TrimSpace(opts.group),
+		selectName:     strings.TrimSpace(opts.selectName),
+		uris:           append([]string{}, opts.uris...),
+		subs:           append([]string{}, opts.subscriptions...),
 		startService:   opts.startService || opts.enableService,
 		persistService: opts.enableService,
 	}
@@ -414,7 +436,7 @@ func collectAnswers(p *prompter, opts *setupOptions, cfg *config.Config) (*answe
 
 	lans := discoverLANs()
 	if ans.gatewayMode {
-		if err := checkGatewayPrerequisites(); err != nil {
+		if err := ensureGatewayPrerequisites(p, opts, defaultSetupHost()); err != nil {
 			return nil, err
 		}
 		if opts.iface == "" {
@@ -451,6 +473,11 @@ func collectAnswers(p *prompter, opts *setupOptions, cfg *config.Config) (*answe
 		}
 		if !found {
 			return nil, fmt.Errorf("interface %q has no private IPv4 address; detected: %s", opts.iface, describeLANs(lans))
+		}
+		ans.addressMayChange, ans.addressReason = addressChangeRisk(ans.iface, loadAddressConfig())
+		if ans.addressMayChange {
+			fmt.Print(renderAddressWarning(ans.iface, ans.ifaceAddr, ans.addressReason))
+			fmt.Println()
 		}
 	}
 
@@ -733,10 +760,16 @@ func printReview(ans *answers, cfg *config.Config) error {
 		} else {
 			fmt.Println("  activation:  staged, gateway stays disabled until verified")
 		}
+		if ans.addressMayChange {
+			fmt.Printf("  address:     %s may change by DHCP — reserve it before clients rely on it\n", ans.ifaceAddr)
+		}
 	} else {
 		fmt.Println("  mode:        proxy-only")
 	}
 	fmt.Printf("  proxy:       %s:%d\n", ans.listenAddr, ans.socksPort)
+	if ans.gatewayMode && !ans.allowLAN {
+		fmt.Println("               loopback only — gateway clients are routed, they do not use the SOCKS port")
+	}
 	if ans.allowLAN {
 		fmt.Printf("  trusted:     %s\n", strings.Join(ans.trusted, ", "))
 	}
@@ -1077,22 +1110,6 @@ func serviceServesDNSPort(cfg *config.Config, port int) bool {
 	return serviceState() == "active" && cfg.Gateway.Enabled && cfg.Server.DNSPort == port
 }
 
-// checkGatewayPrerequisites refuses gateway mode on a host that cannot run it:
-// the TUN device and the iptables tooling that installs routing and the
-// fail-closed rules. Learning this at first start would leave the unit in a
-// restart loop after the operator already pointed clients at it.
-func checkGatewayPrerequisites() error {
-	if info, err := os.Stat("/dev/net/tun"); err != nil || info.Mode()&os.ModeCharDevice == 0 {
-		return fmt.Errorf("gateway mode needs /dev/net/tun; load the tun module or use --mode proxy")
-	}
-	for _, bin := range []string{"iptables", "ip6tables"} {
-		if _, err := exec.LookPath(bin); err != nil {
-			return fmt.Errorf("gateway mode needs %s (install iptables, or use --mode proxy); bypath will not start a gateway whose routing it cannot enforce", bin)
-		}
-	}
-	return nil
-}
-
 // startAndVerify supervises one start, proves the tunnel exit, and only then
 // activates gateway mode. A failed verification leaves gateway mode disabled.
 func startAndVerify(cfgPath string, ans *answers) bool {
@@ -1186,6 +1203,8 @@ func startAndVerify(cfgPath string, ans *answers) bool {
 		return false
 	}
 	fmt.Println("✅ Gateway mode is active and connected")
+	fmt.Print(renderLANClientGuidance(ans))
+	fmt.Println()
 	return true
 }
 
