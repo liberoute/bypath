@@ -13,9 +13,9 @@ uninstall.
 | Other Linux amd64/arm64 distributions | Best effort | systemd assumed for service supervision. |
 | armv7, 386, mipsle, riscv64, Windows, macOS | No | Not built for this release. `--allow-unsupported` overrides the refusal, with no support claim. |
 
-The installer requires Bash, `curl`, `sha256sum` (or `shasum`) and `tar`.
-On Debian/Ubuntu these are present or installed by the base system; the
-installer reports a missing tool instead of installing one.
+The installer requires Bash and `sha256sum`, and downloads with `curl` or, if
+curl is absent, `wget`. On Debian/Ubuntu these are present in the base system;
+the installer reports a missing tool instead of installing one.
 
 ## 1. Download and verify
 
@@ -107,7 +107,7 @@ sudo ./install.sh --version "$VERSION" --non-interactive \
 | `--listen localhost\|lan\|all` | `localhost`. |
 | `--dns-port N` | `53`. |
 | `--dns-upstream ADDR` | Only used in gateway mode; pass one or more explicitly. |
-| `--web off\|loopback\|lan` | `off`. |
+| `--web off\|loopback\|lan` | `loopback`: the panel listens on this host only and is never reachable from the LAN. Pass `--web off` to disable it. |
 | `--uri` / `--subscription` | Nothing is imported. |
 | `--start-service` | Absent: the unit is left stopped. |
 | `--enable-service` | Absent: the unit is not enabled at boot, even after a verified start. |
@@ -257,8 +257,9 @@ at `sudo bypath setup`. Nothing was started.
 
 ## Dependency and platform notes
 
-- A missing `sha256sum`/`shasum` stops the installation; the installer never
-  installs an unverified binary.
+- A missing `sha256sum` stops the installation; the installer never installs
+  an unverified binary. A host with neither `curl` nor `wget` cannot download
+  the release; install one of them first.
 - A missing TUN device does not block a proxy-only install, but gateway mode
   will not work and the wizard says so before it asks you to proceed.
 - Gateway mode additionally requires root, `iproute2`, `iptables` and
