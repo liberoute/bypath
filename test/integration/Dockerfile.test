@@ -16,7 +16,7 @@ RUN go mod download
 COPY . .
 
 RUN CGO_ENABLED=0 go build -o /out/bypath-lite ./cmd/bypath
-RUN CGO_ENABLED=0 go build -tags full -o /out/bypath-full ./cmd/bypath
+RUN CGO_ENABLED=0 go build -tags "full with_utls" -o /out/bypath-full ./cmd/bypath
 
 FROM alpine:3.20
 

@@ -82,22 +82,22 @@ TUN2SOCKS_SHA256_ARM64=b83bc4961b33aa3ec0399c801a97c2c47766462991ffa488a4cbaee1a
 full:
 	@echo "🔋 Building FULL for Linux amd64 (sing-box + xray in-process, native TUN = zero deps)..."
 	@mkdir -p $(BUILD_DIR)
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags full $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-full-linux-amd64-$(VERSION) ./cmd/bypath
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags "full with_utls" $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-full-linux-amd64-$(VERSION) ./cmd/bypath
 
 full-windows:
 	@echo "🔋 Building FULL for Windows amd64..."
 	@mkdir -p $(BUILD_DIR)
-	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags full $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-full-windows-amd64-$(VERSION).exe ./cmd/bypath
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags "full with_utls" $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-full-windows-amd64-$(VERSION).exe ./cmd/bypath
 
 full-arm:
 	@echo "🔋 Building FULL for Linux ARM64..."
 	@mkdir -p $(BUILD_DIR)
-	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags full $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-full-linux-arm64-$(VERSION) ./cmd/bypath
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags "full with_utls" $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-full-linux-arm64-$(VERSION) ./cmd/bypath
 
 full-armv7:
 	@echo "🔋 Building FULL for Linux ARMv7..."
 	@mkdir -p $(BUILD_DIR)
-	GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -tags full $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-full-linux-armv7-$(VERSION) ./cmd/bypath
+	GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -tags "full with_utls" $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-full-linux-armv7-$(VERSION) ./cmd/bypath
 
 full-all: full full-windows full-arm full-armv7
 
@@ -179,19 +179,19 @@ fetch-tun2socks-arm: stage-tun2socks-armv7
 full-embed-amd64: stage-tun2socks-amd64
 	@echo "🔋 Building FULL+EMBED for Linux amd64 (with embedded tun2socks)..."
 	@mkdir -p $(BUILD_DIR)
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags "full embed_tun2socks" $(LDFLAGS) \
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags "full with_utls embed_tun2socks" $(LDFLAGS) \
 		-o $(BUILD_DIR)/$(BINARY_NAME)-full-embed-linux-amd64-$(VERSION) ./cmd/bypath
 
 full-embed-armv7: stage-tun2socks-armv7
 	@echo "🔋 Building FULL+EMBED for Linux ARMv7 (with embedded tun2socks)..."
 	@mkdir -p $(BUILD_DIR)
-	GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -tags "full embed_tun2socks" $(LDFLAGS) \
+	GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -tags "full with_utls embed_tun2socks" $(LDFLAGS) \
 		-o $(BUILD_DIR)/$(BINARY_NAME)-full-embed-linux-armv7-$(VERSION) ./cmd/bypath
 
 full-embed-arm64: stage-tun2socks-arm64
 	@echo "🔋 Building FULL+EMBED for Linux ARM64 (with embedded tun2socks)..."
 	@mkdir -p $(BUILD_DIR)
-	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags "full embed_tun2socks" $(LDFLAGS) \
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags "full with_utls embed_tun2socks" $(LDFLAGS) \
 		-o $(BUILD_DIR)/$(BINARY_NAME)-full-embed-linux-arm64-$(VERSION) ./cmd/bypath
 
 # Historical alias kept for existing build notes.

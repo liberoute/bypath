@@ -48,6 +48,7 @@ func cmdSelect(args []string) {
 	}
 
 	var victim *app.Connection
+	var ambiguous bool
 	if idx := parseIndex(name); idx > 0 {
 		if group != "" {
 			if idx <= len(links) {
@@ -65,12 +66,12 @@ func cmdSelect(args []string) {
 			}
 		}
 	} else {
-		for i := range links {
-			if links[i].Remark == name {
-				victim = &links[i]
-				break
-			}
-		}
+		victim, ambiguous = matchRemark(links, name)
+	}
+	if ambiguous {
+		fmt.Printf("❌ '%s' matches more than one link\n", name)
+		fmt.Println("   Use the number from 'bypath list' instead")
+		os.Exit(1)
 	}
 	if victim == nil {
 		fmt.Printf("❌ Link '%s' not found\n", name)
@@ -92,6 +93,30 @@ func warnIfCDN(link *app.Connection) {
 	if link.CDN || link.Health == "failed" {
 		fmt.Println("  ⚠️  This link is CDN-based or failed validation and may not support HTTPS browsing")
 	}
+}
+
+// matchRemark resolves a name the way 'bypath list' prints it. The list view
+// strips flag emoji, a "provider - " prefix and truncates the name, so
+// comparing only the raw remark made every such profile unselectable by the
+// name the operator was shown. An exact raw match still wins; a cleaned match
+// is accepted only when it is unique.
+func matchRemark(links []app.Connection, name string) (*app.Connection, bool) {
+	for i := range links {
+		if links[i].Remark == name {
+			return &links[i], false
+		}
+	}
+	var match *app.Connection
+	for i := range links {
+		if cleanRemark(links[i].Remark) != name {
+			continue
+		}
+		if match != nil {
+			return nil, true
+		}
+		match = &links[i]
+	}
+	return match, false
 }
 
 func parseIndex(s string) int {

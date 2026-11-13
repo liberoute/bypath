@@ -76,6 +76,17 @@ func grpcService(l *profile.Link) string {
 	}
 	return strings.TrimPrefix(l.Path, "/")
 }
+// alpnForTransport restricts the negotiated protocol to what the transport can
+// actually carry. A WebSocket upgrade is HTTP/1.1 (RFC 6455): offering h2 lets
+// the server negotiate HTTP/2, the upgrade is then rejected, and every request
+// through the tunnel fails with EOF. Servers honour their own preference, so
+// h2 must not merely be listed after http/1.1 — it must not be offered.
+func alpnForTransport(network string, alpn []string) []string {
+	if network == "ws" {
+		return []string{"http/1.1"}
+	}
+	return alpn
+}
 func singboxTLS(l *profile.Link, sni string) map[string]interface{} {
 	if sni == "" {
 		sni = l.Address
@@ -84,8 +95,8 @@ func singboxTLS(l *profile.Link, sni string) map[string]interface{} {
 	if l.Security == "reality" {
 		delete(tls, "insecure")
 	}
-	if len(l.ALPN) > 0 {
-		tls["alpn"] = l.ALPN
+	if alpn := alpnForTransport(l.Network, l.ALPN); len(alpn) > 0 {
+		tls["alpn"] = alpn
 	}
 	if l.Fingerprint != "" {
 		tls["utls"] = map[string]interface{}{"enabled": true, "fingerprint": l.Fingerprint}
@@ -98,8 +109,8 @@ func xrayTLS(l *profile.Link) map[string]interface{} {
 		sni = l.Address
 	}
 	tls := map[string]interface{}{"serverName": sni, "allowInsecure": l.Insecure}
-	if len(l.ALPN) > 0 {
-		tls["alpn"] = l.ALPN
+	if alpn := alpnForTransport(l.Network, l.ALPN); len(alpn) > 0 {
+		tls["alpn"] = alpn
 	}
 	if l.Fingerprint != "" {
 		tls["fingerprint"] = l.Fingerprint
