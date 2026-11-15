@@ -1,0 +1,9 @@
+# Keep the published source byte-identical across platforms: shell scripts,
+# Go sources and workflows must keep LF endings.
+* text=auto eol=lf
+*.sh text eol=lf
+*.go text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+LICENSE text eol=lf

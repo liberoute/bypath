@@ -1,0 +1,10 @@
+BYPATH [FULL]  CONNECTED  pid 4242  ·  running Maple-IPv4                                                               
+ 3/12 Tests   tab/shift+tab: cycle · 1-9: jump                                                                          
+                                                                                                                        
+ Tests ·  Run  Results  Compare    t cycles                                                                             
+ Kind   relay and latency   K to switch                                                                                 
+ Scope  all   s cycles · g group · l link                                                                               
+ Hidden no   i toggles                                                                                                  
+                                                                                                                        
+ No job yet. Enter starts a measurement; relay results carry L1+L2 evidence, and a speed run needs one first.           
+ t run/results/compare  K kind  s scope  g group  l link  i hidden  enter start/evidence  c cancel  r reload  ↑/↓ move  

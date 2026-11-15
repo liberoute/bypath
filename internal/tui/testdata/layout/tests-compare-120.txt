@@ -1,0 +1,15 @@
+BYPATH [FULL]  CONNECTED  pid 4242  ·  running Maple-IPv4                                                               
+ 3/12 Tests   tab/shift+tab: cycle · 1-9: jump                                                                          
+                                                                                                                        
+ Tests ·  Run  Results  Compare    t cycles                                                                             
+ latency · 2 proven ranked · 2 not ranked                                                                               
+                                                                                                                        
+ Ranked (proven path)                                                                                                   
+  1. Maple-IPv4                     VLESS     HEALTHY       p50 41 ms · p90 88 ms                                       
+  2. 东京节点-非常长-的-连接名称    TROJAN    HEALTHY       p50 180 ms · p90 260 ms                                     
+ Not ranked                                                                                                             
+ An inconclusive result does not mean the link is bad; its path was not proven, so it is not used for ranking.          
+  1. eu-tcp                         OPENVPN   FAILED        the DIRECT control failed, so route decisions are not trus… 
+  2. Example VPN Europe 3 (TCP) —…  OPENVPN   INCONCLUSIVE  the exit matches the serving connection, so ownership is u… 
+ ↑/↓ move · enter evidence · K kind · r reload                                                                          
+ t run/results/compare  K kind  s scope  g group  l link  i hidden  enter start/evidence  c cancel  r reload  ↑/↓ move  

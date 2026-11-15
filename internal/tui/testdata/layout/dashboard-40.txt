@@ -1,0 +1,24 @@
+BYPATH [FULL]  CONNECTED  pid 4242      
+ 1/12 Overview                          
+ ● CONNECTED   pid 4242   uptime 1h00m  
+                                        
+ Running         Maple-IPv4             
+ Selected        Maple-IPv4             
+ Protocol        vless / sing-box       
+ Gateway mode    transparent TUN gateway
+ DNS mode        strict                 
+ Public exit IP  unknown — press p to   
+                 probe                  
+ Restarts        0 data-path 0 recovery 
+                 attempt 0              
+ Profiles        12 connections in 1    
+                 source(s)              
+ Organisation    not created yet — press
+                 M in Connections       
+ Tests           4 connection(s) tested 
+                 · 2 proven (only proven
+                 paths are ranked)      
+ Listeners       api 8080 · socks 2801 ·
+                 dns 53                 
+ 2 connections  3 tests  8 import       
+ p probe exit IP  r refresh  q quit     
