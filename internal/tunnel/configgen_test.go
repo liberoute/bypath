@@ -1193,3 +1193,68 @@ func TestRemoveStaleGenerationsMissingDir(t *testing.T) {
 		t.Fatalf("removed=%d err=%v, want 0/nil", removed, err)
 	}
 }
+
+func TestSingboxTransportTranslatesWSPathEarlyData(t *testing.T) {
+	link := &profile.Link{
+		Protocol: "vless",
+		Address:  "cdn.example.com",
+		Port:     443,
+		UUID:     "uuid",
+		Network:  "ws",
+		TLS:      true,
+		SNI:      "cdn.example.com",
+		Host:     "cdn.example.com",
+		// Persisted RC3 profile shape: hint still inside the shared path.
+		Path: "/ws?ed=2560",
+	}
+	tr := singboxTransport(link, link.Host)
+	if tr["path"] != "/ws" {
+		t.Fatalf("path: got %v want /ws", tr["path"])
+	}
+	if tr["max_early_data"] != 2560 {
+		t.Fatalf("max_early_data: got %v want 2560", tr["max_early_data"])
+	}
+	if tr["early_data_header_name"] != "Sec-WebSocket-Protocol" {
+		t.Fatalf("early_data_header_name: got %v", tr["early_data_header_name"])
+	}
+}
+
+func TestSingboxTransportKeepsWSQueryWithoutHint(t *testing.T) {
+	link := &profile.Link{Protocol: "vless", Network: "ws", TLS: true, Path: "/ws?token=abc"}
+	tr := singboxTransport(link, "")
+	if tr["path"] != "/ws?token=abc" {
+		t.Fatalf("path: got %v", tr["path"])
+	}
+	if _, ok := tr["max_early_data"]; ok {
+		t.Fatalf("unexpected early data for path without hint")
+	}
+}
+
+func TestXrayWSSettingsTranslatePathEarlyData(t *testing.T) {
+	link := &profile.Link{Protocol: "vless", Network: "ws", TLS: true, Host: "cdn.example.com", Path: "/?ed=2560"}
+	stream := map[string]interface{}{}
+	xrayStreamNetwork(stream, link)
+	ws, ok := stream["wsSettings"].(map[string]interface{})
+	if !ok {
+		t.Fatal("missing wsSettings")
+	}
+	if ws["path"] != "/" {
+		t.Fatalf("path: got %v want /", ws["path"])
+	}
+	if ws["maxEarlyData"] != 2560 {
+		t.Fatalf("maxEarlyData: got %v want 2560", ws["maxEarlyData"])
+	}
+	if ws["earlyDataHeaderName"] != "Sec-WebSocket-Protocol" {
+		t.Fatalf("earlyDataHeaderName: got %v", ws["earlyDataHeaderName"])
+	}
+}
+
+func TestXrayWSEarlyDataKeptFromExplicitParam(t *testing.T) {
+	link := &profile.Link{Protocol: "vless", Network: "ws", TLS: true, Path: "/ws", WSMaxEarlyData: 2048, WSEarlyDataHeader: "X-Early"}
+	stream := map[string]interface{}{}
+	xrayStreamNetwork(stream, link)
+	ws := stream["wsSettings"].(map[string]interface{})
+	if ws["maxEarlyData"] != 2048 || ws["earlyDataHeaderName"] != "X-Early" {
+		t.Fatalf("explicit early data lost: %v", ws)
+	}
+}

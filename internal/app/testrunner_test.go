@@ -272,3 +272,34 @@ func TestGeneratedTestConfigPassesIsolationAudit(t *testing.T) {
 		t.Fatalf("isolated config failed the audit: %v", err)
 	}
 }
+
+func TestUplinkInterfaceOnlyForNativeTunGateway(t *testing.T) {
+	base := func() *config.Config {
+		c := &config.Config{}
+		c.Gateway.Enabled = true
+		c.Gateway.NativeTUN = true
+		c.Gateway.Interface = "eth0"
+		return c
+	}
+	if got := uplinkInterface(base()); got != "eth0" {
+		t.Fatalf("gateway iface: got %q", got)
+	}
+	c := base()
+	c.Gateway.NativeTUN = false
+	if got := uplinkInterface(c); got != "" {
+		t.Fatalf("tun2socks mode must stay unbound: got %q", got)
+	}
+	c = base()
+	c.Gateway.Enabled = false
+	if got := uplinkInterface(c); got != "" {
+		t.Fatalf("proxy-only mode must stay unbound: got %q", got)
+	}
+	c = base()
+	c.Gateway.Interface = "auto"
+	if got := uplinkInterface(c); got != "" {
+		t.Fatalf("auto interface must stay unbound: got %q", got)
+	}
+	if got := uplinkInterface(nil); got != "" {
+		t.Fatalf("nil config: got %q", got)
+	}
+}

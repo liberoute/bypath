@@ -509,12 +509,25 @@ func singboxTransport(link *profile.Link, host string) map[string]interface{} {
 		return map[string]interface{}{"type": "grpc", "service_name": grpcService(link)}
 	}
 	transport := map[string]interface{}{"type": netType}
-	if netType == "ws" && link.WSMaxEarlyData > 0 {
-		transport["max_early_data"] = link.WSMaxEarlyData
-		transport["early_data_header_name"] = link.WSEarlyDataHeader
+	path := link.Path
+	earlyData := link.WSMaxEarlyData
+	if netType == "ws" {
+		// Older profiles persist the request path with its "?ed=NNN" hint.
+		// sing-box forwards that path verbatim and the server rejects the
+		// upgrade, so translate the hint into the explicit fields.
+		if cleaned, ed := profile.SplitWSPathEarlyData(path); ed > 0 {
+			path = cleaned
+			if earlyData == 0 {
+				earlyData = ed
+			}
+		}
+		if earlyData > 0 {
+			transport["max_early_data"] = earlyData
+			transport["early_data_header_name"] = earlyDataHeader(link.WSEarlyDataHeader)
+		}
 	}
-	if link.Path != "" {
-		transport["path"] = link.Path
+	if path != "" {
+		transport["path"] = path
 	}
 	if host != "" {
 		// xhttp uses top-level host; ws/http use headers.Host
@@ -535,6 +548,13 @@ func singboxTransport(link *profile.Link, host string) map[string]interface{} {
 		}
 	}
 	return transport
+}
+
+func earlyDataHeader(header string) string {
+	if header == "" {
+		return profile.EarlyDataHeaderDefault
+	}
+	return header
 }
 
 // parseExtraJSON decodes the URI extra= payload into a map for engine configs.
@@ -568,16 +588,24 @@ func xrayStreamNetwork(stream map[string]interface{}, link *profile.Link) {
 	switch netType {
 	case "ws":
 		ws := map[string]interface{}{}
-		if link.Path != "" {
-			ws["path"] = link.Path
+		path := link.Path
+		earlyData := link.WSMaxEarlyData
+		if cleaned, ed := profile.SplitWSPathEarlyData(path); ed > 0 {
+			path = cleaned
+			if earlyData == 0 {
+				earlyData = ed
+			}
+		}
+		if path != "" {
+			ws["path"] = path
 		}
 		if link.Host != "" {
 			// xray 25.x: Host is top-level (headers.Host deprecated)
 			ws["host"] = link.Host
 		}
-		if link.WSMaxEarlyData > 0 {
-			ws["maxEarlyData"] = link.WSMaxEarlyData
-			ws["earlyDataHeaderName"] = link.WSEarlyDataHeader
+		if earlyData > 0 {
+			ws["maxEarlyData"] = earlyData
+			ws["earlyDataHeaderName"] = earlyDataHeader(link.WSEarlyDataHeader)
 		}
 		stream["wsSettings"] = ws
 	case "xhttp":

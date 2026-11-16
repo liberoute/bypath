@@ -118,6 +118,16 @@ func applyURIParams(l *Link, p url.Values) {
 		l.WSMaxEarlyData = toInt(p.Get("ed"))
 	}
 	l.WSEarlyDataHeader = p.Get("eh")
+	// Most providers ship the early-data hint inside the shared path rather
+	// than as a separate parameter; normalise it so every engine field agrees.
+	if l.Network == "ws" {
+		if path, ed := SplitWSPathEarlyData(l.Path); ed > 0 {
+			l.Path = path
+			if l.WSMaxEarlyData == 0 {
+				l.WSMaxEarlyData = ed
+			}
+		}
+	}
 	known := map[string]bool{}
 	for _, k := range strings.Fields("type network security insecure allowInsecure sni peer serverName fp fingerprint alpn path host flow serviceName service_name multiMode mode pbk sid spx extra x_padding_bytes ed eh encryption support-x25519mlkem768 headerType") {
 		known[k] = true

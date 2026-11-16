@@ -788,6 +788,7 @@ var (
 	startEngineAttempt    = (*Gateway).startEngine
 	startEnginePinned     = (*Gateway).startEnginePinned
 	probeTunnelConnection = (*Gateway).verifyConnection
+	probeTunnelHTTPS      = (*Gateway).verifyHTTPS
 )
 
 const (
@@ -1014,6 +1015,14 @@ func (gw *Gateway) startEngineWithEngineFallback(ctx context.Context, link *prof
 				gw.stopEngineLocked()
 				return false, err
 			}
+			// CONNECTED must mean browsing works. A relay that forwards plain
+			// HTTP but not TLS leaves every https:// request dead, so it is not a
+			// usable tunnel even though the HTTP probe answered.
+			if !probeTunnelHTTPS(gw, ctx) {
+				log.Printf("  ⚠️  Tunnel relays HTTP but not HTTPS")
+				gw.stopEngineLocked()
+				return false, nil
+			}
 			return true, nil
 		}
 		if ctx.Err() != nil {
@@ -1044,6 +1053,26 @@ func (gw *Gateway) verifyConnection(ctx context.Context) bool {
 	}
 	ok, _ := ProbeDataPath(ctx, net.JoinHostPort(listen, strconv.Itoa(port)), gw.probeTimeout())
 	return ok
+}
+
+// httpsProbeTargets are independent TLS endpoints. example.com is IANA-owned
+// and static; gstatic generate_204 is a second operator, so one blocked host
+// does not condemn a healthy tunnel.
+var httpsProbeTargets = []string{
+	"https://www.example.com/",
+	"https://www.gstatic.com/generate_204",
+}
+
+// verifyHTTPS proves the tunnel carries a verified TLS handshake and an HTTP
+// answer, not just a plaintext relay.
+func (gw *Gateway) verifyHTTPS(ctx context.Context) bool {
+	port := gw.socksPort
+	if port <= 0 {
+		return false
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return profile.TestAnyURL(probeCtx, port, httpsProbeTargets)
 }
 
 // dataPathCandidates are non-Cloudflare targets with predictable responses.

@@ -52,9 +52,9 @@ func newFallbackTestGateway(t *testing.T, endpointTimeout, totalTimeout string) 
 
 func stubFallbackProbes(t *testing.T, start func(context.Context, *profile.Link) error, probe func(context.Context) bool) {
 	t.Helper()
-	oldStart, oldProbe := startEngineAttempt, probeTunnelConnection
+	oldStart, oldProbe, oldHTTPS := startEngineAttempt, probeTunnelConnection, probeTunnelHTTPS
 	t.Cleanup(func() {
-		startEngineAttempt, probeTunnelConnection = oldStart, oldProbe
+		startEngineAttempt, probeTunnelConnection, probeTunnelHTTPS = oldStart, oldProbe, oldHTTPS
 	})
 	startEngineAttempt = func(_ *Gateway, ctx context.Context, link *profile.Link) error {
 		return start(ctx, link)
@@ -65,6 +65,7 @@ func stubFallbackProbes(t *testing.T, start func(context.Context, *profile.Link)
 		}
 		return probe(ctx)
 	}
+	probeTunnelHTTPS = func(_ *Gateway, ctx context.Context) bool { return true }
 }
 
 // TestLinkFallbackBoundsConsecutiveDeadEndpoints proves a group of unreachable
@@ -255,5 +256,24 @@ func TestLinkFallbackSucceedsOnNextLink(t *testing.T) {
 	}
 	if got := mgr.GetActiveLink(); got == nil || got.Remark != "dead-b" {
 		t.Fatalf("manager active link = %+v, want dead-b", got)
+	}
+}
+
+// A relay that answers plain HTTP but cannot carry TLS must not be published
+// as connected: every https:// request through it would fail.
+func TestHTTPOnlyRelayIsNotConnected(t *testing.T) {
+	gw, _ := newFallbackTestGateway(t, "200ms", "1s")
+	stubFallbackProbes(t, func(context.Context, *profile.Link) error { return nil }, func(context.Context) bool { return true })
+	probeTunnelHTTPS = func(*Gateway, context.Context) bool { return false }
+
+	ok, err := gw.startEngineWithEngineFallback(context.Background(), gw.getActiveLink())
+	if ok {
+		t.Fatal("HTTP-only relay was accepted as a working tunnel")
+	}
+	if err != nil {
+		t.Fatalf("a probe failure is a soft failure, got err=%v", err)
+	}
+	if gw.GetRuntimeStatus().State == StateConnected {
+		t.Fatal("state was published as CONNECTED")
 	}
 }

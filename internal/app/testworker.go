@@ -130,7 +130,7 @@ func (s *Local) RunWorkerJob(ctx context.Context, job WorkerJob, selfNS, initNS 
 		job.CapBytes = capBytes
 	}
 
-	uplink := directUplinkIP(ctx)
+	uplink := directUplinkIP(ctx, "")
 	if isolated && uplink == "" {
 		// Without the address this host presents directly, an exit can never
 		// be proven different from the uplink; unknown proof is not Healthy.

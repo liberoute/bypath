@@ -471,7 +471,7 @@ func (s *Local) runTestJob(ctx context.Context, cancel context.CancelFunc, job *
 	// (tests) the runner performs no live network calls at all; the guards then
 	// see empty values and skip comparison instead of guessing.
 	if s.testLink == nil {
-		shared.uplink = directUplinkIP(ctx)
+		shared.uplink = directUplinkIP(ctx, uplinkInterface(cfg))
 		if s.runtime != nil {
 			rs := s.runtime.Status()
 			if rs.State == "CONNECTED" {
@@ -1121,15 +1121,29 @@ func fetchEchoIP(ctx context.Context, port int, url string) (string, error) {
 	return ip.String(), nil
 }
 
+// uplinkInterface names the physical interface the direct-uplink probe must
+// use while the gateway TUN owns the default route. Empty means unbound.
+func uplinkInterface(cfg *config.Config) string {
+	if cfg == nil || !cfg.Gateway.Enabled || !cfg.Gateway.NativeTUN {
+		return ""
+	}
+	iface := strings.TrimSpace(cfg.Gateway.Interface)
+	if iface == "" || strings.EqualFold(iface, "auto") {
+		return ""
+	}
+	return iface
+}
+
 // directUplinkIP asks a public echo what this host looks like without any
 // proxy. It is a comparison value only; a failure leaves it empty and the
 // EXIT_EQUALS_UPLINK guard is skipped rather than guessed.
-func directUplinkIP(ctx context.Context) string {
+func directUplinkIP(ctx context.Context, iface string) string {
 	resolver, err := bench.HostBootstrapResolver()
 	if err != nil {
 		return ""
 	}
-	transport := &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 5 * time.Second, Resolver: resolver}).DialContext}
+	dialer := &net.Dialer{Timeout: 5 * time.Second, Resolver: resolver, Control: bindDeviceControl(iface)}
+	transport := &http.Transport{Proxy: nil, DialContext: dialer.DialContext}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Timeout: 8 * time.Second, Transport: transport}
 	for _, url := range []string{echoServiceA, echoServiceB, echoServiceC} {
