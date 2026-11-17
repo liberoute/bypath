@@ -66,6 +66,18 @@ func (h *benchHarness) assertSelected(t *testing.T, remark string) {
 	}
 }
 
+// assertSelectionChangedTo proves the selection actually moved: the target must
+// differ from what the fixture was seeded with, so a suppressed write cannot
+// satisfy the assertion.
+func (h *benchHarness) assertSelectionChangedTo(t *testing.T, remark string) {
+	t.Helper()
+	want := "lab\n" + remark
+	if want == benchFixtureActive {
+		t.Fatalf("fixture already selects %q; assertion cannot prove a write", remark)
+	}
+	h.assertSelected(t, remark)
+}
+
 func (h *benchHarness) report(best string) bench.Report {
 	report := bench.Report{
 		Groups: []string{"lab"},
@@ -263,7 +275,7 @@ func TestBenchInteractiveAffirmativeSelects(t *testing.T) {
 			if !strings.Contains(out.String(), "✅ Selected!") {
 				t.Fatalf("missing selection confirmation:\n%s", out.String())
 			}
-			h.assertSelected(t, "A")
+			h.assertSelectionChangedTo(t, "A")
 		})
 	}
 }
@@ -281,17 +293,23 @@ func TestBenchExplicitYesSelectsWithoutPrompt(t *testing.T) {
 	if !strings.Contains(out.String(), "✅ Selected!") {
 		t.Fatalf("missing selection confirmation:\n%s", out.String())
 	}
-	h.assertSelected(t, "A")
+	h.assertSelectionChangedTo(t, "A")
 }
 
 func TestBenchAutoYesSelectsWhenNonInteractive(t *testing.T) {
 	h := newBenchHarness(t)
 	var out bytes.Buffer
-	code := runBench([]string{"--auto", "--yes"}, strings.NewReader(""), &out, false, h.deps(t, "B"))
+	code := runBench([]string{"--auto", "--yes"}, strings.NewReader(""), &out, false, h.deps(t, "A"))
 	if code != 0 {
 		t.Fatalf("runBench(--auto --yes) = %d, want 0\n%s", code, out.String())
 	}
-	h.assertSelected(t, "B")
+	if strings.Contains(out.String(), "Auto-select this link?") {
+		t.Fatalf("prompted despite --yes:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "✅ Selected!") {
+		t.Fatalf("missing selection confirmation:\n%s", out.String())
+	}
+	h.assertSelectionChangedTo(t, "A")
 }
 
 func TestBenchGroupFlagReachesRunner(t *testing.T) {
