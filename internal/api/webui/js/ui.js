@@ -33,12 +33,12 @@ export function Chip({ state = 'untested', label, evidence, title, onClick }) {
   return html`<span class="chip ${state}" title=${title || ''}>${content}</span>`;
 }
 
-export function ResultChip({ result, onClick }) {
+export function ResultChip({ result, onClick, evidence = true }) {
   const verdict = verdictOf(result);
   return html`<${Chip}
     state=${verdict.state}
     label=${verdict.label}
-    evidence=${evidenceOf(result)}
+    evidence=${evidence ? evidenceOf(result) : ''}
     title=${result && result.detail ? result.detail : verdict.label}
     onClick=${onClick} />`;
 }

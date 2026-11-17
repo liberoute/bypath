@@ -118,7 +118,9 @@ func (s *Local) speedThrough(ctx context.Context, port int, live bool, target Sp
 			break
 		}
 		if ctx.Err() != nil {
-			return downloadResult{Spent: spent, Received: spent}, check, ctx.Err()
+			// Keep the transfer's own detail: it names the phase and how far the
+			// body got, which a bare context error would throw away.
+			break
 		}
 	}
 	if lastErr == nil {

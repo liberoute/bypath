@@ -855,7 +855,10 @@ func (s *Local) measureIsolated(ctx context.Context, t testTarget, shared testSh
 		}
 		if len(samples) < 2 {
 			res.Status = TestStatusFailed
-			res.Detail = "latency probe failed through the tested instance"
+			res.Detail = "the full HTTPS sample failed through the tested instance"
+			if res.DelayMS > 0 {
+				res.Detail = fmt.Sprintf("the fast delay answered in %d ms, but the full HTTPS sample failed through the tested instance", res.DelayMS)
+			}
 			return res, spent, false
 		}
 		res.LatencyMS = int64(median(samples) / time.Millisecond)
@@ -1123,7 +1126,10 @@ func (s *Local) measureLiveLink(ctx context.Context, t testTarget, shared testSh
 		}
 		if len(samples) < 3 {
 			res.Status = TestStatusFailed
-			res.Detail = "latency probe failed through the live tunnel"
+			res.Detail = "the full HTTPS sample failed through the live tunnel"
+			if res.DelayMS > 0 {
+				res.Detail = fmt.Sprintf("the fast delay answered in %d ms, but the full HTTPS sample failed through the live tunnel", res.DelayMS)
+			}
 			return res
 		}
 		res.LatencyMS = int64(median(samples) / time.Millisecond)

@@ -172,6 +172,7 @@ export function connectivityOf(result) {
       }
       return { code: 'no_answer', text: 'no answer recorded' };
     case 'failed':
+      if (ms > 0) return { code: 'answered', text: `answered in ${ms} ms; the full HTTPS sample failed` };
       return { code: 'no_answer', text: 'no answer' };
     case 'cancelled':
       return { code: 'not_measured', text: 'not measured (cancelled)' };

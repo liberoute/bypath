@@ -188,12 +188,18 @@ function failureRank(result) {
 function sortResults(list, mode) {
   const ms = (result) => delayMS(result);
   const recent = (a, b) => String(b.tested_at || '').localeCompare(String(a.tested_at || ''));
+  // A superseded or stale row is history, not a current ranking candidate. A
+  // failed row may still carry a fast delay, but it has no completed sample, so
+  // it sorts after rows that do.
+  const current = (result) => (result.superseded || result.stale ? 1 : 0);
+  const complete = (result) => (result.status === 'ok' || result.status === 'measured' ? 0 : 1);
   const rows = list.slice();
   if (mode === 'latency') {
-    return rows.sort((a, b) => ((ms(a) || Number.POSITIVE_INFINITY) - (ms(b) || Number.POSITIVE_INFINITY)) || recent(a, b));
+    return rows.sort((a, b) => complete(a) - complete(b) || current(a) - current(b)
+      || (ms(a) || Number.POSITIVE_INFINITY) - (ms(b) || Number.POSITIVE_INFINITY) || recent(a, b));
   }
   if (mode === 'speed') {
-    return rows.sort((a, b) => (b.mbps || -1) - (a.mbps || -1) || recent(a, b));
+    return rows.sort((a, b) => current(a) - current(b) || (b.mbps || -1) - (a.mbps || -1) || recent(a, b));
   }
   if (mode === 'failures') {
     return rows.sort((a, b) => failureRank(a) - failureRank(b) || recent(a, b));
@@ -255,7 +261,7 @@ function ResultsPanel({ state }) {
               <div class="c-name">${result.remark || result.connection_id}</div>
               <div class="c-sub">${evidenceOf(result) || '—'}${['ok', 'measured'].includes(result.status) ? '' : ` · ${timeAgo(result.tested_at)}`}</div>
             </div>
-            <div class="c-end"><${ResultChip} result=${result} /></div>
+            <div class="c-end"><${ResultChip} result=${result} evidence=${false} /></div>
           </div>
           ${open ? html`<div class="evidence-box">
             <div class="row"><strong class="grow">${result.kind === 'speed' ? 'Download speed' : 'Relay and latency'}</strong>
