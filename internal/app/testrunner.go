@@ -632,7 +632,11 @@ func (s *Local) measureLink(ctx context.Context, t testTarget, shared testShared
 	}
 	// The serving connection is measured on its own live path. Starting a second
 	// instance for it would compete with the tunnel that carries user traffic.
-	if shared.servingLink != nil && shared.servingLink.Group == link.Group && shared.servingLink.Remark == link.Remark {
+	// That path needs a routing decision for every probe host, so when the live
+	// policy cannot be evaluated (proxy-only mode, or a host without route
+	// explain) the link is measured in its own instance like any other instead
+	// of being reported as unmeasurable.
+	if shared.servingLink != nil && shared.servingLink.Group == link.Group && shared.servingLink.Remark == link.Remark && s.livePathReady(ctx) {
 		before := s.countedBytes()
 		res := s.measureLiveLink(ctx, t, shared, kind, target, capBytes)
 		if after := s.countedBytes(); after > before {
@@ -877,6 +881,20 @@ func (s *Local) measureIsolated(ctx context.Context, t testTarget, shared testSh
 // runLiveLinkTest measures the serving connection's latency on its live path.
 func (s *Local) runLiveLinkTest(ctx context.Context, t testTarget, shared testShared) TestResult {
 	return s.measureLiveLink(ctx, t, shared, TestKindLatency, nil, 0)
+}
+
+// livePathReady reports whether a measurement on the serving link's live path
+// could be attributed to the tunnel. The live path applies the gateway routing
+// policy, so every probe host must get a certain route decision first; the
+// answer is the same for every host because certainty depends on whether the
+// policy can evaluate the default probe name.
+func (s *Local) livePathReady(ctx context.Context) bool {
+	cfg := s.Config()
+	if cfg == nil || cfg.Server.SOCKSPort <= 0 {
+		return false
+	}
+	exp, err := s.ExplainRoute(ctx, "api.ipify.org")
+	return err == nil && exp.Certain
 }
 
 // measureLiveLink measures the serving connection through the live SOCKS port,

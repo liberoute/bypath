@@ -356,3 +356,30 @@ func TestWorkerMeasuredRowNeedsAnHTTPSAnswer(t *testing.T) {
 		t.Fatal("a measured row without a number was accepted")
 	}
 }
+
+// The serving link used to be measured only on its live path, which needs a
+// certain route decision for every probe host. A proxy-only daemon (no gateway
+// DNS) or a platform without route explain left the most important connection
+// unmeasurable. It must fall back to its own isolated instance instead.
+func TestServingLinkFallsBackToIsolatedWhenLivePathIsUncertain(t *testing.T) {
+	stubIsolatedSeams(t)
+	readTestExit = func(context.Context, int, string, string) (string, []EchoResult, error) {
+		return agreeOn("198.51.100.7")
+	}
+	svc, _ := newTestLocal(t)
+	link := fixtureLink()
+	shared := testShared{servingLink: link, uplink: "198.51.100.9", servingExit: "198.51.100.7", isolation: true}
+
+	res, _ := svc.measureLink(context.Background(),
+		testTarget{id: "lab:shared-exit", link: link}, shared, TestKindLatency, nil, 0)
+
+	if res.Path == nil || res.Path.Kind != "isolated" {
+		t.Fatalf("the serving link did not fall back to an isolated instance: %+v", res.Path)
+	}
+	if res.Status != TestStatusMeasured || res.Reason != ReasonExitEqualsServing {
+		t.Fatalf("status=%q reason=%q, want measured/%s (%s)", res.Status, res.Reason, ReasonExitEqualsServing, res.Detail)
+	}
+	if res.LatencyMS != 64 || !res.HTTPSProven {
+		t.Fatalf("the fallback did not keep the measured answer: %+v", res)
+	}
+}

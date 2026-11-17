@@ -228,6 +228,10 @@ func TestLivePathNeverStartsAnIsolatedInstance(t *testing.T) {
 	}
 	// The SOCKS port has no listener, so the identity probe fails quickly; the
 	// assertion is that the runner chose the live path and spawned no engine.
+	// A live measurement needs a certain route decision, so the connected
+	// gateway answers DNS for the probe names.
+	svc.runtime = &fakeRuntime{state: "CONNECTED"}
+	svc.Config().Server.DNSPort = startFakeDNS(t, net.IPv4(203, 0, 113, 9))
 	shared := testShared{servingLink: link}
 	res := svc.runLinkTest(ctx, testTarget{link: link, id: "default:serving"}, shared)
 	if res.Path == nil || res.Path.Kind != "live" {
