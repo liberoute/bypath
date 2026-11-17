@@ -340,3 +340,25 @@ func TestParseTraceIP(t *testing.T) {
 		}
 	}
 }
+
+func TestParseEchoIPAcceptsBareAddressAndTrace(t *testing.T) {
+	cases := map[string]string{
+		"203.0.113.7\n": "203.0.113.7",
+		"2001:db8::7":   "2001:db8::7",
+		"fl=1\nh=www.cloudflare.com\nip=198.51.100.9\nts=1\n": "198.51.100.9",
+		"":     "",
+		"204 ": "",
+	}
+	for body, want := range cases {
+		got, err := parseEchoIP([]byte(body))
+		if want == "" {
+			if err == nil {
+				t.Fatalf("parseEchoIP(%q) = %q, want an error", body, got)
+			}
+			continue
+		}
+		if err != nil || got != want {
+			t.Fatalf("parseEchoIP(%q) = %q, %v; want %q", body, got, err, want)
+		}
+	}
+}

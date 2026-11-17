@@ -45,10 +45,14 @@ const (
 	// traffic on the target network class, which made a working path look
 	// ambiguous. Any replacement must agree with A and B on a direct sample.
 	echoServiceC = "https://checkip.amazonaws.com"
-	// negativeControlHost is a Cloudflare name the optional IP-check profile
-	// routes DIRECT. When the live policy does not route it DIRECT the control
-	// is recorded as not applicable rather than assumed.
-	negativeControlHost = "cp.cloudflare.com"
+	// negativeControlHost is a Cloudflare name that a policy routing
+	// *.cloudflare.com DIRECT to keep latency checks local will also route
+	// DIRECT. When the policy does not, the control is recorded as not
+	// applicable rather than assumed. The endpoint must echo the observed
+	// address: cp.cloudflare.com answers 204 with an empty body, so the control
+	// uses the trace endpoint instead.
+	negativeControlHost = "www.cloudflare.com"
+	negativeControlURL  = "https://www.cloudflare.com/cdn-cgi/trace"
 )
 
 type testJob struct {
@@ -1044,7 +1048,7 @@ func (s *Local) measureLiveLink(ctx context.Context, t testTarget, shared testSh
 		proof.RouteDecisions = append(proof.RouteDecisions, dec)
 		switch dec.Decision {
 		case "DIRECT":
-			controlIP, err := fetchEchoIP(setupCtx, port, "https://"+negativeControlHost)
+			controlIP, err := fetchEchoIP(setupCtx, port, negativeControlURL)
 			switch {
 			case err != nil:
 				proof.NegativeControl = "failed"
@@ -1261,15 +1265,25 @@ func echoLabel(rawURL string) string {
 func fetchEchoIP(ctx context.Context, port int, url string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	body, err := bench.FetchHTTPSThroughProxy(ctx, port, url, 128)
+	body, err := bench.FetchHTTPSThroughProxy(ctx, port, url, 512)
 	if err != nil {
 		return "", err
 	}
-	ip := net.ParseIP(strings.TrimSpace(string(body)))
-	if ip == nil {
-		return "", fmt.Errorf("unexpected echo response")
+	return parseEchoIP(body)
+}
+
+// parseEchoIP accepts the two shapes the echo endpoints use: a bare address
+// (ipify, icanhazip, checkip) and the key=value trace body (cloudflare
+// cdn-cgi/trace). Anything else is refused so a block page or an empty 204 can
+// never be read as an observed address.
+func parseEchoIP(body []byte) (string, error) {
+	if ip := net.ParseIP(strings.TrimSpace(string(body))); ip != nil {
+		return ip.String(), nil
 	}
-	return ip.String(), nil
+	if ip := parseTraceIP(body); ip != "" {
+		return ip, nil
+	}
+	return "", fmt.Errorf("unexpected echo response")
 }
 
 // uplinkInterface names the physical interface the direct-uplink probe must
