@@ -189,9 +189,7 @@ func assertLocalDNSConfig(t *testing.T, cg *ConfigGenerator) {
 	if !inverted {
 		t.Fatalf("catch-all resolve must invert the local suffix match: %+v", *catchAll)
 	}
-	// The probe names are forced through the tunnel, so their resolve class is
-	// excluded from the catch-all alongside the local suffixes.
-	want := append(append([]string(nil), StartupProbeDomains...), "home", "lan", "corp")
+	want := []string{"home", "lan", "corp"}
 	if !reflect.DeepEqual(skipped, want) {
 		t.Fatalf("catch-all resolve must exclude %v, got %v", want, skipped)
 	}

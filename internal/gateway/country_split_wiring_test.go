@@ -20,17 +20,17 @@ func TestEngineConfigGeneratorCarriesCountrySplit(t *testing.T) {
 		{
 			name:    "split with whitelist routing",
 			country: "ir",
-			want:    []string{"builtin", "probe", "country-split", "country-split", "default"},
+			want:    []string{"builtin", "country-split", "country-split", "default"},
 		},
 		{
 			name:    "split with explicit rules",
 			country: "ir",
 			rules:   []config.RoutingRule{{Match: "domain_suffix:example.com", Outbound: "proxy"}},
-			want:    []string{"builtin", "probe", "rule", "country-split", "country-split", "default"},
+			want:    []string{"builtin", "rule", "country-split", "country-split", "default"},
 		},
 		{
 			name: "no split keeps proxy-only plan",
-			want: []string{"builtin", "probe", "default"},
+			want: []string{"builtin", "default"},
 		},
 	}
 

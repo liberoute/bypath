@@ -37,7 +37,6 @@ func TestPlanMatchesGeneratedXrayRules(t *testing.T) {
 		// whitelist or geoip rule covers its address.
 		{"ip": []string{"8.8.8.8/32"}, "outboundTag": "proxy"},
 		{"ip": []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "fc00::/7", "::1/128"}, "outboundTag": "direct"},
-		{"domain": []string{"domain:example.com", "domain:gstatic.com"}, "outboundTag": "proxy"},
 		{"domain": []string{"domain:home"}, "outboundTag": "direct"},
 		{"ip": []string{"geoip:de"}, "outboundTag": "direct"},
 		{"domain": []string{"geosite:CATEGORY-DE"}, "outboundTag": "direct"},
@@ -67,8 +66,8 @@ func TestPlanMatchesGeneratedXrayRules(t *testing.T) {
 	if plan[0].Scope != "dns-pin" || plan[0].Kind != "ip_cidr" {
 		t.Errorf("plan resolver pin = %+v", plan[0])
 	}
-	if plan[5].Kind != "geosite" || plan[5].Resolved != "CATEGORY-DE" {
-		t.Errorf("plan geosite entry = %+v, want resolved CATEGORY-DE", plan[5])
+	if plan[4].Kind != "geosite" || plan[4].Resolved != "CATEGORY-DE" {
+		t.Errorf("plan geosite entry = %+v, want resolved CATEGORY-DE", plan[4])
 	}
 	if plan[len(plan)-1].Kind != "default" || plan[len(plan)-1].Outbound != "proxy" {
 		t.Errorf("plan default = %+v", plan[len(plan)-1])
@@ -107,7 +106,7 @@ func TestPlanLegacyOrderAndDefault(t *testing.T) {
 	for i, entry := range plan {
 		kinds[i] = entry.Scope
 	}
-	want := []string{"dns-pin", "builtin", "probe", "force-proxy", "local-dns", "bypass", "country", "country", "default"}
+	want := []string{"dns-pin", "builtin", "force-proxy", "local-dns", "bypass", "country", "country", "default"}
 	if len(kinds) != len(want) {
 		t.Fatalf("plan scopes = %v, want %v", kinds, want)
 	}
@@ -118,14 +117,14 @@ func TestPlanLegacyOrderAndDefault(t *testing.T) {
 	}
 	// The legacy route emits a geosite rule before the geoip rule for the same
 	// country list; both are skipped here because no .dat category exists.
-	if plan[6].Skip == "" || plan[6].Kind != "geosite" {
-		t.Errorf("missing geosite category was not marked skipped: %+v", plan[6])
+	if plan[5].Skip == "" || plan[5].Kind != "geosite" {
+		t.Errorf("missing geosite category was not marked skipped: %+v", plan[5])
 	}
-	if plan[7].Skip == "" || plan[7].Kind != "geoip" {
+	if plan[6].Skip == "" || plan[6].Kind != "geoip" {
 		t.Error("missing geoip category was not marked skipped")
 	}
-	if plan[8].Outbound != "proxy" {
-		t.Errorf("legacy default = %q, want proxy", plan[8].Outbound)
+	if plan[7].Outbound != "proxy" {
+		t.Errorf("legacy default = %q, want proxy", plan[7].Outbound)
 	}
 }
 

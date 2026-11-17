@@ -43,6 +43,11 @@ type ConfigGenerator struct {
 	ForceProxyDomains  []string // domains to always route through tunnel (override geoip/geosite direct rules)
 	DNSUpstream        []string // upstream DNS servers to use in tunnel config
 	SOCKSPort          int      // SOCKS5/mixed listen port (default: 2801)
+	// ProbePort reserves a loopback-only inbound for the daemon's own startup
+	// health probes. The forced probe route is scoped to that inbound, so an
+	// operator DIRECT or deny rule still applies to ordinary client traffic.
+	// Zero omits the inbound and the forced rule (no probe exemption exists).
+	ProbePort int
 	// SOCKSListen is the bind address for generated SOCKS/mixed inbounds.
 	// Empty means loopback; a LAN address is only reachable when the operator
 	// opted in through server.socks_allow_lan.
@@ -1171,14 +1176,14 @@ func (cg *ConfigGenerator) singboxRouteFromRulesFor(proxyTag string) map[string]
 	// tunnel's DoH, which survives TCP-only transports (dns-direct is plaintext
 	// UDP) and returns the uncensored answer for ISP-poisoned names.
 	rules = append(rules, cg.domainResolveRules()...)
+	// The daemon's health probes get their own inbound so they can be forced
+	// through the tunnel without rewriting the operator's rules for clients.
+	rules = append(rules, cg.singboxProbeInboundRules(proxyTag)...)
 	rules = append(rules, map[string]interface{}{
 		"ip_is_private": true,
 		"action":        "route",
 		"outbound":      "direct",
 	})
-	// Startup health probes are forced through the tunnel here so no operator or
-	// country DIRECT rule can make them verify the direct path instead.
-	rules = append(rules, singboxProbeRule(proxyTag))
 
 	// Local DNS domains (e.g. .home, .lan) → direct before applying user routing rules.
 	for _, rule := range cg.LocalDNSRules {
@@ -1258,13 +1263,25 @@ func (cg *ConfigGenerator) singboxRouteFromRulesFor(proxyTag string) map[string]
 	return route
 }
 
-// singboxProbeRule routes the startup health-probe hosts through the tunnel.
-// It is emitted before operator and country DIRECT rules on purpose.
-func singboxProbeRule(outbound string) map[string]interface{} {
-	return map[string]interface{}{
-		"domain_suffix": append([]string(nil), StartupProbeDomains...),
-		"action":        "route",
-		"outbound":      outbound,
+// singboxProbeInboundRules forces the daemon's startup probes through the
+// tunnel and closes the probe inbound to everything else. Both rules are
+// conditioned on ProbeInboundTag, so no operator rule and no deny policy is
+// overridden for traffic that arrives on a client inbound.
+func (cg *ConfigGenerator) singboxProbeInboundRules(outbound string) []map[string]interface{} {
+	if cg.ProbePort <= 0 {
+		return nil
+	}
+	return []map[string]interface{}{
+		{
+			"inbound":       []string{ProbeInboundTag},
+			"domain_suffix": append([]string(nil), StartupProbeDomains...),
+			"action":        "route",
+			"outbound":      outbound,
+		},
+		{
+			"inbound": []string{ProbeInboundTag},
+			"action":  "reject",
+		},
 	}
 }
 
@@ -1424,9 +1441,10 @@ func (cg *ConfigGenerator) singboxRouteFor(link *profile.Link, proxyTag string) 
 	// listed above a bypass rule therefore keeps its query on the tunnel.
 	rules = append(rules, cg.domainResolveRules()...)
 
-	// Rule: startup health probes — always tunnel these, so the startup HTTPS
-	// check verifies the tunnel even when a bypass or country list says DIRECT.
-	rules = append(rules, singboxProbeRule(proxyTag))
+	// Rule: the daemon's startup health probes use their own inbound, so they
+	// always verify the tunnel while operator and country rules keep applying
+	// unchanged to ordinary clients.
+	rules = append(rules, cg.singboxProbeInboundRules(proxyTag)...)
 
 	// Rule: force proxy domains — always tunnel these, even if IP is in a whitelisted country.
 	// Must come before bypass_domains and geoip/geosite direct rules.
@@ -1644,6 +1662,17 @@ func (cg *ConfigGenerator) singboxInbounds(link *profile.Link) []map[string]inte
 		local["listen"], local["tag"] = "127.0.0.1", "mixed-local"
 		inbounds = append(inbounds, local)
 	}
+	// Loopback-only inbound for the daemon's own connectivity probes. It never
+	// accepts authentication and its route is closed to every non-probe host,
+	// so exposing it on loopback adds no path around the operator's rules.
+	if cg.ProbePort > 0 {
+		inbounds = append(inbounds, map[string]interface{}{
+			"type":        "socks",
+			"tag":         ProbeInboundTag,
+			"listen":      "127.0.0.1",
+			"listen_port": cg.ProbePort,
+		})
+	}
 	return inbounds
 }
 
@@ -1857,6 +1886,21 @@ func (cg *ConfigGenerator) generateXray(link *profile.Link) (string, error) {
 		local["listen"], local["tag"] = "127.0.0.1", "socks-local"
 		cfg["inbounds"] = append(inbounds, local)
 	}
+	if cg.ProbePort > 0 {
+		inbounds := cfg["inbounds"].([]map[string]interface{})
+		cfg["inbounds"] = append(inbounds, map[string]interface{}{
+			"tag":      ProbeInboundTag,
+			"port":     cg.ProbePort,
+			"listen":   "127.0.0.1",
+			"protocol": "socks",
+			"settings": map[string]interface{}{"auth": "noauth", "udp": false},
+			"sniffing": map[string]interface{}{
+				"enabled":      true,
+				"destOverride": []string{"http", "tls"},
+				"routeOnly":    true,
+			},
+		})
+	}
 
 	// Append external outbounds (referenced by routing rules or used manually)
 	if len(cg.ExternalOutbounds) > 0 {
@@ -1867,7 +1911,7 @@ func (cg *ConfigGenerator) generateXray(link *profile.Link) (string, error) {
 	// Add routing: prefer new rule-based system, fall back to legacy whitelist config.
 	// Both shapes come from one plan so the panel's explanation matches the
 	// engine config that is actually generated.
-	if len(cg.RoutingRules) > 0 || cg.CountrySplit != "" || len(cg.WhitelistCountries) > 0 || len(cg.BypassDomains) > 0 || len(cg.ForceProxyDomains) > 0 {
+	if len(cg.RoutingRules) > 0 || cg.CountrySplit != "" || len(cg.WhitelistCountries) > 0 || len(cg.BypassDomains) > 0 || len(cg.ForceProxyDomains) > 0 || cg.ProbePort > 0 {
 		cfg["routing"] = cg.xrayRoutingSection()
 	}
 

@@ -269,6 +269,7 @@ func (cg *ConfigGenerator) singboxOpenVPNRoute() map[string]interface{} {
 	rules := []map[string]interface{}{
 		{"action": "sniff", "timeout": "300ms"},
 	}
+	rules = append(rules, cg.singboxProbeInboundRules("proxy")...)
 	for _, rule := range cg.LocalDNSRules {
 		if len(rule.Domains) == 0 {
 			continue

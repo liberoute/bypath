@@ -89,6 +89,17 @@ func freePort(t *testing.T) int {
 	return 0
 }
 
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	_ = listener.Close()
+	return port
+}
+
 func validateXray(t *testing.T, cg *ConfigGenerator) {
 	t.Helper()
 	cg.SOCKSPort = freePort(t)
@@ -252,5 +263,31 @@ func TestRealEngineXray_ProxyOnlyDefault(t *testing.T) {
 func TestRealEngineXray_DirectFinal(t *testing.T) {
 	cg := NewConfigGenerator(t.TempDir())
 	cg.RoutingRules = []RoutingRule{{Match: "default", Outbound: "direct"}}
+	validateXray(t, cg)
+}
+
+// TestRealEngineSingBox_ProbeInboundScoped loads the daemon probe inbound and
+// its two scoped rules into the pinned engine, so an unsupported rule field
+// fails here instead of at gateway start.
+func TestRealEngineSingBox_ProbeInboundScoped(t *testing.T) {
+	cg := NewConfigGenerator(t.TempDir())
+	// box.New constructs inbounds without binding them, so a TCP port is enough.
+	cg.ProbePort = freeTCPPort(t)
+	cg.RoutingRules = []RoutingRule{
+		{Match: "domain_suffix:example.com", Outbound: "block"},
+		{Match: "default", Outbound: "direct"},
+	}
+	validateSingBox(t, cg)
+}
+
+// TestRealEngineXray_ProbeInboundScoped covers the tagged probe inbound and the
+// inboundTag-scoped proxy/blackhole rules xray has to accept.
+func TestRealEngineXray_ProbeInboundScoped(t *testing.T) {
+	cg := NewConfigGenerator(t.TempDir())
+	cg.ProbePort = freePort(t)
+	cg.RoutingRules = []RoutingRule{
+		{Match: "domain_suffix:example.com", Outbound: "block"},
+		{Match: "default", Outbound: "direct"},
+	}
 	validateXray(t, cg)
 }

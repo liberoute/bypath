@@ -78,21 +78,22 @@ func (cg *ConfigGenerator) singboxGeoGate(kind, value string) (string, string) {
 	return tag, ""
 }
 
-// StartupProbeDomains are the hosts the gateway contacts to prove its tunnel.
-// Every generated config forces them through the tunnel ahead of operator and
-// country rules: a startup probe must never pass on a DIRECT rule while the
-// proxy outbound is broken. A suffix covers the www. form the probes use.
-var StartupProbeDomains = []string{"example.com", "gstatic.com"}
+// ProbeInboundTag names the loopback SOCKS inbound the gateway reserves for its
+// own startup health probes. The forced probe route is scoped to this inbound,
+// so client traffic through the operator listeners keeps following the explicit
+// routing rules and deny policies even for the probe hostnames.
+const ProbeInboundTag = "bypath-probe"
 
-// probePlanEntry is the ordered plan entry mirroring that forced rule.
-func probePlanEntry() PlanEntry {
-	return PlanEntry{
-		Scope:       "probe",
-		Kind:        "domain_suffix_list",
-		Domains:     append([]string(nil), StartupProbeDomains...),
-		Outbound:    "proxy",
-		SourceIndex: -1,
-	}
+// StartupProbeDomains are the hosts the gateway contacts to prove its tunnel.
+// They only bypass operator and country rules for the probe inbound above; a
+// startup probe must never verify the direct path while the proxy is broken,
+// and an operator rule must never be silently overridden for other clients.
+// A suffix covers the www. and generate_204 forms the probes use.
+var StartupProbeDomains = []string{
+	"example.com",
+	"gstatic.com",
+	"msftconnecttest.com",
+	"captive.apple.com",
 }
 
 // RoutingPlan builds the ordered plan the named engine evaluates. The panel and
@@ -208,7 +209,6 @@ func (cg *ConfigGenerator) planWithGate(gate geoGate) []PlanEntry {
 		Outbound:    "direct",
 		SourceIndex: -1,
 	}}
-	plan = append(plan, probePlanEntry())
 
 	if len(cg.RoutingRules) > 0 {
 		for _, rule := range cg.LocalDNSRules {
@@ -350,6 +350,25 @@ func (cg *ConfigGenerator) planFromRule(index int, rule RoutingRule, gate geoGat
 func (cg *ConfigGenerator) xrayRoutingSection() map[string]interface{} {
 	finalOutbound := "proxy"
 	var rules []map[string]interface{}
+
+	// The daemon's probe inbound is forced through the tunnel and closed to
+	// everything else. Both rules carry the inbound tag, so they never decide a
+	// client destination and cannot override an operator rule or deny policy.
+	if cg.ProbePort > 0 {
+		rules = append(rules,
+			map[string]interface{}{
+				"type":        "field",
+				"inboundTag":  []string{ProbeInboundTag},
+				"domain":      append([]string(nil), StartupProbeDomains...),
+				"outboundTag": "proxy",
+			},
+			map[string]interface{}{
+				"type":        "field",
+				"inboundTag":  []string{ProbeInboundTag},
+				"outboundTag": xrayBlockOutboundTag,
+			},
+		)
+	}
 
 	for _, entry := range cg.XrayRoutingPlan() {
 		if entry.Kind == "default" {

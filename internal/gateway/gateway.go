@@ -76,6 +76,7 @@ type Gateway struct {
 	realGW    string // e.g., "192.168.1.1"
 	subnet    string // e.g., "192.168.1.0/24"
 	socksPort int
+	probePort int // loopback inbound reserved for the gateway's own health probes
 	dnsPort   int
 
 	ctx    context.Context
@@ -321,6 +322,7 @@ func (gw *Gateway) startWithContext(ctx context.Context, h *startupHooks) error 
 	// 3. Start tunnel engine (with auto-fallback). Ownership may already be
 	// recorded, so a failed start is rolled back before returning instead of
 	// leaving host state pending.
+	gw.probePort = reserveProbePort(gw.socksPort)
 	if err := startEngine(activeLink); err != nil {
 		gw.stopLocked()
 		return fmt.Errorf("starting engine: %w", err)
@@ -401,6 +403,9 @@ func (gw *Gateway) startWithContext(ctx context.Context, h *startupHooks) error 
 	log.Printf("   Local IP:   %s", gw.localIP)
 	socksAddr := gw.config.Server.SOCKSListenAddress()
 	log.Printf("   SOCKS:      %s:%d", socksAddr, gw.socksPort)
+	if gw.probePort > 0 {
+		log.Printf("   Probe:      127.0.0.1:%d (health checks only)", gw.probePort)
+	}
 	// DNS is only reported when this run actually owns a listener (D7).
 	if gw.dnsProc != nil || len(gw.dnsBuiltin) > 0 {
 		log.Printf("   DNS:        :%d", gw.dnsPort)
@@ -819,6 +824,25 @@ func (gw *Gateway) probeTimeout() time.Duration {
 	return defaultProbeTimeout
 }
 
+// reserveProbePort picks a free loopback port for the daemon's probe inbound
+// and releases it again; the engine binds it when it starts. Zero means no port
+// could be reserved, in which case no forced probe route is generated and the
+// probes fall back to the client listener.
+func reserveProbePort(socksPort int) int {
+	for i := 0; i < 4; i++ {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return 0
+		}
+		port := l.Addr().(*net.TCPAddr).Port
+		l.Close()
+		if port > 0 && port != socksPort {
+			return port
+		}
+	}
+	return 0
+}
+
 // startEngineWithLinkFallback tries the given link first, then falls back to other links
 // in the same group if the first one fails or can't connect.
 // For each link it tries the preferred engine first, then falls back to the alternative
@@ -1046,13 +1070,22 @@ func (gw *Gateway) startEngineWithEngineFallback(ctx context.Context, link *prof
 func (gw *Gateway) verifyConnection(ctx context.Context) bool {
 	// Called while the lifecycle lock is held, so the config and port reads
 	// below cannot race a reload.
+	ok, _ := ProbeDataPath(ctx, gw.probeSocksAddr(), gw.probeTimeout())
+	return ok
+}
+
+// probeSocksAddr is the listener the daemon's own probes must enter through.
+// The reserved probe inbound exists precisely so the forced tunnel route is
+// scoped to it; the client listener keeps the operator's rules.
+func (gw *Gateway) probeSocksAddr() string {
+	if gw.probePort > 0 {
+		return net.JoinHostPort("127.0.0.1", strconv.Itoa(gw.probePort))
+	}
 	listen := strings.TrimSpace(gw.config.Server.SOCKSListen)
-	port := gw.socksPort
 	if listen == "" || listen == "0.0.0.0" || listen == "::" {
 		listen = "127.0.0.1"
 	}
-	ok, _ := ProbeDataPath(ctx, net.JoinHostPort(listen, strconv.Itoa(port)), gw.probeTimeout())
-	return ok
+	return net.JoinHostPort(listen, strconv.Itoa(gw.socksPort))
 }
 
 // httpsProbeTargets are independent TLS endpoints. example.com is IANA-owned
@@ -1066,7 +1099,10 @@ var httpsProbeTargets = []string{
 // verifyHTTPS proves the tunnel carries a verified TLS handshake and an HTTP
 // answer, not just a plaintext relay.
 func (gw *Gateway) verifyHTTPS(ctx context.Context) bool {
-	port := gw.socksPort
+	port := gw.probePort
+	if port <= 0 {
+		port = gw.socksPort
+	}
 	if port <= 0 {
 		return false
 	}
@@ -1236,6 +1272,7 @@ func (gw *Gateway) engineConfigGenerator(pinnedHosts map[string]string) *tunnel.
 		configGen.LocalDNSRules = rules
 	}
 	configGen.SOCKSPort = gw.socksPort
+	configGen.ProbePort = gw.probePort
 	configGen.SOCKSListen = gw.config.Server.SOCKSListenAddress()
 	configGen.SOCKSUsername = gw.config.Server.SOCKSUsername
 	configGen.SOCKSPassword = gw.config.Server.SOCKSPassword
