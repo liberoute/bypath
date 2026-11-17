@@ -41,6 +41,11 @@ test-guard:
 	docker run --rm --cap-add NET_ADMIN --cap-add NET_RAW bypath-guard-test
 	@echo "📊 Coverage report: coverage.html"
 
+test-guard-nonetadmin:
+	@echo "🔒 Running loopback startup regression in a root container without NET_ADMIN..."
+	docker build -f test/integration/guard/Dockerfile -t bypath-guard-test .
+	docker run --rm -e BYPATH_GUARD_NO_NETADMIN=1 --entrypoint go bypath-guard-test test -count=1 -v -run NoNetAdmin ./internal/proxyguard
+
 ## Run linter
 lint:
 	@echo "🔍 Running vet..."

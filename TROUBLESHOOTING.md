@@ -191,10 +191,34 @@ removal and install a fresh guard. A chain that contains any rule without a
 marker is left untouched and startup keeps refusing: inspect it rather than
 deleting it.
 
+The guard is owned by a process as well as by a marker: the daemon holds an
+exclusive lock (`/var/lib/bypath/proxy-guard.lock`) for its whole lifetime, and
+every install or removal runs under that lock. `bypath stop` therefore removes
+only the guard of the run it stopped, and two stop messages mean a guard was
+deliberately kept:
+
+- `Proxy guard kept: it belongs to a bypath process that is still running.`
+  Another bypath process, typically an automatic restart, owns the guard and
+  keeps its containment.
+- `Proxy guard kept: a newer bypath run installed its own guard.`
+  The stopped run's record was replaced before the cleanup ran; the newer run's
+  guard is left alone.
+
+Neither message is an error. To remove that guard, stop the running bypath
+service first. The stop command waits up to two seconds for the guard lock
+before reporting either message.
+
+A loopback-only listener (`server.socks_listen: 127.0.0.1`) installs no guard
+and needs no `iptables` access, including in containers without `NET_ADMIN`. A
+guard left by an earlier LAN-mode run stays installed and keeps clients blocked
+until a LAN-mode start or `bypath stop` reconciles it.
+
 After a crash, `sudo bypath stop` removes the guard once the daemon is confirmed
-gone, so a binary swap or a rollback to an older build starts from a clean
-firewall. Do not delete `BYPATH_PROXY_IN` or its INPUT jumps by hand unless the
-rules are visibly foreign.
+gone. Run that stop with the current build before installing an older binary:
+builds before 3.0.0-rc.4 cannot always finish a guard left by a crash, and a
+documented stop is what makes the rollback start from a clean firewall. Do not
+delete `BYPATH_PROXY_IN` or its INPUT jumps by hand unless the rules are
+visibly foreign.
 
 ## Collecting a useful report
 

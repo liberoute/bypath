@@ -16,6 +16,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/liberoute/bypath/internal/config"
@@ -31,6 +32,76 @@ var trustedLANs = config.TrustedLANs
 var writeState = serviceop.AtomicWrite
 var Command = func(ctx context.Context, args ...string) ([]byte, error) {
 	return exec.CommandContext(ctx, "/usr/sbin/iptables", args...).CombinedOutput()
+}
+
+// Every destructive guard operation runs under one exclusive lock in the
+// record's directory. The daemon holds it for its whole lifetime, so a stop in
+// another process can neither run between a run's ownership proof and its
+// install nor remove a guard a replacement run is holding.
+var (
+	ErrGuardBusy     = errors.New("proxy guard is in use by a running bypath process")
+	ErrGuardReplaced = errors.New("proxy guard belongs to a different run")
+	lockWait         = 2 * time.Second
+)
+
+type lease struct {
+	file *os.File
+}
+
+// held is the lease of the daemon in this process, if any.
+var held *lease
+
+func lockPath() string {
+	return filepath.Join(filepath.Dir(statePath), "proxy-guard.lock")
+}
+
+func lockGuard(wait time.Duration) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(statePath), 0700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(lockPath(), os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0600)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return f, nil
+		}
+		if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN && err != syscall.EINTR {
+			f.Close()
+			return nil, err
+		}
+		if time.Now().After(deadline) {
+			f.Close()
+			return nil, ErrGuardBusy
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func unlockGuard(f *os.File) {
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	f.Close()
+}
+
+func releaseHeld() {
+	if held == nil {
+		return
+	}
+	unlockGuard(held.file)
+	held = nil
+}
+
+// RecordToken reports the token of the guard currently recorded on disk. The
+// stop path samples it before stopping so its cleanup stays bound to that run.
+func RecordToken() string {
+	r, err := load()
+	if err != nil {
+		return ""
+	}
+	return r.Token
 }
 
 type entry struct {
@@ -405,26 +476,37 @@ func removeRecord() error {
 
 // Ensure installs containment before any engine listener starts, in proxy-only
 // and gateway modes. An unverifiable LAN or foreign chain prevents engine
-// startup.
+// startup. The guard lock is held until Cleanup, so no other process can
+// replace or remove this run's guard while it serves.
 func Ensure(cfg *config.Config) error {
-	if rootUID() != 0 {
-		if cfg.Server.SOCKSListenAddress() == "127.0.0.1" {
-			return nil
-		}
-		return errors.New("LAN proxy requires root-owned IPv4 firewall")
-	}
-	if err := Cleanup(); err != nil {
-		return err
-	}
 	if cfg.Server.SOCKSListenAddress() == "127.0.0.1" {
+		// A loopback listener exposes nothing to the LAN: no guard is needed, so
+		// no iptables access may be required. A guard left by an earlier LAN-mode
+		// run stays fail-closed until a LAN start or an explicit stop reconciles it.
 		return nil
 	}
-	lan, err := trustedLANs(cfg.Gateway.Interface, cfg.Server.SOCKSAllowCIDRs)
+	if rootUID() != 0 {
+		return errors.New("LAN proxy requires root-owned IPv4 firewall")
+	}
+	releaseHeld()
+	f, err := lockGuard(lockWait)
 	if err != nil {
 		return err
 	}
+	held = &lease{file: f}
+	fail := func(err error) error {
+		releaseHeld()
+		return err
+	}
+	if err := cleanupLocked("", false); err != nil {
+		return fail(err)
+	}
+	lan, err := trustedLANs(cfg.Gateway.Interface, cfg.Server.SOCKSAllowCIDRs)
+	if err != nil {
+		return fail(err)
+	}
 	if !cfg.Server.SOCKSAllowLAN {
-		return errors.New("LAN bind not confirmed")
+		return fail(errors.New("LAN bind not confirmed"))
 	}
 	addr := cfg.Server.SOCKSListenAddress()
 	bound := addr == "0.0.0.0"
@@ -434,38 +516,35 @@ func Ensure(cfg *config.Config) error {
 		}
 	}
 	if !bound {
-		return errors.New("proxy bind is not the trusted LAN interface")
+		return fail(errors.New("proxy bind is not the trusted LAN interface"))
 	}
 	v, err := inspect()
 	if err != nil {
-		return err
+		return fail(err)
 	}
 	if v.exists {
-		return errors.New("refusing foreign proxy firewall chain")
+		return fail(errors.New("refusing foreign proxy firewall chain"))
 	}
 	var token [16]byte
 	if _, err = rand.Read(token[:]); err != nil {
-		return err
+		return fail(err)
 	}
 	r := record{Token: hex.EncodeToString(token[:]), Port: cfg.Server.SOCKSPort}
 	for _, l := range lan {
 		r.Entries = append(r.Entries, entry{CIDR: l.CIDR, Interface: l.Interface})
 	}
 	r.Rules = ruleSet(r)
-	if err = os.MkdirAll(filepath.Dir(statePath), 0700); err != nil {
-		return err
-	}
 	b, _ := json.Marshal(r)
 	if err = writeState(statePath, b); err != nil {
-		return err
+		return fail(err)
 	}
 	if err = install(r); err != nil {
 		// A half-installed chain is recoverable on the next start because the
 		// record names every rule; deleting the record here would strand it.
 		if undoErr := uninstall(r); undoErr != nil {
-			return fmt.Errorf("%w (guard cleanup failed: %v)", err, undoErr)
+			return fail(fmt.Errorf("%w (guard cleanup failed: %v)", err, undoErr))
 		}
-		return err
+		return fail(err)
 	}
 	return nil
 }
@@ -536,13 +615,49 @@ func firewallUnavailable(err error) bool {
 	return errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist)
 }
 
-// Cleanup removes the guard only after proving whose it is. The record is the
-// primary proof; a uniform marker over the exact guard structure is the
-// recovery proof when the record was lost. The record is deleted last and only
-// after two listings confirm the chain is gone, so no crash window can leave an
-// unowned chain behind.
+// Cleanup removes the guard of this process's run, or, without a lease, any
+// guard that is verifiably bypath's. It is the daemon's shutdown path.
 func Cleanup() error {
+	if held != nil {
+		defer releaseHeld()
+		return cleanupLocked("", false)
+	}
+	f, err := lockGuard(lockWait)
+	if err != nil {
+		return err
+	}
+	defer unlockGuard(f)
+	return cleanupLocked("", false)
+}
+
+// CleanupOwned is the stop-time entry point. It removes the guard only when the
+// record still names the token that was sampled before that daemon was stopped.
+// A replacement daemon either holds the guard lock (ErrGuardBusy) or has
+// recorded its own token (ErrGuardReplaced); in both cases its guard is left
+// in place. With a lost or corrupt record the chain is still adopted only when
+// the lock proves no daemon is running (adoption never touches foreign rules).
+func CleanupOwned(token string) error {
+	if held != nil {
+		return ErrGuardBusy
+	}
+	f, err := lockGuard(lockWait)
+	if err != nil {
+		return err
+	}
+	defer unlockGuard(f)
+	return cleanupLocked(token, true)
+}
+
+// cleanupLocked removes the guard only after proving whose it is, with the
+// guard lock already held. The record is the primary proof; a uniform marker
+// over the exact guard structure is the recovery proof when the record was
+// lost. The record is deleted last and only after two listings confirm the
+// chain is gone, so no crash window can leave an unowned chain behind.
+func cleanupLocked(token string, scoped bool) error {
 	r, recErr := load()
+	if scoped && recErr == nil && (token == "" || r.Token != token) {
+		return ErrGuardReplaced
+	}
 	v, err := inspect()
 	if err != nil {
 		if recErr != nil && firewallUnavailable(err) {

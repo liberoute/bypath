@@ -70,6 +70,7 @@ func iptablesState(t *testing.T) string {
 // forceGuardCleanup is test-only surgery. It removes the guard objects even
 // when ownership cannot be proven, so one failing test cannot poison the next.
 func forceGuardCleanup() {
+	releaseHeld()
 	out, _ := run("-S")
 	for _, line := range strings.Split(string(out), "\n") {
 		f := strings.Fields(line)
@@ -83,6 +84,7 @@ func forceGuardCleanup() {
 		run("-X", chain)
 	}
 	os.Remove(statePath)
+	os.Remove(lockPath())
 }
 
 func guardPresent(t *testing.T) (rules int, jumps int) {

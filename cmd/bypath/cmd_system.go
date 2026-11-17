@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -61,6 +62,15 @@ func cmdStop(args []string) {
 	p := paths.Get()
 	pidPath := p.PidFile
 
+	// Sample the guard's ownership identity before stopping. The cleanup below
+	// then removes only the guard of the run that was stopped: a replacement
+	// daemon that starts in the meantime records a different token and holds the
+	// guard lock, so its firewall chain is never deleted on its behalf.
+	guardToken := ""
+	if os.Geteuid() == 0 {
+		guardToken = proxyguard.RecordToken()
+	}
+
 	pid, running := pidfile.IsRunningFromFile(pidPath)
 	stoppedRemotely := false
 	if running {
@@ -108,9 +118,16 @@ func cmdStop(args []string) {
 	// daemon, or a rollback to a binary older than the crash-consistent guard,
 	// will refuse to start while a recorded or adoptable guard is still
 	// installed. With the daemon confirmed gone, finish that removal here so a
-	// documented stop is enough before any binary is started again.
+	// documented stop is enough before any binary is started again. The token
+	// sampled above keeps this bound to the stopped run.
 	if os.Geteuid() == 0 {
-		if err := proxyguard.Cleanup(); err != nil {
+		switch err := proxyguard.CleanupOwned(guardToken); {
+		case err == nil:
+		case errors.Is(err, proxyguard.ErrGuardBusy):
+			fmt.Println("  🛡️  Proxy guard kept: it belongs to a bypath process that is still running.")
+		case errors.Is(err, proxyguard.ErrGuardReplaced):
+			fmt.Println("  🛡️  Proxy guard kept: a newer bypath run installed its own guard.")
+		default:
 			fmt.Printf("  ⚠️  Proxy guard not removed: %v\n", err)
 		}
 	}

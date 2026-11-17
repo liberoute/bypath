@@ -91,8 +91,10 @@ func (f *firewall) command(_ context.Context, args ...string) ([]byte, error) {
 }
 func setup(t *testing.T) *firewall {
 	t.Helper()
+	releaseHeld()
 	oldCmd, oldPath, oldRoot, oldCheck, oldLAN, oldWrite := Command, statePath, rootUID, checkState, trustedLANs, writeState
 	t.Cleanup(func() {
+		releaseHeld()
 		Command, statePath, rootUID, checkState, trustedLANs, writeState = oldCmd, oldPath, oldRoot, oldCheck, oldLAN, oldWrite
 	})
 	f := &firewall{chains: map[string][]string{"INPUT": {}}}
