@@ -130,6 +130,10 @@ type TestResult struct {
 	LatencyMS   int64 `json:"latency_ms"`
 	P50MS       int64 `json:"p50_ms"`
 	P90MS       int64 `json:"p90_ms"`
+	// DelayMS is the fast per-connection delay: one low-overhead HTTPS request
+	// that stops at the response headers. LatencyMS/P50/P90 stay the full
+	// exchange metric, so a slow body never inflates the delay.
+	DelayMS int64 `json:"delay_ms,omitempty"`
 	// Speed fields. MBps is counted payload throughput; Bytes is what Bypath
 	// itself counted, never true link-level usage.
 	MBps          float64 `json:"mbps,omitempty"`

@@ -70,9 +70,15 @@ func operationalHTTPS(res TestResult) bool {
 	return false
 }
 
+// speedMinRemainder stops retrying when the budget left for this link is too
+// small to produce a rate worth ranking.
+const speedMinRemainder = 256 << 10
+
 // speedThrough validates a target on the tested path and downloads it from the
 // first address that accepts the connection. Every address is re-checked at
-// use, and the connection is pinned to it for the whole transfer.
+// use, and the connection is pinned to it for the whole transfer. A failed
+// attempt hands the next address only the budget that is left, so retries can
+// never spend more payload than the link's cap.
 func (s *Local) speedThrough(ctx context.Context, port int, live bool, target SpeedTarget, capBytes int64) (downloadResult, TargetCheck, error) {
 	if capBytes <= 0 {
 		capBytes = 10 << 20
@@ -83,6 +89,7 @@ func (s *Local) speedThrough(ctx context.Context, port int, live bool, target Sp
 	}
 	dynamic := localDeniedNets()
 	var lastErr error
+	var last downloadResult
 	var spent int64
 	for _, raw := range check.ResolvedIPs {
 		ip := net.ParseIP(raw)
@@ -90,26 +97,35 @@ func (s *Local) speedThrough(ctx context.Context, port int, live bool, target Sp
 			lastErr = fmt.Errorf("target address is %s", why)
 			continue
 		}
+		remaining := capBytes - spent
+		if remaining < speedMinRemainder {
+			if lastErr == nil {
+				lastErr = errors.New("the transfer budget for this connection is spent")
+			}
+			break
+		}
 		client := pinnedClient(port, target.Host, ip)
-		res, err := downloadBounded(ctx, client, target.URL, capBytes, speedDurationCap)
+		res, err := downloadBounded(ctx, client, target.URL, remaining, speedDurationCap)
 		client.CloseIdleConnections()
-		spent += res.Bytes
+		spent += res.Received
 		if err == nil {
 			res.Spent = spent
 			return res, check, nil
 		}
+		last = res
 		lastErr = err
 		if errors.Is(err, errRedirected) {
 			break
 		}
 		if ctx.Err() != nil {
-			return downloadResult{Spent: spent}, check, ctx.Err()
+			return downloadResult{Spent: spent, Received: spent}, check, ctx.Err()
 		}
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no validated address accepted the connection")
 	}
-	return downloadResult{Spent: spent}, check, lastErr
+	last.Spent = spent
+	return last, check, lastErr
 }
 
 // chargeSpeedAttempt records the payload a measurement actually transferred,
@@ -135,9 +151,12 @@ func (s *Local) countedBytes() int64 {
 }
 
 // speedFailure maps a transfer failure onto the result contract. A target that
-// fails stage 0 is Inconclusive, not Failed: the link was never measured.
+// fails stage 0 is Inconclusive, not Failed: the link was never measured. A
+// transfer that died mid-body stays Failed and keeps the observed progress in
+// its detail; it is never ranked.
 func speedFailure(res TestResult, check TargetCheck, err error) TestResult {
 	var rejected targetRejectedError
+	var transfer *transferError
 	switch {
 	case errors.As(err, &rejected):
 		res.Status = TestStatusInconclusive
@@ -150,6 +169,18 @@ func speedFailure(res TestResult, check TargetCheck, err error) TestResult {
 	case errors.Is(err, context.Canceled):
 		res.Status = TestStatusCancelled
 		res.Detail = "the transfer was cancelled by user"
+	case errors.As(err, &transfer):
+		res.Detail = transfer.describe(check.Host)
+		if transfer.phase == "status" {
+			// The link answered; the registered target is what refused the run.
+			res.Status = TestStatusInconclusive
+			res.Reason = ReasonTargetRejected
+			break
+		}
+		res.Status = TestStatusFailed
+		if errors.Is(err, context.DeadlineExceeded) {
+			res.Category = CategoryUnreachable
+		}
 	case errors.Is(err, context.DeadlineExceeded):
 		res.Status, res.Category = TestStatusFailed, CategoryUnreachable
 		res.Detail = "the transfer timed out"

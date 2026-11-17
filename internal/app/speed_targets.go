@@ -11,10 +11,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/liberoute/bypath/internal/config"
@@ -365,28 +367,139 @@ func pinnedClient(socksPort int, host string, ip net.IP) *http.Client {
 		DialContext:         dial,
 		TLSClientConfig:     &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12},
 		TLSHandshakeTimeout: 8 * time.Second,
-		DisableKeepAlives:   true,
-		DisableCompression:  true,
+		// A target that never answers must fail on its own phase, so the next
+		// validated address can be tried while the transfer budget remains.
+		ResponseHeaderTimeout: 15 * time.Second,
+		DisableKeepAlives:     true,
+		DisableCompression:    true,
 	}
+	// The caller's context is the wall-clock bound. A client timeout shorter
+	// than that would report a generic timeout while the body was still moving.
 	return &http.Client{
 		Transport: transport,
-		Timeout:   20 * time.Second,
+		Timeout:   0,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
 }
 
+// Speed sampling policy. Throughput is computed over a steady-state body
+// window: the TCP/TLS handshake and the first response byte are setup, not
+// transfer, and on a 1 s-RTT tunnel they can take longer than a small sample.
+// A body longer than speedWarmupMinBody skips its first speedWarmup of
+// slow-start ramp-up.
+const (
+	speedWarmup        = 1 * time.Second
+	speedWarmupMinBody = 2 * time.Second
+)
+
 // downloadResult is the counted outcome of one bounded transfer.
 type downloadResult struct {
+	// Bytes and Duration describe the steady-state window that Mbps is
+	// computed from. Received is every payload byte this attempt took off the
+	// connection, including the warm-up and any bytes read before a failure.
 	Bytes         int64
 	Duration      time.Duration
 	Mbps          float64
 	SupportsRange bool
+	Received      int64
 	// Spent is every payload byte observed across the attempts of one
 	// measurement, including attempts that failed or were cancelled. It is
 	// what the monthly counter charges; Bytes is only the ranked transfer.
 	Spent int64
+	// Phase observations for diagnosis. TTFB is request start to first body
+	// byte, so it includes connect, TLS and the response headers.
+	HTTPStatus int
+	TTFB       time.Duration
+	TLS        time.Duration
+	Total      time.Duration
+}
+
+// transferError is one failed transfer with the phase that failed and the
+// progress it had made, so a reset mid-body is distinguishable from a target
+// that never answered.
+type transferError struct {
+	phase    string // connect, tls, headers, body, status, compressed
+	status   int
+	received int64
+	elapsed  time.Duration
+	tls      time.Duration
+	ttfb     time.Duration
+	err      error
+}
+
+func (e *transferError) Error() string {
+	if e.err != nil {
+		return e.err.Error()
+	}
+	return "the transfer failed during " + e.phase
+}
+
+func (e *transferError) Unwrap() error { return e.err }
+
+// describe renders the failure without the target URL (a registered target may
+// carry query data) and with the progress that was actually observed.
+func (e *transferError) describe(host string) string {
+	name := host
+	if name == "" {
+		name = "the speed target"
+	}
+	progress := ""
+	if e.received > 0 {
+		progress = fmt.Sprintf(" after %s of payload in %s", payloadLabel(e.received), shortDuration(e.elapsed))
+	}
+	cause := ""
+	if e.err != nil {
+		var ue *url.Error
+		if errors.As(e.err, &ue) {
+			e2 := ue.Err
+			cause = ": " + Redact(e2.Error())
+		} else {
+			cause = ": " + Redact(e.err.Error())
+		}
+	}
+	setup := ""
+	if e.tls > 0 {
+		setup = fmt.Sprintf(" (TLS handshake %s, first byte %s)", shortDuration(e.tls), shortDuration(e.ttfb))
+	}
+	switch e.phase {
+	case "connect", "tls", "headers":
+		return fmt.Sprintf("%s did not answer through the tested connection%s%s%s", name, setup, progress, cause)
+	case "status":
+		return fmt.Sprintf("%s answered HTTP %d after %s; nothing was downloaded", name, e.status, shortDuration(e.elapsed))
+	case "compressed":
+		return fmt.Sprintf("%s compressed the response despite an identity request; the byte count would not be payload", name)
+	case "body":
+		if errors.Is(e.err, context.DeadlineExceeded) {
+			return fmt.Sprintf("the transfer from %s timed out%s%s", name, progress, setup)
+		}
+		return fmt.Sprintf("the connection to %s was interrupted%s%s%s", name, progress, setup, cause)
+	}
+	return fmt.Sprintf("the transfer from %s failed%s%s", name, progress, cause)
+}
+
+// payloadLabel prints a byte count the way the panel does.
+func payloadLabel(bytes int64) string {
+	switch {
+	case bytes >= 1<<30:
+		return fmt.Sprintf("%.1f GiB", float64(bytes)/(1<<30))
+	case bytes >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", float64(bytes)/(1<<20))
+	case bytes >= 1<<10:
+		return fmt.Sprintf("%.0f KiB", float64(bytes)/(1<<10))
+	}
+	return fmt.Sprintf("%d B", bytes)
+}
+
+func shortDuration(d time.Duration) string {
+	switch {
+	case d >= time.Minute:
+		return fmt.Sprintf("%.1f min", d.Minutes())
+	case d >= time.Second:
+		return fmt.Sprintf("%.1f s", d.Seconds())
+	}
+	return fmt.Sprintf("%.0f ms", float64(d)/float64(time.Millisecond))
 }
 
 // errRedirected reports that the target answered with a redirect. Redirects are
@@ -396,7 +509,9 @@ var errRedirected = errors.New("this target redirected to another host — block
 // downloadBounded performs one Range-capped GET against a pinned address and
 // counts payload bytes locally. It stops at whichever cap is reached first and
 // never parses the body. Counting is at the body reader, so the number is what
-// Bypath actually received, not an estimate.
+// Bypath actually received, not an estimate. The throughput window starts at
+// the first body byte and skips a slow-start warm-up on long transfers; the
+// handshake and the first-byte wait are reported separately.
 func downloadBounded(ctx context.Context, client *http.Client, rawurl string, capBytes int64, durationCap time.Duration) (downloadResult, error) {
 	var res downloadResult
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawurl, nil)
@@ -406,49 +521,136 @@ func downloadBounded(ctx context.Context, client *http.Client, rawurl string, ca
 	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", capBytes-1))
 	req.Header.Set("Accept-Encoding", "identity")
 	req.Header.Set("User-Agent", "Bypath-speedtest")
+
+	var tlsStarted, tlsFinished, headersAt atomic.Int64
+	trace := &httptrace.ClientTrace{
+		TLSHandshakeStart:    func() { tlsStarted.Store(time.Now().UnixNano()) },
+		TLSHandshakeDone:     func(tls.ConnectionState, error) { tlsFinished.Store(time.Now().UnixNano()) },
+		GotFirstResponseByte: func() { headersAt.Store(time.Now().UnixNano()) },
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		return res, err
+		phase := "connect"
+		if tlsStarted.Load() != 0 && tlsFinished.Load() == 0 {
+			phase = "tls"
+		}
+		return res, &transferError{
+			phase: phase, elapsed: time.Since(start),
+			tls: span(tlsStarted.Load(), tlsFinished.Load()),
+			err: err,
+		}
 	}
 	defer resp.Body.Close()
+	res.HTTPStatus = resp.StatusCode
+	res.TLS = span(tlsStarted.Load(), tlsFinished.Load())
+	if at := headersAt.Load(); at != 0 {
+		ttfb := time.Duration(at - start.UnixNano())
+		if ttfb > 0 {
+			res.TTFB = ttfb
+		}
+	}
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		return res, errRedirected
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return res, fmt.Errorf("this target answered HTTP %d", resp.StatusCode)
+		return res, &transferError{
+			phase: "status", status: resp.StatusCode, elapsed: time.Since(start),
+			tls: res.TLS, err: fmt.Errorf("this target answered HTTP %d", resp.StatusCode),
+		}
 	}
 	if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
-		return res, errors.New("this target compressed the response despite an identity request")
+		return res, &transferError{
+			phase: "compressed", status: resp.StatusCode, elapsed: time.Since(start),
+			tls: res.TLS, err: errors.New("this target compressed the response despite an identity request"),
+		}
 	}
 	res.SupportsRange = resp.StatusCode == http.StatusPartialContent
-	deadline := start.Add(durationCap)
+
+	var (
+		received    int64
+		bodyStart   time.Time
+		warmupDone  time.Time
+		warmupBytes int64
+	)
 	buf := make([]byte, 32<<10)
-	for res.Bytes < capBytes {
-		if ctx.Err() != nil {
-			return res, ctx.Err()
+	for received < capBytes {
+		if cerr := ctx.Err(); cerr != nil {
+			res.Bytes, res.Received = received, received
+			return res, &transferError{
+				phase: "body", status: resp.StatusCode, received: received,
+				elapsed: time.Since(start), tls: res.TLS, ttfb: res.TTFB,
+				err: cerr,
+			}
 		}
-		if durationCap > 0 && time.Now().After(deadline) {
+		if !bodyStart.IsZero() && durationCap > 0 && time.Since(bodyStart) > durationCap {
 			break
 		}
 		window := int64(len(buf))
-		if left := capBytes - res.Bytes; left < window {
+		if left := capBytes - received; left < window {
 			window = left
 		}
-		n, err := resp.Body.Read(buf[:window])
-		res.Bytes += int64(n)
-		if err == io.EOF {
+		n, rerr := resp.Body.Read(buf[:window])
+		if n > 0 {
+			now := time.Now()
+			if bodyStart.IsZero() {
+				bodyStart = now
+				warmupDone = now.Add(speedWarmup)
+			}
+			received += int64(n)
+			if warmupBytes == 0 && !warmupDone.IsZero() && !now.Before(warmupDone) {
+				warmupBytes = received
+			}
+		}
+		if rerr == io.EOF {
 			break
 		}
-		if err != nil {
-			return res, err
+		if rerr != nil {
+			res.Bytes, res.Received = received, received
+			return res, &transferError{
+				phase: "body", status: resp.StatusCode, received: received,
+				elapsed: time.Since(start), tls: res.TLS, ttfb: res.TTFB,
+				err: rerr,
+			}
 		}
 	}
-	res.Duration = time.Since(start)
+	res.Received = received
+	res.Total = time.Since(start)
+	if bodyStart.IsZero() {
+		res.Bytes, res.Duration = 0, 0
+		return res, &transferError{
+			phase: "body", status: resp.StatusCode, elapsed: res.Total,
+			tls: res.TLS, err: errors.New("the target returned no body bytes"),
+		}
+	}
+	if res.TTFB == 0 {
+		res.TTFB = bodyStart.Sub(start)
+	}
+	bodyDuration := time.Since(bodyStart)
+	res.Bytes, res.Duration = received, bodyDuration
+	if bodyDuration >= speedWarmupMinBody && warmupBytes > 0 && warmupBytes < received {
+		res.Bytes = received - warmupBytes
+		res.Duration = bodyDuration - speedWarmup
+	}
+	if res.Duration <= 0 {
+		// The whole body arrived inside one clock tick. That is not a network
+		// path, but the transfer did complete; keep the outcome and a floor so
+		// the rate stays finite.
+		res.Duration = time.Microsecond
+	}
 	if res.Duration > 0 {
 		res.Mbps = float64(res.Bytes) * 8 / res.Duration.Seconds() / 1e6
 	}
 	return res, nil
+}
+
+func span(from, to int64) time.Duration {
+	if from == 0 || to == 0 || to <= from {
+		return 0
+	}
+	return time.Duration(to - from)
 }
 
 // ---------------------------------------------------------------------------

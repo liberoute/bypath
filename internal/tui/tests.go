@@ -590,8 +590,8 @@ func evidenceWithoutAge(res app.TestResult) string {
 		if res.Kind == "speed" && res.MBps > 0 {
 			return throughputLine(res) + " · exit unproven"
 		}
-		if res.P50MS > 0 {
-			return fmt.Sprintf("%d ms · exit unproven", res.P50MS)
+		if pair := msPair(res); pair != "" {
+			return pair + " · exit unproven"
 		}
 		return "measured; exit unproven"
 	}
@@ -601,8 +601,8 @@ func evidenceWithoutAge(res app.TestResult) string {
 	if res.Kind == "speed" && res.MBps > 0 {
 		return throughputLine(res)
 	}
-	if res.P50MS > 0 {
-		return fmt.Sprintf("%d ms", res.P50MS)
+	if pair := msPair(res); pair != "" {
+		return pair
 	}
 	return ""
 }
@@ -780,7 +780,7 @@ func (m *Menu) compareRow(cursor int, entry compareEntry, w int) string {
 		if res.Kind == "speed" {
 			value = throughputLine(res)
 		} else {
-			value = fmt.Sprintf("p50 %s · p90 %s", fmtMs(latencyMS(res)), fmtMs(res.P90MS))
+			value = fmt.Sprintf("delay %s · https p90 %s", fmtMs(latencyMS(res)), fmtMs(res.P90MS))
 		}
 	}
 	if value == "" {
@@ -1076,11 +1076,37 @@ func (m *Menu) pickTestLink() {
 
 // --- result helpers ---
 
+// latencyMS is the metric used to rank a latency row: the fast per-connection
+// delay when recorded, the full HTTPS median otherwise (older rows).
 func latencyMS(res app.TestResult) int64 {
+	if res.DelayMS > 0 {
+		return res.DelayMS
+	}
 	if res.P50MS > 0 {
 		return res.P50MS
 	}
 	return res.LatencyMS
+}
+
+// httpsMS is the full exchange figure, kept separate from the fast delay so a
+// slow body or probe page cannot be read as connection latency.
+func httpsMS(res app.TestResult) int64 {
+	if res.P50MS > 0 {
+		return res.P50MS
+	}
+	return res.LatencyMS
+}
+
+// msPair renders "delay N ms · https M ms" when both figures exist.
+func msPair(res app.TestResult) string {
+	delay, https := latencyMS(res), httpsMS(res)
+	switch {
+	case delay > 0 && https > 0 && delay != https:
+		return fmt.Sprintf("delay %d ms · https %d ms", delay, https)
+	case delay > 0:
+		return fmt.Sprintf("%d ms", delay)
+	}
+	return ""
 }
 
 func fmtMs(ms int64) string {
@@ -1245,8 +1271,8 @@ func evidenceOf(res app.TestResult) string {
 		parts := []string{}
 		if res.Kind == "speed" && res.MBps > 0 {
 			parts = append(parts, throughputLine(res))
-		} else if res.P50MS > 0 {
-			parts = append(parts, fmt.Sprintf("%d ms", res.P50MS))
+		} else if pair := msPair(res); pair != "" {
+			parts = append(parts, pair)
 		}
 		if res.Status == "measured" {
 			parts = append(parts, "exit unproven")

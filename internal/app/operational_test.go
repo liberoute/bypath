@@ -37,15 +37,16 @@ func stubIsolatedSeams(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := &bench.Session{Engine: "sing-box", Port: 19001, Config: cfg, ConfigFile: file, EngineOwned: true}
-	prevOpen, prevProbe, prevExit, prevSample, prevDiag := openTestSession, pickTestProbe, readTestExit, sampleTestSession, diagnoseEndpoint
+	prevOpen, prevProbe, prevExit, prevSample, prevDiag, prevDelay := openTestSession, pickTestProbe, readTestExit, sampleTestSession, diagnoseEndpoint, measureTestDelay
 	t.Cleanup(func() {
-		openTestSession, pickTestProbe, readTestExit, sampleTestSession, diagnoseEndpoint = prevOpen, prevProbe, prevExit, prevSample, prevDiag
+		openTestSession, pickTestProbe, readTestExit, sampleTestSession, diagnoseEndpoint, measureTestDelay = prevOpen, prevProbe, prevExit, prevSample, prevDiag, prevDelay
 	})
 	openTestSession = func(context.Context, *profile.Link, bench.Options) (*bench.Session, error) { return session, nil }
 	pickTestProbe = func(context.Context, int) (string, error) { return "https://probe.example/", nil }
 	sampleTestSession = func(*bench.Session, context.Context, string, int64) (time.Duration, []byte, error) {
 		return 64 * time.Millisecond, []byte("ok"), nil
 	}
+	measureTestDelay = func(context.Context, int, string) (time.Duration, error) { return 41 * time.Millisecond, nil }
 	diagnoseEndpoint = func(context.Context, *profile.Link, bench.Options) error { return nil }
 }
 
@@ -101,6 +102,9 @@ func TestMeasuredHTTPSWithUnprovenExitKeepsNumbers(t *testing.T) {
 			}
 			if res.P50MS != 64 || res.LatencyMS != 64 || res.P90MS != 64 {
 				t.Fatalf("latency was not kept: %+v", res)
+			}
+			if res.DelayMS != 41 {
+				t.Fatalf("delay = %d ms, want the fast probe's 41 ms kept separate", res.DelayMS)
 			}
 			if VerifiedTestResult(res) {
 				t.Fatal("an operational result was certified as a proven path")

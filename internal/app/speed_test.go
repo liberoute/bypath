@@ -1,9 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -371,6 +373,184 @@ func TestDownloadBoundedCountsBytesBeforeCancel(t *testing.T) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func okResponse(body io.ReadCloser) *http.Response {
+	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: body}
+}
+
+// TestDownloadRateExcludesConnectionSetup pins the separation between setup and
+// transfer. A slow handshake used to be counted as transfer time, so a 700 ms
+// setup halved the reported rate of every small sample.
+func TestDownloadRateExcludesConnectionSetup(t *testing.T) {
+	const bodySize = 512 << 10
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		time.Sleep(600 * time.Millisecond) // connect + TLS + first byte
+		return okResponse(&pacedBody{chunk: 32 << 10, interval: time.Millisecond, left: bodySize}), nil
+	})}
+	res, err := downloadBounded(context.Background(), client, "https://dl.google.com/file", bodySize, 5*time.Second)
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	if res.Bytes != bodySize || res.Received != bodySize {
+		t.Fatalf("counted %d bytes, want %d", res.Bytes, bodySize)
+	}
+	if res.TTFB < 500*time.Millisecond {
+		t.Fatalf("first response took %s; the fixture did not delay setup", res.TTFB)
+	}
+	if res.Duration > 300*time.Millisecond {
+		t.Fatalf("rate window %s includes the setup delay", res.Duration)
+	}
+	if res.Total < res.TTFB {
+		t.Fatalf("total %s is shorter than the setup %s", res.Total, res.TTFB)
+	}
+	if res.Mbps <= 0 {
+		t.Fatalf("no rate was computed for a complete sample (bytes=%d window=%s total=%s)", res.Bytes, res.Duration, res.Total)
+	}
+}
+
+// TestDownloadRateSkipsWarmupOnLongTransfers pins the second half of the same
+// rule: a body that ran long enough to include TCP slow start ranks only its
+// steady window, while every byte received is still reported for charging.
+func TestDownloadRateSkipsWarmupOnLongTransfers(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return okResponse(&pacedBody{chunk: 32 << 10, interval: 25 * time.Millisecond, left: 120 * 32 << 10}), nil
+	})}
+	res, err := downloadBounded(context.Background(), client, "https://dl.google.com/file", 8<<20, 10*time.Second)
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	if res.Received != 120*32<<10 {
+		t.Fatalf("received %d bytes, want the whole paced body", res.Received)
+	}
+	if res.Bytes >= res.Received {
+		t.Fatalf("ranked %d of %d bytes; the warm-up was not discarded", res.Bytes, res.Received)
+	}
+	if res.Duration >= res.Total {
+		t.Fatalf("rate window %s was not shortened within %s", res.Duration, res.Total)
+	}
+}
+
+// TestMidBodyResetKeepsProgressInDetail proves a truncated transfer is still a
+// failure, but one whose detail names the phase and the progress instead of
+// repeating the request URL.
+func TestMidBodyResetKeepsProgressInDetail(t *testing.T) {
+	reset := errors.New("read tcp 127.0.0.1:52360->127.0.0.1:51607: wsarecv: An existing connection was forcibly closed by the remote host")
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return okResponse(&failingBody{chunk: 64 << 10, err: reset}), nil
+	})}
+	raw, err := downloadBounded(context.Background(), client, "https://dl.google.com/file", 4<<20, 10*time.Second)
+	var transfer *transferError
+	if !errors.As(err, &transfer) || transfer.phase != "body" {
+		t.Fatalf("error = %v, want a body transferError", err)
+	}
+	if raw.Received != 32<<10 {
+		t.Fatalf("received = %d, want %d", raw.Received, 32<<10)
+	}
+	out := speedFailure(TestResult{Kind: TestKindSpeed}, TargetCheck{Host: "dl.google.com"}, err)
+	if out.Status != TestStatusFailed {
+		t.Fatalf("status = %q, a truncated transfer is not a measurement", out.Status)
+	}
+	if out.Bytes != 0 || out.MBps != 0 || out.Seconds != 0 {
+		t.Fatalf("failed transfer was ranked: %+v", out)
+	}
+	for _, want := range []string{"interrupted", "32 KiB", "dl.google.com"} {
+		if !strings.Contains(out.Detail, want) {
+			t.Fatalf("detail %q does not mention %q", out.Detail, want)
+		}
+	}
+	if strings.Contains(out.Detail, "https://") {
+		t.Fatalf("detail repeats the target URL: %q", out.Detail)
+	}
+}
+
+// TestTargetStatusIsInconclusive keeps a target-side refusal out of the link's
+// failure record: the link answered, the registered target did not.
+func TestTargetStatusIsInconclusive(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+	})}
+	_, err := downloadBounded(context.Background(), client, "https://dl.google.com/moved", 1<<20, time.Second)
+	out := speedFailure(TestResult{Kind: TestKindSpeed}, TargetCheck{Host: "dl.google.com"}, err)
+	if out.Status != TestStatusInconclusive || out.Reason != ReasonTargetRejected {
+		t.Fatalf("status/reason = %q/%q, want inconclusive/TARGET_REJECTED", out.Status, out.Reason)
+	}
+	if !strings.Contains(out.Detail, "HTTP 404") {
+		t.Fatalf("detail %q does not name the status", out.Detail)
+	}
+}
+
+// TestBudgetExpiryKeepsProgressInDetail covers the slow-link case: the transfer
+// window ended while the body was still trickling, and the detail must say how
+// far it got instead of collapsing to "the transfer timed out".
+func TestBudgetExpiryKeepsProgressInDetail(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return okResponse(&pacedBody{chunk: 8 << 10, interval: 20 * time.Millisecond, left: 2 << 20}), nil
+	})}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	raw, err := downloadBounded(ctx, client, "https://dl.google.com/file", 2<<20, time.Minute)
+	if raw.Received == 0 {
+		t.Fatal("no progress was recorded before the budget expired")
+	}
+	var transfer *transferError
+	if !errors.As(err, &transfer) || transfer.phase != "body" {
+		t.Fatalf("error = %v, want a body transferError", err)
+	}
+	out := speedFailure(TestResult{Kind: TestKindSpeed}, TargetCheck{Host: "dl.google.com"}, err)
+	if out.Status != TestStatusFailed {
+		t.Fatalf("status = %q, want failed", out.Status)
+	}
+	if !strings.Contains(out.Detail, "timed out") || !strings.Contains(out.Detail, "payload") {
+		t.Fatalf("detail %q does not describe the stalled transfer", out.Detail)
+	}
+}
+
+type pacedBody struct {
+	chunk    int
+	interval time.Duration
+	left     int
+}
+
+func (b *pacedBody) Read(p []byte) (int, error) {
+	if b.left <= 0 {
+		return 0, io.EOF
+	}
+	time.Sleep(b.interval)
+	n := b.chunk
+	if n > len(p) {
+		n = len(p)
+	}
+	if n > b.left {
+		n = b.left
+	}
+	b.left -= n
+	for i := 0; i < n; i++ {
+		p[i] = 0x5a
+	}
+	return n, nil
+}
+
+func (b *pacedBody) Close() error { return nil }
+
+type failingBody struct {
+	chunk int
+	sent  bool
+	err   error
+}
+
+func (b *failingBody) Read(p []byte) (int, error) {
+	if b.sent {
+		return 0, b.err
+	}
+	b.sent = true
+	n := b.chunk
+	if n > len(p) {
+		n = len(p)
+	}
+	return n, nil
+}
+
+func (b *failingBody) Close() error { return nil }
 
 // cancelledBody yields one chunk and then reports cancellation, the way a
 // stopped transfer ends.

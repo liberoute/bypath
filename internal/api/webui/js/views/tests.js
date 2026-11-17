@@ -12,7 +12,7 @@ import {
 } from '../data.js';
 import {
   connectionName, evidenceOf, connectivityOf, verdictOf, reasonText, pathKind, fmtLatency, fmtMB, timeAgo,
-  verifiedResult, invalidateSupersededResults, throughputText, downloadedText, mbPerSec,
+  verifiedResult, invalidateSupersededResults, throughputText, downloadedText, mbPerSec, delayMS,
 } from '../format.js';
 import { BudgetDialog, TargetAddDialog, TargetDeleteDialog } from '../dialogs.js';
 
@@ -186,7 +186,7 @@ function failureRank(result) {
 }
 
 function sortResults(list, mode) {
-  const ms = (result) => result.p50_ms || result.latency_ms || 0;
+  const ms = (result) => delayMS(result);
   const recent = (a, b) => String(b.tested_at || '').localeCompare(String(a.tested_at || ''));
   const rows = list.slice();
   if (mode === 'latency') {
@@ -266,8 +266,9 @@ function ResultsPanel({ state }) {
               ['Connectivity', connectivityOf(result).text],
               ['Evidence', result.status === 'ok' && verifiedResult(result) ? 'verified path (L1+L2)' : result.status === 'measured' ? 'operational measurement · exit ownership unproven' : 'no verified proof'],
               ['Path', pathKind(result) || 'no proof recorded'],
-              result.kind === 'speed' ? ['Throughput', throughputText(result) || '—'] : ['Median / p90', `${fmtLatency(result.p50_ms || result.latency_ms)} / ${fmtLatency(result.p90_ms)}`],
-              result.kind === 'speed' ? ['Downloaded', downloadedText(result) || '—'] : null,
+              ['Fast delay', delayMS(result) ? `${delayMS(result)} ms` : '—'],
+              result.kind === 'speed' ? ['Throughput', throughputText(result) || '—'] : ['HTTPS median / p90', `${fmtLatency(result.p50_ms || result.latency_ms)} / ${fmtLatency(result.p90_ms)}`],
+              result.kind === 'speed' ? ['Sample', downloadedText(result) || '—'] : null,
               result.kind === 'speed' ? ['Target', result.target || '—'] : null,
               result.kind === 'speed' ? ['Counted bytes', result.bytes ? `${result.bytes} B` : '—'] : null,
               ['Exit before', result.path && result.path.exit_ip_before],
@@ -301,7 +302,7 @@ function ComparePanel({ state }) {
   const all = Array.from(latest.values());
   const byValue = (a, b) => kind === 'speed'
     ? (b.mbps || -1) - (a.mbps || -1)
-    : ((a.p50_ms || a.latency_ms || Number.POSITIVE_INFINITY) - (b.p50_ms || b.latency_ms || Number.POSITIVE_INFINITY));
+    : ((delayMS(a) || Number.POSITIVE_INFINITY) - (delayMS(b) || Number.POSITIVE_INFINITY));
   const proven = all.filter(verifiedResult).sort(byValue);
   const operational = all
     .filter((result) => !verifiedResult(result) && result.status === 'measured' && !result.superseded && !result.stale)
@@ -319,8 +320,8 @@ function ComparePanel({ state }) {
         ${kind === 'speed'
           ? html`<div><div class="v">${result.mbps ? result.mbps.toFixed(1) : '—'}</div><div class="k">Mbps</div></div>
               <div><div class="v">${mbPerSec(result) ? mbPerSec(result).toFixed(2) : '—'}</div><div class="k">MB/s</div></div>`
-          : html`<div><div class="v">${fmtLatency(result.p50_ms || result.latency_ms)}</div><div class="k">p50</div></div>
-              <div><div class="v">${fmtLatency(result.p90_ms)}</div><div class="k">p90</div></div>`}
+          : html`<div><div class="v">${fmtLatency(delayMS(result))}</div><div class="k">delay</div></div>
+              <div><div class="v">${fmtLatency(result.p90_ms)}</div><div class="k">https p90</div></div>`}
         <div><div class="v"><${ResultChip} result=${result} /></div><div class="k">evidence</div></div>
       </div>
     </div>`)}

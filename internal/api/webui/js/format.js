@@ -65,6 +65,13 @@ export function fmtLatency(ms) {
   return `${ms} ms`;
 }
 
+// delayMS is the fast per-connection delay when the backend recorded one, and
+// the full HTTPS median otherwise (older rows).
+export function delayMS(result) {
+  if (!result) return 0;
+  return result.delay_ms || result.p50_ms || result.latency_ms || 0;
+}
+
 export const REASON_TEXT = {
   CONFIG_NOT_ISOLATED: 'measured on the live tunnel; the test-tunnel configuration is not isolated',
   PATH_DIRECT_TARGET: 'the destination would go DIRECT, not through the tunnel',
@@ -147,7 +154,7 @@ export function verdictOf(result) {
 // It never upgrades a verdict; ranking still requires verifiedResult.
 export function connectivityOf(result) {
   if (!result) return { code: 'unknown', text: 'unknown' };
-  const ms = result.p50_ms || result.latency_ms || 0;
+  const ms = delayMS(result);
   switch (result.status) {
     case 'ok':
       return verifiedResult(result)
@@ -179,17 +186,21 @@ export function evidenceOf(result) {
   if (!result) return '';
   if (result.superseded) return 'a later attempt invalidated this proof';
   if (result.status === 'ok' && !verifiedResult(result)) return 'stale or incomplete path proof; not ranked';
-  if (result.status === 'ok') {
+  const facts = () => {
     const parts = [];
     if (result.kind === 'speed' && result.mbps) parts.push(throughputText(result));
-    else if (result.p50_ms) parts.push(`${result.p50_ms} ms`);
+    if (result.delay_ms) parts.push(`delay ${result.delay_ms} ms`);
+    if (result.p50_ms && result.p50_ms !== result.delay_ms) parts.push(`https ${result.p50_ms} ms`);
+    if (!result.delay_ms && result.p50_ms) parts.push(`${result.p50_ms} ms`);
+    return parts;
+  };
+  if (result.status === 'ok') {
+    const parts = facts();
     if (result.tested_at) parts.push(timeAgo(result.tested_at));
     return parts.join(' · ');
   }
   if (result.status === 'measured') {
-    const parts = [];
-    if (result.kind === 'speed' && result.mbps) parts.push(throughputText(result));
-    else if (result.p50_ms) parts.push(`${result.p50_ms} ms`);
+    const parts = facts();
     parts.push('exit unproven');
     if (result.tested_at) parts.push(timeAgo(result.tested_at));
     return parts.join(' · ');

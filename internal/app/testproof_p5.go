@@ -35,6 +35,11 @@ var sampleTestSession = func(s *bench.Session, ctx context.Context, target strin
 	return s.Sample(ctx, target, limit)
 }
 
+// measureTestDelay is the fast per-connection delay: one request that stops at
+// the response headers. Kept separate from the full HTTPS exchange so a slow
+// page or a large body cannot turn a delay test into a transfer.
+var measureTestDelay = profile.DelayThroughProxy
+
 func digest(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }
 func profileProofBinding(l *profile.Link) string {
 	if l == nil {

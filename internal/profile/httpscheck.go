@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 )
@@ -172,6 +173,51 @@ func testHTTPS(ctx context.Context, proxyPort int, target string, tlsConfig *tls
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	return resp.StatusCode >= 200 && resp.StatusCode < 300
+}
+
+// DelayThroughProxy reports how long one HTTPS request takes to answer through
+// the local SOCKS listener, stopping at the response headers. It reads no body,
+// so it is the low-overhead per-connection delay (the v2rayN-style test), not
+// the full exchange measured by FetchHTTPSThroughProxy.
+func DelayThroughProxy(ctx context.Context, proxyPort int, target string) (time.Duration, error) {
+	u, err := url.Parse(target)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil {
+		return 0, fmt.Errorf("delay target must be HTTPS")
+	}
+	start := time.Now()
+	proxyAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(proxyPort))
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, portStr, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			port, err := strconv.Atoi(portStr)
+			if err != nil {
+				return nil, err
+			}
+			return dialSOCKS5(ctx, proxyAddr, host, port, 6*time.Second)
+		},
+		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+		TLSHandshakeTimeout: 6 * time.Second,
+		DisableKeepAlives:   true,
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 8 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return time.Since(start), err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return time.Since(start), err
+	}
+	resp.Body.Close()
+	if resp.TLS == nil {
+		return time.Since(start), fmt.Errorf("delay target did not answer over TLS")
+	}
+	return time.Since(start), nil
 }
 
 // dialSOCKS5 performs a no-auth SOCKS5 CONNECT. Domain names are sent to the

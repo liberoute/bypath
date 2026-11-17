@@ -24,6 +24,15 @@ const (
 	testDefaultParallel = 2
 	testMaxParallel     = 3
 	testPerLinkTimeout  = 25 * time.Second
+	// speedTransferBudget is the extra wall-clock window a speed transfer gets
+	// beyond the per-link setup timeout. Engine startup, the probe and the exit
+	// checks share testPerLinkTimeout; the download must not be killed by a
+	// deadline that already ran out while the tunnel was being prepared.
+	speedTransferBudget = 45 * time.Second
+	// delayProbeTimeout keeps the fast delay test fast: a link that cannot
+	// answer a header-only request in five seconds reports no delay instead of
+	// holding the batch.
+	delayProbeTimeout = 5 * time.Second
 	// Echo endpoints are fixed constants, not user input. Two independent
 	// operators make a single provider's anycast quirk visible. A blocked or
 	// geo-fenced endpoint (ifconfig.me answers 403 on the target network class)
@@ -705,8 +714,17 @@ func (s *Local) measureIsolated(ctx context.Context, t testTarget, shared testSh
 		return unavailable("missing credentials")
 	}
 
-	lctx, cancel := context.WithTimeout(ctx, testPerLinkTimeout)
+	sessionWindow := testPerLinkTimeout
+	if kind == TestKindSpeed {
+		sessionWindow += speedTransferBudget
+	}
+	lctx, cancel := context.WithTimeout(ctx, sessionWindow)
 	defer cancel()
+	// Setup stages keep their own bound so a hung engine start, probe or exit
+	// lookup cannot consume the window the transfer needs. The engine is bound
+	// to lctx, which covers the whole measurement.
+	setupCtx, setupDone := context.WithTimeout(lctx, testPerLinkTimeout)
+	defer setupDone()
 
 	opts := bench.Options{
 		TmpDir:     s.paths.TmpDir,
@@ -754,7 +772,7 @@ func (s *Local) measureIsolated(ctx context.Context, t testTarget, shared testSh
 	}
 	// Relay startup is not liveness. First prove real HTTPS through the exact
 	// isolated owned configuration; blocked identity services are a separate stage.
-	probeURL, perr := pickTestProbe(lctx, session.Port)
+	probeURL, perr := pickTestProbe(setupCtx, session.Port)
 	if perr != nil {
 		// The engine started, so its own error is not observable here. Probe the
 		// endpoint directly to separate a dead server from a TLS/SNI mismatch;
@@ -772,7 +790,7 @@ func (s *Local) measureIsolated(ctx context.Context, t testTarget, shared testSh
 	// The exit identity is operational context, not a precondition. Identity
 	// services can be blocked, and a subscription can share one exit address
 	// across every link; neither makes a carried HTTPS request a dead link.
-	exitBefore, echoes, idErr := readTestExit(lctx, session.Port, echoServiceA, echoServiceB)
+	exitBefore, echoes, idErr := readTestExit(setupCtx, session.Port, echoServiceA, echoServiceB)
 	proof.ExitBefore = exitBefore
 	proof.Echoes = echoes
 	unverified, unverifiedDetail := "", ""
@@ -805,8 +823,11 @@ func (s *Local) measureIsolated(ctx context.Context, t testTarget, shared testSh
 			return res, spent, false
 		}
 		// One small timed request records the HTTPS latency of the same path
-		// the download is about to use.
-		if elapsed, _, err := sampleTestSession(session, lctx, probeURL, 4096); err == nil {
+		// the download is about to use. The fast delay is recorded separately:
+		// it stops at the response headers, so it stays comparable across links
+		// even when the download itself is slow or fails.
+		res.DelayMS = measureDelayMS(setupCtx, session.Port, probeURL)
+		if elapsed, _, err := sampleTestSession(session, setupCtx, probeURL, 4096); err == nil {
 			res.LatencyMS = int64(elapsed / time.Millisecond)
 			res.P50MS = res.LatencyMS
 		}
@@ -823,9 +844,10 @@ func (s *Local) measureIsolated(ctx context.Context, t testTarget, shared testSh
 		proof.RouteDecisions = []RouteDecision{{Host: check.Host, IPs: check.ResolvedIPs, Decision: check.Route}}
 		measured = true
 	} else {
+		res.DelayMS = measureDelayMS(setupCtx, session.Port, probeURL)
 		samples := make([]time.Duration, 0, 3)
 		for i := 0; i < 3; i++ {
-			elapsed, _, err := sampleTestSession(session, lctx, probeURL, 4096)
+			elapsed, _, err := sampleTestSession(session, setupCtx, probeURL, 4096)
 			if err != nil {
 				continue
 			}
@@ -897,6 +919,22 @@ func (s *Local) livePathReady(ctx context.Context) bool {
 	return err == nil && exp.Certain
 }
 
+// measureDelayMS runs the fast delay probe under its own short bound. A failed
+// delay leaves the field empty; the full HTTPS exchange decides the row.
+func measureDelayMS(ctx context.Context, port int, probeURL string) int64 {
+	delayCtx, cancel := context.WithTimeout(ctx, delayProbeTimeout)
+	defer cancel()
+	elapsed, err := measureTestDelay(delayCtx, port, probeURL)
+	if err != nil {
+		return 0
+	}
+	ms := int64(elapsed / time.Millisecond)
+	if ms == 0 {
+		ms = 1
+	}
+	return ms
+}
+
 // measureLiveLink measures the serving connection through the live SOCKS port,
 // which applies the gateway's routing rules. Every destination is route-checked
 // first: a DIRECT decision means the number would not describe the tunnel.
@@ -933,11 +971,19 @@ func (s *Local) measureLiveLink(ctx context.Context, t testTarget, shared testSh
 	}
 	res.Path = proof
 
-	lctx, cancel := context.WithTimeout(ctx, testPerLinkTimeout)
+	sessionWindow := testPerLinkTimeout
+	if kind == TestKindSpeed {
+		sessionWindow += speedTransferBudget
+	}
+	lctx, cancel := context.WithTimeout(ctx, sessionWindow)
 	defer cancel()
+	// Route checks, the negative control and the exit reads are setup. A hung
+	// probe must not eat the transfer window that follows.
+	setupCtx, setupDone := context.WithTimeout(lctx, testPerLinkTimeout)
+	defer setupDone()
 
 	decide := func(host string) (RouteDecision, bool) {
-		exp, err := s.ExplainRoute(lctx, host)
+		exp, err := s.ExplainRoute(setupCtx, host)
 		if err != nil || !exp.Certain {
 			res.Status = TestStatusInconclusive
 			res.Reason = ReasonRouteExplainMissing
@@ -967,7 +1013,7 @@ func (s *Local) measureLiveLink(ctx context.Context, t testTarget, shared testSh
 		proof.RouteDecisions = append(proof.RouteDecisions, dec)
 		switch dec.Decision {
 		case "DIRECT":
-			controlIP, err := fetchEchoIP(lctx, port, "https://"+negativeControlHost)
+			controlIP, err := fetchEchoIP(setupCtx, port, "https://"+negativeControlHost)
 			switch {
 			case err != nil:
 				proof.NegativeControl = "failed"
@@ -991,7 +1037,7 @@ func (s *Local) measureLiveLink(ctx context.Context, t testTarget, shared testSh
 		}
 	}
 
-	probeURL, perr := bench.PickProbeURL(lctx, port)
+	probeURL, perr := bench.PickProbeURL(setupCtx, port)
 	if perr != nil {
 		failAttempt(&res, perr, ctx)
 		return res
@@ -1012,7 +1058,7 @@ func (s *Local) measureLiveLink(ctx context.Context, t testTarget, shared testSh
 	// exit is a fact about ownership, not a reason to leave the serving
 	// connection unmeasured.
 	note, noteDetail := "", ""
-	exitBefore, echoes, err := echoThrough(lctx, port, echoServiceA, echoServiceB)
+	exitBefore, echoes, err := echoThrough(setupCtx, port, echoServiceA, echoServiceB)
 	proof.ExitBefore = exitBefore
 	proof.Echoes = echoes
 	switch {
@@ -1040,8 +1086,9 @@ func (s *Local) measureLiveLink(ctx context.Context, t testTarget, shared testSh
 		}
 		// One small timed request records the HTTPS latency of the same path
 		// the download is about to use.
+		res.DelayMS = measureDelayMS(setupCtx, port, probeURL)
 		start := time.Now()
-		if _, err := profile.FetchThroughProxy(lctx, port, probeURL, 4096); err == nil {
+		if _, err := profile.FetchThroughProxy(setupCtx, port, probeURL, 4096); err == nil {
 			res.LatencyMS = int64(time.Since(start) / time.Millisecond)
 			res.P50MS = res.LatencyMS
 		}
@@ -1058,17 +1105,18 @@ func (s *Local) measureLiveLink(ctx context.Context, t testTarget, shared testSh
 		proof.RouteDecisions = append(proof.RouteDecisions,
 			RouteDecision{Host: check.Host, IPs: check.ResolvedIPs, Decision: check.Route})
 	} else {
+		res.DelayMS = measureDelayMS(setupCtx, port, probeURL)
 		samples := make([]time.Duration, 0, 5)
 		for i := 0; i < 5; i++ {
 			if i > 0 {
 				select {
 				case <-time.After(400 * time.Millisecond):
-				case <-lctx.Done():
+				case <-setupCtx.Done():
 					return res
 				}
 			}
 			start := time.Now()
-			if _, err := profile.FetchThroughProxy(lctx, port, probeURL, 4096); err != nil {
+			if _, err := profile.FetchThroughProxy(setupCtx, port, probeURL, 4096); err != nil {
 				continue
 			}
 			samples = append(samples, time.Since(start))
