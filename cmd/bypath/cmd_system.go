@@ -22,6 +22,7 @@ import (
 	"github.com/liberoute/bypath/internal/gateway"
 	"github.com/liberoute/bypath/internal/paths"
 	"github.com/liberoute/bypath/internal/pidfile"
+	"github.com/liberoute/bypath/internal/proxyguard"
 	"github.com/liberoute/bypath/internal/updater"
 )
 
@@ -102,6 +103,16 @@ func cmdStop(args []string) {
 	if err := verifyStopped(pid); err != nil {
 		fmt.Printf("❌ %v\n", err)
 		os.Exit(1)
+	}
+	// The daemon removes the proxy guard on its own shutdown, but a killed
+	// daemon, or a rollback to a binary older than the crash-consistent guard,
+	// will refuse to start while a recorded or adoptable guard is still
+	// installed. With the daemon confirmed gone, finish that removal here so a
+	// documented stop is enough before any binary is started again.
+	if os.Geteuid() == 0 {
+		if err := proxyguard.Cleanup(); err != nil {
+			fmt.Printf("  ⚠️  Proxy guard not removed: %v\n", err)
+		}
 	}
 	if !purgeFirewall && gateway.RetainedContainment() {
 		fmt.Println("🛡️  Fail-closed LAN containment retained: another service keeps IP forwarding enabled.")

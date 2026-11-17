@@ -34,6 +34,11 @@ test-cover:
 	@echo "🧪 Running tests with coverage..."
 	go test -race -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out -o coverage.html
+
+test-guard:
+	@echo "🔥 Running proxy guard lifecycle tests against real iptables..."
+	docker build -f test/integration/guard/Dockerfile -t bypath-guard-test .
+	docker run --rm --cap-add NET_ADMIN --cap-add NET_RAW bypath-guard-test
 	@echo "📊 Coverage report: coverage.html"
 
 ## Run linter

@@ -177,6 +177,25 @@ If the unit runs but exits immediately, `journalctl` plus `bypath doctor` will
 show whether the configuration, the engine or the selected connection is at
 fault.
 
+## The proxy guard refuses to start after a crash or an upgrade
+
+`Proxy firewall setup failed: refusing foreign proxy firewall chain` or
+`retaining unverified proxy firewall ownership` means `BYPATH_PROXY_IN` is
+installed but cannot be proven to belong to this run. Older builds deleted the
+ownership record (`/var/lib/bypath/proxy-input.json`) before, or without,
+removing the chain; with the record gone they could not start again.
+
+Current builds prove ownership from the record when it survives, and from the
+chain's own uniform marker and exact shape when it does not, then finish the
+removal and install a fresh guard. A chain that contains any rule without a
+marker is left untouched and startup keeps refusing: inspect it rather than
+deleting it.
+
+After a crash, `sudo bypath stop` removes the guard once the daemon is confirmed
+gone, so a binary swap or a rollback to an older build starts from a clean
+firewall. Do not delete `BYPATH_PROXY_IN` or its INPUT jumps by hand unless the
+rules are visibly foreign.
+
 ## Collecting a useful report
 
 ```bash

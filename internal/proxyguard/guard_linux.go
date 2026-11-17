@@ -111,6 +111,7 @@ func load() (record, error) {
 	}
 	return r, nil
 }
+
 // chainRules keeps only the rule lines of an iptables listing. iptables writes
 // legacy-table notices to stderr, which CombinedOutput merges into the listing;
 // counting them as rules would reject our own chain and block startup.
@@ -150,8 +151,261 @@ func owns(r record) error {
 	return nil
 }
 
+// ruleView is a parsed iptables rule line, in either the -S listing form
+// ("-A CHAIN ...") or the argument form used to build deletions.
+type ruleView struct {
+	parent string
+	args   []string
+	marker string
+	proto  string
+	dport  int
+	src    string
+	iface  string
+	target string
+}
+
+func parseRule(line string) (ruleView, bool) {
+	f := strings.Fields(line)
+	if len(f) < 3 || f[0] != "-A" {
+		return ruleView{}, false
+	}
+	v := ruleView{parent: f[1], args: f[2:]}
+	for i := 0; i < len(v.args); i++ {
+		next := func() string {
+			if i+1 < len(v.args) {
+				i++
+				return v.args[i]
+			}
+			return ""
+		}
+		switch v.args[i] {
+		case "-p", "--protocol":
+			v.proto = next()
+		case "--dport", "--destination-port":
+			v.dport, _ = strconv.Atoi(next())
+		case "-s", "--source":
+			v.src = next()
+		case "-i", "--in-interface":
+			v.iface = next()
+		case "-j", "--jump":
+			v.target = next()
+		case "--comment":
+			v.marker = next()
+		}
+	}
+	return v, true
+}
+
+// view is what the kernel currently holds for the guard, independent of any
+// record. Everything the lifecycle decides is derived from this observation.
+type view struct {
+	exists bool
+	rules  []ruleView
+	jumps  []ruleView
+	extra  []ruleView
+	marker string
+}
+
+// guardParents are the only built-in chains the guard may appear in. Each is
+// listed on its own so a truncated combined listing cannot hide a jump.
+var guardParents = []string{"INPUT", "FORWARD", "OUTPUT"}
+
+func references() (jumps, extra []ruleView, err error) {
+	for _, parent := range guardParents {
+		out, err := run("-S", parent)
+		if err != nil {
+			return nil, nil, fmt.Errorf("listing %s: %w", parent, err)
+		}
+		for _, line := range chainRules(out) {
+			r, ok := parseRule(line)
+			if !ok || r.target != chain {
+				continue
+			}
+			if parent == "INPUT" {
+				jumps = append(jumps, r)
+			} else {
+				extra = append(extra, r)
+			}
+		}
+	}
+	return jumps, extra, nil
+}
+
+func inspect() (view, error) {
+	var v view
+	if out, err := run("-S", chain); err == nil {
+		v.exists = true
+		for _, line := range chainRules(out) {
+			if r, ok := parseRule(line); ok && r.parent == chain {
+				v.rules = append(v.rules, r)
+			}
+		}
+	}
+	jumps, extra, err := references()
+	if err != nil {
+		return v, err
+	}
+	v.jumps, v.extra = jumps, extra
+	if !v.exists && len(v.jumps)+len(v.extra) > 0 {
+		return v, errors.New("proxy firewall jumps reference a chain that does not exist; inspect iptables before starting")
+	}
+	v.marker = uniformMarker(v)
+	return v, nil
+}
+
+// uniformMarker returns the single well-formed marker shared by every rule in
+// the chain and every jump into it. Empty means the object cannot be attributed
+// to one bypath run, which is the only case that must be treated as foreign.
+func uniformMarker(v view) string {
+	marker := ""
+	for _, list := range [][]ruleView{v.rules, v.jumps} {
+		for _, r := range list {
+			if len(r.marker) != 32 {
+				return ""
+			}
+			if _, err := hex.DecodeString(r.marker); err != nil {
+				return ""
+			}
+			if marker == "" {
+				marker = r.marker
+			} else if marker != r.marker {
+				return ""
+			}
+		}
+	}
+	return marker
+}
+
+// ownedByRecord proves the installed objects belong to this run even when the
+// install or the previous cleanup was interrupted: a strict subset of the
+// recorded rules, every line carrying the recorded token, and only the two
+// recorded jumps. A missing rule is expected after a crash; an extra or
+// untagged rule is not ours.
+func ownedByRecord(v view, r record) bool {
+	if len(v.extra) > 0 {
+		return false
+	}
+	if len(v.rules) == 0 && len(v.jumps) == 0 {
+		// Nothing foreign remains and the record names this chain; a flush that
+		// was interrupted before deletion is ours to finish.
+		return true
+	}
+	if v.marker == "" || v.marker != r.Token {
+		return false
+	}
+	if len(v.rules) > len(r.Rules) || len(v.jumps) > 2 {
+		return false
+	}
+	for _, rule := range v.rules {
+		if rule.marker != r.Token {
+			return false
+		}
+	}
+	for _, j := range v.jumps {
+		if j.marker != r.Token || j.dport != r.Port || (j.proto != "tcp" && j.proto != "udp") || j.iface != "" || j.src != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// adoptable is the record-free proof: the chain is named exactly like the guard
+// and every rule matches the guard's structure with one shared 32-hex marker.
+// Anything less could be a foreign chain that merely borrowed the name, and is
+// never deleted.
+func adoptable(v view) bool {
+	if v.marker == "" || len(v.extra) > 0 || len(v.jumps) != 2 {
+		return false
+	}
+	var entries []entry
+	loop, tcpDrop, udpDrop := 0, 0, 0
+	tcpPort, udpPort := 0, 0
+	for _, rule := range v.rules {
+		if rule.marker != v.marker {
+			return false
+		}
+		switch rule.target {
+		case "RETURN":
+			if rule.proto != "" || rule.dport != 0 {
+				return false
+			}
+			if rule.iface == "lo" && rule.src == "" {
+				loop++
+				continue
+			}
+			if rule.iface == "" || rule.src == "" {
+				return false
+			}
+			entries = append(entries, entry{CIDR: rule.src, Interface: rule.iface})
+		case "DROP":
+			if rule.src != "" || rule.iface != "" || rule.dport < 1 || rule.dport > 65535 {
+				return false
+			}
+			switch rule.proto {
+			case "tcp":
+				tcpDrop++
+				tcpPort = rule.dport
+			case "udp":
+				udpDrop++
+				udpPort = rule.dport
+			default:
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	if loop != 1 || tcpDrop != 1 || udpDrop != 1 || tcpPort != udpPort {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, j := range v.jumps {
+		if j.marker != v.marker || j.dport != tcpPort || j.iface != "" || j.src != "" || seen[j.proto] || (j.proto != "tcp" && j.proto != "udp") {
+			return false
+		}
+		seen[j.proto] = true
+	}
+	return seen["tcp"] && seen["udp"] && validEntries(entries)
+}
+
+func removeJumps(jumps []ruleView) {
+	for _, j := range jumps {
+		args := append([]string{"-D", j.parent}, j.args...)
+		for {
+			if _, err := run(args...); err != nil {
+				break
+			}
+		}
+	}
+}
+
+// absentVerified proves the chain is gone from an independent listing before
+// the ownership record may be deleted. Removing the record while the chain is
+// still installed is what turns a crash into a permanent startup refusal.
+func absentVerified() error {
+	if _, err := run("-S", chain); err == nil {
+		return errors.New("proxy guard chain still present")
+	}
+	jumps, extra, err := references()
+	if err != nil {
+		return fmt.Errorf("cannot confirm the proxy guard was removed: %w", err)
+	}
+	if len(jumps)+len(extra) > 0 {
+		return errors.New("proxy guard jumps still present")
+	}
+	return nil
+}
+
+func removeRecord() error {
+	if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 // Ensure installs containment before any engine listener starts, in proxy-only
-// and gateway modes. An ambiguous LAN or foreign chain prevents engine startup.
+// and gateway modes. An unverifiable LAN or foreign chain prevents engine
+// startup.
 func Ensure(cfg *config.Config) error {
 	if rootUID() != 0 {
 		if cfg.Server.SOCKSListenAddress() == "127.0.0.1" {
@@ -182,7 +436,11 @@ func Ensure(cfg *config.Config) error {
 	if !bound {
 		return errors.New("proxy bind is not the trusted LAN interface")
 	}
-	if _, err = run("-S", chain); err == nil {
+	v, err := inspect()
+	if err != nil {
+		return err
+	}
+	if v.exists {
 		return errors.New("refusing foreign proxy firewall chain")
 	}
 	var token [16]byte
@@ -202,8 +460,8 @@ func Ensure(cfg *config.Config) error {
 		return err
 	}
 	if err = install(r); err != nil {
-		// A half-installed chain would fail the next startup's ownership check
-		// forever; remove exactly what was added before reporting the failure.
+		// A half-installed chain is recoverable on the next start because the
+		// record names every rule; deleting the record here would strand it.
 		if undoErr := uninstall(r); undoErr != nil {
 			return fmt.Errorf("%w (guard cleanup failed: %v)", err, undoErr)
 		}
@@ -257,49 +515,71 @@ func uninstall(r record) error {
 		keep(run1("-F", chain))
 		keep(run1("-X", chain))
 	}
-	if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
+	if err := absentVerified(); err != nil {
 		keep(err)
 	}
-	return first
+	if first != nil {
+		return first
+	}
+	return removeRecord()
 }
 
 func run1(args ...string) error {
 	_, err := run(args...)
 	return err
 }
+
+// firewallUnavailable reports whether iptables could not be executed at all.
+// That is the only failure under which an absent record proves nothing was
+// installed, so a proxy-only host without iptables keeps starting.
+func firewallUnavailable(err error) bool {
+	return errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist)
+}
+
+// Cleanup removes the guard only after proving whose it is. The record is the
+// primary proof; a uniform marker over the exact guard structure is the
+// recovery proof when the record was lost. The record is deleted last and only
+// after two listings confirm the chain is gone, so no crash window can leave an
+// unowned chain behind.
 func Cleanup() error {
-	r, err := load()
-	if os.IsNotExist(err) {
-		return nil
-	}
+	r, recErr := load()
+	v, err := inspect()
 	if err != nil {
-		return err
-	}
-	all, err := run("-S")
-	if err != nil {
-		return err
-	}
-	if !strings.Contains(string(all), "-N "+chain+"\n") && !strings.HasSuffix(string(all), "-N "+chain) {
-		if strings.Contains(string(all), "-j "+chain) {
-			return errors.New("orphan proxy guard jump")
+		if recErr != nil && firewallUnavailable(err) {
+			return nil
 		}
-		return os.Remove(statePath)
+		return err
 	}
-	if err = owns(r); err != nil {
-		return fmt.Errorf("retaining unverified proxy firewall ownership: %w", err)
+	if !v.exists {
+		// Nothing is installed, so the record protects nothing and its loss or
+		// corruption must not block every later start.
+		return removeRecord()
 	}
-	for _, proto := range []string{"tcp", "udp"} {
-		if _, err = run(append([]string{"-C", "INPUT"}, jump(r, proto)...)...); err == nil {
-			if _, err = run(append([]string{"-D", "INPUT"}, jump(r, proto)...)...); err != nil {
-				return err
-			}
+	owned := false
+	if recErr == nil {
+		owned = ownedByRecord(v, r)
+	}
+	if !owned {
+		owned = adoptable(v)
+	}
+	if !owned {
+		if os.IsNotExist(recErr) {
+			return errors.New("retaining unverified proxy firewall ownership: no record and the installed rules are not a verifiable guard")
 		}
+		if recErr != nil {
+			return fmt.Errorf("retaining unverified proxy firewall ownership: %v", recErr)
+		}
+		return errors.New("retaining unverified proxy firewall ownership: installed rules do not match the record and the guard structure")
 	}
-	if _, err = run("-F", chain); err != nil {
+	removeJumps(v.jumps)
+	if err = run1("-F", chain); err != nil {
 		return err
 	}
-	if _, err = run("-X", chain); err != nil {
+	if err = run1("-X", chain); err != nil {
 		return err
 	}
-	return os.Remove(statePath)
+	if err = absentVerified(); err != nil {
+		return err
+	}
+	return removeRecord()
 }

@@ -41,6 +41,10 @@ func (f *firewall) command(_ context.Context, args ...string) ([]byte, error) {
 		}
 		rules, ok := f.chains[args[1]]
 		if !ok {
+			switch args[1] {
+			case "INPUT", "FORWARD", "OUTPUT":
+				return []byte("-N " + args[1] + "\n"), nil
+			}
 			return nil, errors.New("no chain")
 		}
 		out := f.warn + "-N " + args[1] + "\n"
@@ -123,7 +127,7 @@ func TestProxyOnlyInstallsNarrowOwnedInputAndCleanup(t *testing.T) {
 	if strings.Contains(calls, "-s 127.0.0.0/8") {
 		t.Fatal("loopback allowance rejects daemon probes sourced from the LAN IP")
 	}
-	if strings.Contains(calls, "FORWARD") || strings.Contains(calls, "OUTPUT") {
+	if mutatedPlane(f.calls, "FORWARD") || mutatedPlane(f.calls, "OUTPUT") {
 		t.Fatal("guard mutated unrelated plane")
 	}
 	if err := Cleanup(); err != nil {
