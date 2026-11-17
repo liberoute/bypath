@@ -43,7 +43,7 @@ func runCLI(args []string, stdout io.Writer, interactive bool) int {
 	case "select":
 		cmdSelect(rest)
 	case "bench":
-		cmdBench(rest)
+		return cmdBench(rest, os.Stdin, stdout, interactive)
 	case "stop":
 		cmdStop(rest)
 	case "status":
@@ -124,8 +124,11 @@ Commands:
 
   select <name|number>    Set active link
 
-  bench                   Test ALL links, show speed, auto-select best
+  bench                   Test links, show speed; selecting the best needs approval
     -g, --group NAME      Specific group
+    --single N            Test only row #N (no selection)
+    --yes                 Approve selecting the best link
+    -h, --help            Show bench help
 
   sub add [-g group] <url>     Add a subscription URL
   sub preview <url|file>       Show what a subscription contains without storing it
