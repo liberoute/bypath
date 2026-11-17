@@ -119,3 +119,89 @@ func TestPinServerPrefersIPv4(t *testing.T) {
 		t.Fatalf("PinServer = %v, want the IPv4 address", pinned)
 	}
 }
+
+// fakeDNS answers every A question with one fixed address. It exists to prove
+// the configured bootstrap reaches the exact server it names.
+func fakeDNS(t *testing.T, answer net.IP) string {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pc.Close() })
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			req := append([]byte(nil), buf[:n]...)
+			if len(req) < 12 {
+				continue
+			}
+			resp := append([]byte(nil), req...)
+			resp[2], resp[3] = 0x81, 0x80 // response, recursion available
+			resp[6], resp[7] = 0, 1       // one answer
+			resp[8], resp[9] = 0, 0       // no authority records
+			resp[10], resp[11] = 0, 0     // no additional records
+			resp = resp[:12]
+			offset := 12
+			for offset < len(req) && req[offset] != 0 {
+				offset += int(req[offset]) + 1
+			}
+			if offset+5 > len(req) {
+				continue
+			}
+			question := req[12 : offset+5]
+			resp = append(resp, question...)
+			resp = append(resp, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4)
+			resp = append(resp, answer.To4()...)
+			pc.WriteTo(resp, addr)
+		}
+	}()
+	return pc.LocalAddr().String()
+}
+
+func TestResolverFromServersQueriesTheConfiguredServer(t *testing.T) {
+	server := fakeDNS(t, net.IPv4(203, 0, 113, 9))
+	resolver, err := ResolverFromServers([]string{server})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addrs, err := resolver.LookupIPAddr(context.Background(), "pinned.example")
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if len(addrs) != 1 || addrs[0].IP.String() != "203.0.113.9" {
+		t.Fatalf("lookup = %v, want the fake answer", addrs)
+	}
+}
+
+func TestResolverFromServersRejectsUnusableEntries(t *testing.T) {
+	for _, entry := range []string{"", "dns.lan", "0.0.0.0", "1.2.3.4:0"} {
+		if _, err := ResolverFromServers([]string{entry}); err == nil {
+			t.Fatalf("entry %q accepted", entry)
+		}
+	}
+	if _, err := ResolverFromServers(nil); err == nil {
+		t.Fatal("an empty server list was accepted")
+	}
+}
+
+func TestPinServerBootstrapFailureIsItsOwnCategory(t *testing.T) {
+	if _, err := PinServer(context.Background(), "pinned.example", func(context.Context, string) ([]net.IPAddr, error) {
+		return nil, fmt.Errorf("no answer")
+	}); err == nil {
+		t.Fatal("PinServer accepted a failing lookup")
+	}
+	resolver, err := ResolverFromServers([]string{"127.0.0.1:1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := &profile.Link{Protocol: "vless", Address: "pinned.example", Port: 443, Security: "none"}
+	_, err = Open(context.Background(), link, Options{EndpointResolver: resolver, TmpDir: t.TempDir()})
+	if got := categoryOf(err); got != CategoryDNSBootstrap {
+		t.Fatalf("category = %q (%v), want %q", got, err, CategoryDNSBootstrap)
+	}
+}

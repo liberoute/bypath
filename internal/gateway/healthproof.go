@@ -280,7 +280,9 @@ func (gw *Gateway) observeIdentity(ctx context.Context) (exits, uplink []string,
 	through := func(ctx context.Context, target string) (string, error) {
 		return fetchIPThroughProxy(ctx, gw.socksPort, target)
 	}
-	direct := fetchIPDirect
+	direct := func(ctx context.Context, target string) (string, error) {
+		return fetchIPDirectVia(ctx, target, gw.iface)
+	}
 	return collectIdentity(ctx, through, direct)
 }
 
@@ -295,11 +297,20 @@ func fetchIPThroughProxy(ctx context.Context, socksPort int, target string) (str
 }
 
 func fetchIPDirect(ctx context.Context, target string) (string, error) {
+	return fetchIPDirectVia(ctx, target, "")
+}
+
+// fetchIPDirectVia observes the host's own address with the TCP dial pinned to
+// iface. On a gateway host the default route belongs to the served TUN, so an
+// unbound request would answer with the tunnel exit and the EXIT_IS_UPLINK
+// verdict could never fire truthfully.
+func fetchIPDirectVia(ctx context.Context, target, iface string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, healthIdentityRequestLimit)
 	defer cancel()
+	dialer := &net.Dialer{Timeout: healthIdentityRequestLimit, Control: bindDeviceControl(iface)}
 	client := &http.Client{
 		Timeout:   healthIdentityRequestLimit,
-		Transport: &http.Transport{Proxy: nil},
+		Transport: &http.Transport{Proxy: nil, DialContext: dialer.DialContext},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {

@@ -31,8 +31,8 @@ func TestDiagnoseEndpointClosedPortIsUnreachable(t *testing.T) {
 
 	link := &profile.Link{Protocol: "vless", Address: "127.0.0.1", Port: port, Security: "none"}
 	err = DiagnoseEndpoint(context.Background(), link, Options{})
-	if got := categoryOf(err); got != "unreachable_server" {
-		t.Fatalf("category = %q (%v), want unreachable_server", got, err)
+	if got := categoryOf(err); got != CategoryTCP {
+		t.Fatalf("category = %q (%v), want %q", got, err, CategoryTCP)
 	}
 }
 
@@ -43,8 +43,8 @@ func TestDiagnoseEndpointUntrustedCertificateIsHandshakeFailure(t *testing.T) {
 
 	link := &profile.Link{Protocol: "vless", Address: host, Port: port, Security: "tls", SNI: "127.0.0.1"}
 	err := DiagnoseEndpoint(context.Background(), link, Options{})
-	if got := categoryOf(err); got != "handshake_failure" {
-		t.Fatalf("category = %q (%v), want handshake_failure", got, err)
+	if got := categoryOf(err); got != CategoryTransport {
+		t.Fatalf("category = %q (%v), want %q", got, err, CategoryTransport)
 	}
 }
 
@@ -69,8 +69,8 @@ func TestDiagnoseEndpointRequiredALPNMismatch(t *testing.T) {
 	link := &profile.Link{Protocol: "vless", Address: host, Port: port, Security: "tls", SNI: "127.0.0.1",
 		Insecure: true, ALPN: []string{"h2"}}
 	err := DiagnoseEndpoint(context.Background(), link, Options{})
-	if got := categoryOf(err); got != "handshake_failure" {
-		t.Fatalf("category = %q (%v), want handshake_failure", got, err)
+	if got := categoryOf(err); got != CategoryTransport {
+		t.Fatalf("category = %q (%v), want %q", got, err, CategoryTransport)
 	}
 }
 

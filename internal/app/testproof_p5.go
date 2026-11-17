@@ -24,7 +24,22 @@ const (
 	CategoryInfrastructure = "test_infrastructure_failure"
 	CategoryExitUnverified = "exit_unverified"
 	CategoryVerified       = "verified_working_connection"
+	// Categories below keep the failing stage distinct all the way to the
+	// stored result: a name that would not resolve is not a dead port, and a
+	// port that refuses TCP is not a TLS mismatch.
+	CategoryDNSBootstrap = bench.CategoryDNSBootstrap
+	CategoryTCP          = bench.CategoryTCP
+	CategoryHTTPS        = bench.CategoryHTTPS
 )
+
+// categoryDetail explains a failed stage for the person reading the result.
+var categoryDetail = map[string]string{
+	CategoryDNSBootstrap: "the server name could not be resolved before the test tunnel started",
+	CategoryTCP:          "the server port did not accept a TCP connection",
+	CategoryHandshake:    "the TLS handshake with the server failed",
+	CategoryHTTPS:        "the test tunnel started, but no HTTPS answer came through it",
+	CategoryUnreachable:  "the attempt did not complete in time",
+}
 
 // Dependency seams keep proof-stage regressions fully offline.
 var openTestSession = bench.Open
@@ -122,8 +137,11 @@ func failAttempt(res *TestResult, err error, parent context.Context) {
 	res.Status = TestStatusFailed
 	res.Category = attemptCategory(err)
 	// Engine and network errors can quote secret-bearing config contents. Keep
-	// the category, never the untrusted message, in persisted diagnostics.
+	// the category and its fixed explanation, never the untrusted message.
 	res.Detail = "test attempt failed: " + res.Category
+	if text := categoryDetail[res.Category]; text != "" {
+		res.Detail += " — " + text
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		res.Detail = "test attempt timed out"
 	}

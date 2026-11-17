@@ -21,7 +21,7 @@ func DiagnoseEndpoint(ctx context.Context, link *profile.Link, opts Options) err
 	}
 	resolver, err := endpointResolver(link, opts)
 	if err != nil {
-		return &AttemptError{Category: "test_infrastructure_failure", Err: err}
+		return &AttemptError{Category: CategoryInfrastructure, Err: err}
 	}
 	var lookup func(context.Context, string) ([]net.IPAddr, error)
 	if resolver != nil {
@@ -29,7 +29,7 @@ func DiagnoseEndpoint(ctx context.Context, link *profile.Link, opts Options) err
 	}
 	pinned, err := PinServer(ctx, link.Address, lookup)
 	if err != nil {
-		return &AttemptError{Category: "unreachable_server", Err: err}
+		return &AttemptError{Category: CategoryDNSBootstrap, Err: err}
 	}
 	address := pinned[link.Address]
 	if address == "" {
@@ -40,7 +40,7 @@ func DiagnoseEndpoint(ctx context.Context, link *profile.Link, opts Options) err
 	dial := &net.Dialer{Timeout: 6 * time.Second}
 	raw, err := dial.DialContext(ctx, "tcp", endpoint)
 	if err != nil {
-		return &AttemptError{Category: "unreachable_server", Err: err}
+		return &AttemptError{Category: CategoryTCP, Err: err}
 	}
 	defer raw.Close()
 	if link.Security != "tls" {
@@ -58,11 +58,11 @@ func DiagnoseEndpoint(ctx context.Context, link *profile.Link, opts Options) err
 	_ = raw.SetDeadline(time.Now().Add(6 * time.Second))
 	conn := tls.Client(raw, conf)
 	if err := conn.HandshakeContext(ctx); err != nil {
-		return &AttemptError{Category: "handshake_failure", Err: fmt.Errorf("TLS handshake with %s failed: %w", sni, err)}
+		return &AttemptError{Category: CategoryTransport, Err: fmt.Errorf("TLS handshake with %s failed: %w", sni, err)}
 	}
 	state := conn.ConnectionState()
 	if len(link.ALPN) > 0 && !contains(state.NegotiatedProtocol, link.ALPN) {
-		return &AttemptError{Category: "handshake_failure",
+		return &AttemptError{Category: CategoryTransport,
 			Err: fmt.Errorf("the endpoint did not negotiate a required ALPN protocol (got %q)", state.NegotiatedProtocol)}
 	}
 	return nil

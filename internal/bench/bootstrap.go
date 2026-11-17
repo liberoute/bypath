@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -81,6 +83,54 @@ func ResolverFromHostConfig(config string) (*net.Resolver, error) {
 		}
 		return nil, last
 	}}, nil
+}
+
+// ResolverFromServers returns a resolver that asks exactly the configured
+// ip[:port] servers, in order. A configured LAN bootstrap replaces the host's
+// pre-takeover DHCP resolvers, whose upstream path may be censored or lossy on
+// the very network the tested tunnel runs over.
+func ResolverFromServers(servers []string) (*net.Resolver, error) {
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("no bootstrap resolvers configured")
+	}
+	addrs := make([]string, 0, len(servers))
+	for _, raw := range servers {
+		addr, err := bootstrapServerAddr(raw)
+		if err != nil {
+			return nil, err
+		}
+		addrs = append(addrs, addr)
+	}
+	var mu sync.Mutex
+	next := 0
+	dial := func(ctx context.Context, network, _ string) (net.Conn, error) {
+		mu.Lock()
+		addr := addrs[next%len(addrs)]
+		next++
+		mu.Unlock()
+		return (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, network, addr)
+	}
+	return &net.Resolver{PreferGo: true, Dial: dial}, nil
+}
+
+// bootstrapServerAddr normalizes one ip[:port] entry to ip:port.
+func bootstrapServerAddr(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	host, port := trimmed, "53"
+	if h, p, err := net.SplitHostPort(trimmed); err == nil {
+		host, port = h, p
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	if ip == nil {
+		return "", fmt.Errorf("bootstrap resolver %q is not an IP address", raw)
+	}
+	if ip.IsUnspecified() || ip.IsMulticast() {
+		return "", fmt.Errorf("bootstrap resolver %q is not a unicast address", raw)
+	}
+	if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+		return "", fmt.Errorf("bootstrap resolver %q has an invalid port", raw)
+	}
+	return net.JoinHostPort(ip.String(), port), nil
 }
 
 // PinServer resolves ONLY the remote server name; SNI, WS Host, gRPC authority

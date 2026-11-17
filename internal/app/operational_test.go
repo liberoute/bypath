@@ -140,8 +140,8 @@ func TestProbeFailureIsFailedNotMeasured(t *testing.T) {
 		return "", nil, nil
 	}
 	res := runIsolated(t, testShared{uplink: "198.51.100.9", isolation: true})
-	if res.Status != TestStatusFailed || res.Category != CategoryInfrastructure {
-		t.Fatalf("probe failure = %q/%q, want failed/%q", res.Status, res.Category, CategoryInfrastructure)
+	if res.Status != TestStatusFailed || res.Category != CategoryHTTPS {
+		t.Fatalf("probe failure = %q/%q, want failed/%q", res.Status, res.Category, CategoryHTTPS)
 	}
 	if res.HTTPSProven || res.P50MS != 0 {
 		t.Fatalf("a failed probe produced a measurement: %+v", res)

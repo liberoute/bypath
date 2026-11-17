@@ -168,8 +168,13 @@ type PathProof struct {
 	PolicyRevision    string          `json:"policy_revision,omitempty"`
 	PolicyAfter       string          `json:"policy_revision_after,omitempty"`
 	NegativeControl   string          `json:"negative_control"`
-	Counters          *Counters       `json:"counters,omitempty"`
-	Note              string          `json:"note,omitempty"`
+	// Bootstrap records where the tested endpoint's address was pinned from:
+	// "lan:<ip:port>" for a configured LAN resolver, "host" for the
+	// pre-takeover DHCP resolvers, "literal" when no lookup was needed. The
+	// pin must never come from the tunnel this host serves.
+	Bootstrap string     `json:"bootstrap,omitempty"`
+	Counters  *Counters  `json:"counters,omitempty"`
+	Note      string     `json:"note,omitempty"`
 }
 
 // RouteDecision is the policy verdict for one measured destination, resolved

@@ -44,6 +44,9 @@ func (s *Local) Bench(ctx context.Context, req BenchRequest) (bench.Report, erro
 		FallbackEnabled: fallback,
 		ProfileDir:      s.paths.ProfileDir,
 	}
+	if resolver, _ := testBootstrapResolver(s.Config()); resolver != nil {
+		opts.EndpointResolver = resolver
+	}
 	report, err := bench.Run(ctx, s.profiles, bench.Request{Group: req.Group}, opts)
 	if err != nil {
 		switch {

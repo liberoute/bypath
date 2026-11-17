@@ -58,7 +58,7 @@ func Open(ctx context.Context, link *profile.Link, opts Options) (*Session, erro
 	linkCopy.ListenPort = port
 	resolver, err := endpointResolver(link, opts)
 	if err != nil {
-		return nil, &AttemptError{Category: "test_infrastructure_failure", Err: err}
+		return nil, &AttemptError{Category: CategoryInfrastructure, Err: err}
 	}
 	var lookup func(context.Context, string) ([]net.IPAddr, error)
 	if resolver != nil {
@@ -66,7 +66,7 @@ func Open(ctx context.Context, link *profile.Link, opts Options) (*Session, erro
 	}
 	pinned, err := PinServer(ctx, link.Address, lookup)
 	if err != nil {
-		return nil, &AttemptError{Category: "unreachable_server", Err: err}
+		return nil, &AttemptError{Category: CategoryDNSBootstrap, Err: err}
 	}
 	cfgDir := filepath.Join(opts.TmpDir, fmt.Sprintf("test-%d-%d", os.Getpid(), port))
 
@@ -81,19 +81,19 @@ func Open(ctx context.Context, link *profile.Link, opts Options) (*Session, erro
 		cg.PinnedHosts = pinned
 		configFile, err := cg.Generate(eng, &linkCopy)
 		if err != nil {
-			lastErr = &AttemptError{Category: "unsupported_configuration", Err: err}
+			lastErr = &AttemptError{Category: CategoryUnsupported, Err: err}
 			cg.DiscardGeneration()
 			continue
 		}
 		config, err := isolateConfigFile(configFile)
 		if err != nil {
-			lastErr = &AttemptError{Category: "test_infrastructure_failure", Err: err}
+			lastErr = &AttemptError{Category: CategoryInfrastructure, Err: err}
 			cg.DiscardGeneration()
 			continue
 		}
 		inst, err := engine.StartBenchmark(ctx, engineName, configFile, opts.EngineDir, port, benchmarkReadiness)
 		if err != nil {
-			lastErr = &AttemptError{Category: "test_infrastructure_failure", Err: err}
+			lastErr = &AttemptError{Category: CategoryInfrastructure, Err: err}
 			cg.DiscardGeneration()
 			continue
 		}

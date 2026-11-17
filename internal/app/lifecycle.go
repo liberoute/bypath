@@ -114,7 +114,14 @@ func (s *Local) ProbeExitIdentity(ctx context.Context) (ExitProof, error) {
 	through := func(ctx context.Context, target string) (string, error) {
 		return gateway.FetchExitIPThroughProxy(ctx, port, target)
 	}
-	id := gateway.CollectExitIdentity(ctx, through, gateway.FetchExitIPDirect)
+	// The direct side must not inherit the tunnel's default route: in gateway
+	// mode an unbound request reports the exit as the uplink, which makes the
+	// EXIT_EQUALS_UPLINK guard compare a value with itself.
+	iface := uplinkInterface(s.Config())
+	direct := func(ctx context.Context, target string) (string, error) {
+		return uplinkIdentityFetcher(ctx, iface, target)
+	}
+	id := gateway.CollectExitIdentity(ctx, through, direct)
 	proof := ExitProof{Exits: id.Exits, Uplink: id.Uplink, Oracles: id.Attempts}
 	if len(id.Exits) == 0 {
 		proof.DataPathOK, proof.DataPathDetail = gateway.ProbeDataPath(ctx, socksProbeAddress(s.Config().Server.SOCKSListen, port), 6*time.Second)

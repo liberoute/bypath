@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 
 	"github.com/liberoute/bypath/internal/paths"
@@ -46,6 +47,12 @@ type TestsConfig struct {
 	// MonthlyBudgetMB refuses a run whose worst case exceeds what is left of
 	// the monthly allowance. Zero means no monthly cap.
 	MonthlyBudgetMB int `yaml:"monthly_budget_mb,omitempty"`
+	// BootstrapDNS lists the LAN resolvers used to pin a tested endpoint's
+	// address before an isolated test tunnel starts. Entries are ip or
+	// ip:port and must be private: the lookup happens while the tested tunnel
+	// does not exist yet, so it may not depend on this host's gateway DNS.
+	// Empty keeps the host's pre-takeover DHCP resolvers.
+	BootstrapDNS []string `yaml:"bootstrap_dns,omitempty"`
 }
 
 // UpdateConfig points at a release feed that publishes the same JSON shape as
@@ -255,6 +262,9 @@ func (cfg *Config) NormalizeAndValidate() error {
 	if err := validateDirectDNS(cfg); err != nil {
 		return err
 	}
+	if err := validateBootstrapDNS(cfg); err != nil {
+		return err
+	}
 	validateBypassDomains(cfg)
 	if err := validateCountryCodes(cfg); err != nil {
 		return err
@@ -308,6 +318,65 @@ func validateDirectDNS(cfg *Config) error {
 		return fmt.Errorf("gateway.direct_dns %q must be an IP address ([ip][:port]) or an https:// DoH URL that uses an IP host", raw)
 	}
 	return nil
+}
+
+// validateBootstrapDNS keeps the endpoint-pinning resolver on the LAN. The
+// lookup runs before the tested tunnel exists and must identify the tunnel's
+// server without help from the tunnel this host serves; a loopback entry is
+// this gateway's own DNS, and a public entry is the same censored path the
+// host already has as a fallback.
+func validateBootstrapDNS(cfg *Config) error {
+	list := cfg.Tests.BootstrapDNS
+	if len(list) == 0 {
+		return nil
+	}
+	if len(list) > 4 {
+		return fmt.Errorf("tests.bootstrap_dns accepts at most 4 resolvers")
+	}
+	seen := make(map[string]bool, len(list))
+	for _, raw := range list {
+		server, err := parseBootstrapDNS(raw)
+		if err != nil {
+			return err
+		}
+		if seen[server] {
+			return fmt.Errorf("tests.bootstrap_dns lists %q more than once", server)
+		}
+		seen[server] = true
+	}
+	return nil
+}
+
+// parseBootstrapDNS validates one tests.bootstrap_dns entry and returns its
+// normalized ip:port form.
+func parseBootstrapDNS(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || strings.ContainsAny(trimmed, " \t\r\n\x00") {
+		return "", fmt.Errorf("tests.bootstrap_dns entry %q is empty or contains whitespace", raw)
+	}
+	host, port := trimmed, ""
+	if h, p, err := net.SplitHostPort(trimmed); err == nil {
+		host, port = h, p
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	if ip == nil {
+		return "", fmt.Errorf("tests.bootstrap_dns %q must be an IP address ([ip][:port]); a hostname would need the DNS it is meant to provide", raw)
+	}
+	if ip.IsLoopback() {
+		return "", fmt.Errorf("tests.bootstrap_dns %q is a loopback address, which is this gateway's own tunneled DNS", raw)
+	}
+	if ip.IsUnspecified() || ip.IsMulticast() || !ip.IsPrivate() {
+		return "", fmt.Errorf("tests.bootstrap_dns %q must be a private LAN address", raw)
+	}
+	portNum := 53
+	if port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return "", fmt.Errorf("tests.bootstrap_dns %q has an invalid port", raw)
+		}
+		portNum = n
+	}
+	return net.JoinHostPort(ip.String(), strconv.Itoa(portNum)), nil
 }
 
 // validateUpdateURL keeps the release feed on TLS: the digest that authorizes

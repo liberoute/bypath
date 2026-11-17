@@ -442,6 +442,11 @@ type testShared struct {
 	servingLink *profile.Link
 	isolation   bool
 	policyRev   string
+	// resolver pins a tested server's address through the configured LAN
+	// bootstrap; nil means the host's pre-takeover resolvers. bootstrap labels
+	// where the pin came from and travels in every replayed proof.
+	resolver  *net.Resolver
+	bootstrap string
 }
 
 // testEngineDir and testProfileDir resolve the same directories the daemon
@@ -459,6 +464,22 @@ func (s *Local) testProfileDir() string {
 		return cfg.Profiles.Directory
 	}
 	return s.paths.ProfileDir
+}
+
+// testBootstrapResolver returns the resolver that pins a tested endpoint's
+// address and a label recording where it came from. A configured list wins;
+// otherwise the host's pre-takeover DHCP resolvers are used, as before.
+func testBootstrapResolver(cfg *config.Config) (*net.Resolver, string) {
+	if cfg == nil || len(cfg.Tests.BootstrapDNS) == 0 {
+		return nil, "host"
+	}
+	resolver, err := bench.ResolverFromServers(cfg.Tests.BootstrapDNS)
+	if err != nil {
+		// Config validation rejects these entries; an unreadable document is
+		// handled by the caller's own config error path.
+		return nil, "host"
+	}
+	return resolver, "lan:" + strings.Join(cfg.Tests.BootstrapDNS, ",")
 }
 
 func (s *Local) runTestJob(ctx context.Context, cancel context.CancelFunc, job *testJob, targets []testTarget, parallel int) {
@@ -499,6 +520,7 @@ func (s *Local) runTestJob(ctx context.Context, cancel context.CancelFunc, job *
 	if cfg != nil {
 		shared.isolation = cfg.Tests.IsolationVerified
 		shared.policyRev = routingRevision(cfg)
+		shared.resolver, shared.bootstrap = testBootstrapResolver(cfg)
 	}
 
 	job.set("testing")
@@ -727,9 +749,10 @@ func (s *Local) measureIsolated(ctx context.Context, t testTarget, shared testSh
 	defer setupDone()
 
 	opts := bench.Options{
-		TmpDir:     s.paths.TmpDir,
-		EngineDir:  s.testEngineDir(),
-		ProfileDir: s.testProfileDir(),
+		TmpDir:           s.paths.TmpDir,
+		EngineDir:        s.testEngineDir(),
+		ProfileDir:       s.testProfileDir(),
+		EndpointResolver: shared.resolver,
 	}
 	if cfg := s.Config(); cfg != nil {
 		opts.HostKeyPolicy = cfg.Server.SSHHostKey
@@ -754,6 +777,7 @@ func (s *Local) measureIsolated(ctx context.Context, t testTarget, shared testSh
 		ServingExitIP:     shared.servingExit,
 		PolicyRevision:    shared.policyRev,
 		NegativeControl:   "n/a (isolated instance)",
+		Bootstrap:         shared.bootstrap,
 	}
 	res.Path = proof
 
@@ -780,7 +804,10 @@ func (s *Local) measureIsolated(ctx context.Context, t testTarget, shared testSh
 		if diagnosed := diagnoseEndpoint(lctx, link, opts); diagnosed != nil {
 			failAttempt(&res, diagnosed, ctx)
 		} else {
-			failAttempt(&res, perr, ctx)
+			// The endpoint accepted TCP and a TLS handshake, so the failure
+			// happened after the transport: name the HTTPS stage instead of
+			// blaming the server's reachability.
+			failAttempt(&res, &bench.AttemptError{Category: CategoryHTTPS, Err: perr}, ctx)
 		}
 		return res, spent, false
 	}
@@ -855,6 +882,7 @@ func (s *Local) measureIsolated(ctx context.Context, t testTarget, shared testSh
 		}
 		if len(samples) < 2 {
 			res.Status = TestStatusFailed
+			res.Category = CategoryHTTPS
 			res.Detail = "the full HTTPS sample failed through the tested instance"
 			if res.DelayMS > 0 {
 				res.Detail = fmt.Sprintf("the fast delay answered in %d ms, but the full HTTPS sample failed through the tested instance", res.DelayMS)
@@ -1285,29 +1313,52 @@ func parseTraceIP(body []byte) string {
 // proxy. It is a comparison value only; a failure leaves it empty and the
 // EXIT_EQUALS_UPLINK guard is skipped rather than guessed.
 func directUplinkIP(ctx context.Context, iface string) string {
+	ip, _ := probeUplinkIP(ctx, iface)
+	return ip
+}
+
+// probeUplinkIP sends an IP-literal trace request bound to the physical
+// interface. In gateway mode the default route belongs to the TUN, so an
+// unbound request would report the tunnel exit as the "uplink".
+func probeUplinkIP(ctx context.Context, iface string) (string, error) {
 	dialer := &net.Dialer{Timeout: 5 * time.Second, Control: bindDeviceControl(iface)}
 	transport := &http.Transport{Proxy: nil, DialContext: dialer.DialContext}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Timeout: 8 * time.Second, Transport: transport}
+	var last error
 	for _, target := range uplinkTraceEndpoints {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
+			last = err
 			continue
 		}
 		resp, err := client.Do(req)
 		if err != nil {
+			last = err
 			continue
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
 		if err != nil {
+			last = err
 			continue
 		}
 		if ip := parseTraceIP(body); ip != "" {
-			return ip
+			return ip, nil
 		}
+		last = fmt.Errorf("trace answer carried no client address")
 	}
-	return ""
+	if last == nil {
+		last = fmt.Errorf("no uplink trace endpoint answered")
+	}
+	return "", last
+}
+
+// uplinkIdentityFetcher adapts the bound uplink probe to the gateway identity
+// fetcher signature. The oracle name in target is ignored: every sample is an
+// IP-literal trace request, so the direct side never depends on hostname DNS.
+func uplinkIdentityFetcher(ctx context.Context, iface string, _ string) (string, error) {
+	return probeUplinkIP(ctx, iface)
 }
 
 // servingExitIP reads the exit address of the running tunnel without changing
