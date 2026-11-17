@@ -127,9 +127,11 @@ export function connectivityOf(result) {
         ? { code: 'answered', text: 'answered through the proven path' }
         : { code: 'answered', text: 'answered; proof incomplete, not ranked' };
     case 'inconclusive':
-      return ms > 0
-        ? { code: 'answered', text: `answered in ${ms} ms; exit ownership unproven` }
-        : { code: 'no_answer', text: 'no measurable answer' };
+      if (ms > 0) return { code: 'answered', text: `answered in ${ms} ms; exit ownership unproven` };
+      if (result.path && result.path.tunneled_https) {
+        return { code: 'answered', text: 'answered through the tested instance; exit identity unproven' };
+      }
+      return { code: 'no_answer', text: 'no answer recorded' };
     case 'failed':
       return { code: 'no_answer', text: 'no answer' };
     case 'cancelled':

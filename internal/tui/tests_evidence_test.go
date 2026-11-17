@@ -35,11 +35,27 @@ func TestInconclusiveWithoutAnswerClaimsNoConnectivity(t *testing.T) {
 	if note := connectivityNote(res); note != "" {
 		t.Fatalf("no latency must not claim an answer: %q", note)
 	}
-	if line := connectivityLine(res); !strings.Contains(line, "no measurable answer") {
+	if line := connectivityLine(res); !strings.Contains(line, "no answer recorded") {
 		t.Fatalf("connectivity line: %q", line)
 	}
-	if evidence := evidenceOf(res); strings.Contains(evidence, "answered in") {
+	if evidence := evidenceOf(res); strings.Contains(evidence, "answered in") || strings.Contains(evidence, "tested instance") {
 		t.Fatalf("evidence invented a measurement: %q", evidence)
+	}
+}
+
+// An isolated instance that completed the HTTPS probe carried traffic even
+// when the exit check bailed out before the latency samples were taken.
+func TestInconclusiveTunneledHTTPSStillShowsConnectivity(t *testing.T) {
+	res := app.TestResult{
+		Status: "inconclusive",
+		Reason: app.ReasonExitEqualsServing,
+		Path:   &app.PathProof{TunneledHTTPS: true, Level: "L1+L2"},
+	}
+	if line := connectivityLine(res); !strings.Contains(line, "answered through the tested instance") {
+		t.Fatalf("connectivity line: %q", line)
+	}
+	if evidence := evidenceOf(res); !strings.Contains(evidence, "answered through the tested instance") {
+		t.Fatalf("evidence lost the connectivity fact: %q", evidence)
 	}
 }
 

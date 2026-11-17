@@ -1012,13 +1012,20 @@ func reasonText(code string) string {
 // its path ownership is unproven, and the row must say so instead of reading
 // like a dead link.
 func connectivityNote(res app.TestResult) string {
-	if res.Status != "inconclusive" {
+	if res.Status != "inconclusive" || !answered(res) {
 		return ""
 	}
 	if ms := latencyMS(res); ms > 0 {
 		return fmt.Sprintf("traffic answered in %d ms; path ownership unproven", ms)
 	}
-	return ""
+	return "answered through the tested instance; exit identity unproven"
+}
+
+// answered reports whether the run itself observed a completed request. The
+// latency probe is not attempted once the exit check fails, but an isolated
+// instance that completed the HTTPS probe still carried traffic.
+func answered(res app.TestResult) bool {
+	return latencyMS(res) > 0 || (res.Path != nil && res.Path.TunneledHTTPS)
 }
 
 // connectivityLine states what the evidence shows about carrying traffic,
@@ -1034,7 +1041,10 @@ func connectivityLine(res app.TestResult) string {
 		if ms := latencyMS(res); ms > 0 {
 			return fmt.Sprintf("answered in %d ms; exit ownership unproven", ms)
 		}
-		return "no measurable answer"
+		if answered(res) {
+			return "answered through the tested instance; exit identity unproven"
+		}
+		return "no answer recorded"
 	case "failed":
 		return "no answer"
 	case "cancelled":
