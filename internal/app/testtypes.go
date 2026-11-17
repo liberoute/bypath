@@ -11,11 +11,20 @@ const (
 	TestScopeAll   = "all"
 
 	TestStatusOK           = "ok"
+	TestStatusMeasured     = "measured"
 	TestStatusInconclusive = "inconclusive"
 	TestStatusUnavailable  = "unavailable"
 	TestStatusFailed       = "failed"
 	TestStatusCancelled    = "cancelled"
 	TestStatusSkipped      = "skipped"
+
+	// Evidence layers. An operational result answers a real HTTPS request
+	// through the tested connection but does not bind the exit identity. A
+	// verified result carries the full L1+L2 proof. Only the verified layer is
+	// ranked as a proven path; the operational layer is what makes shared-exit
+	// subscriptions usable at all.
+	EvidenceOperational = "operational"
+	EvidenceVerified    = "verified"
 
 	TestJobQueued    = "queued"
 	TestJobRunning   = "running"
@@ -76,6 +85,13 @@ type TestJob struct {
 	FinishedAt string       `json:"finished_at,omitempty"`
 	Error      string       `json:"error,omitempty"`
 	Results    []TestResult `json:"results"`
+	// Traffic plan for a speed job, computed before the first byte moves. The
+	// worst case is what the monthly refusal checks; the batch stops on the
+	// bytes it actually spent, so a cheap run can cover more connections than
+	// the worst case promises.
+	PlannedBytes  int64 `json:"planned_bytes,omitempty"`
+	PlannedLinks  int   `json:"planned_links,omitempty"`
+	BudgetSkipped int   `json:"budget_skipped,omitempty"`
 }
 
 // TestEvent is one progress event. Seq is monotonic per job so a polling or
@@ -103,10 +119,17 @@ type TestResult struct {
 	Reason       string `json:"reason,omitempty"`
 	Detail       string `json:"detail,omitempty"`
 	Category     string `json:"category,omitempty"`
-	Superseded   bool   `json:"superseded,omitempty"`
-	LatencyMS    int64  `json:"latency_ms"`
-	P50MS        int64  `json:"p50_ms"`
-	P90MS        int64  `json:"p90_ms"`
+	// Evidence names the layer behind the numbers: "verified" for an L1+L2
+	// proof, "operational" for a real HTTPS measurement whose exit ownership
+	// is unproven. Empty on legacy rows and on rows with no measurement.
+	Evidence string `json:"evidence,omitempty"`
+	// HTTPSProven is set only after a real HTTPS response arrived through the
+	// tested connection. An open listener or a TCP handshake never sets it.
+	HTTPSProven bool  `json:"https_proven,omitempty"`
+	Superseded  bool  `json:"superseded,omitempty"`
+	LatencyMS   int64 `json:"latency_ms"`
+	P50MS       int64 `json:"p50_ms"`
+	P90MS       int64 `json:"p90_ms"`
 	// Speed fields. MBps is counted payload throughput; Bytes is what Bypath
 	// itself counted, never true link-level usage.
 	MBps          float64 `json:"mbps,omitempty"`
@@ -171,11 +194,14 @@ type Counters struct {
 type TestBudget struct {
 	Kind          string `json:"kind"`
 	Links         int    `json:"links"`
+	LinksMeasured int    `json:"links_measured"`
+	LinksSkipped  int    `json:"links_skipped"`
 	PerLinkMB     int    `json:"per_link_mb"`
 	PerBatchMB    int    `json:"per_batch_mb"`
 	WorstCaseMB   int    `json:"worst_case_mb"`
 	MonthlyCapMB  int    `json:"monthly_cap_mb,omitempty"`
 	MonthUsedMB   int    `json:"month_used_mb"`
+	RemainingMB   int    `json:"month_remaining_mb,omitempty"`
 	Target        string `json:"target"`
 	TargetURL     string `json:"target_url"`
 	RouteCheck    string `json:"route_check,omitempty"`

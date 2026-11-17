@@ -199,6 +199,11 @@ func validateWorkerResult(job WorkerJob, out WorkerResult) error {
 			return errors.New("the worker returned a certified result without an isolated path proof")
 		}
 	}
+	if out.Result.Status == TestStatusMeasured {
+		if !out.Result.HTTPSProven || (out.Result.P50MS <= 0 && out.Result.LatencyMS <= 0 && out.Result.MBps <= 0) {
+			return errors.New("the worker returned an operational result without an HTTPS measurement")
+		}
+	}
 	return nil
 }
 

@@ -66,7 +66,7 @@ export function fmtLatency(ms) {
 }
 
 export const REASON_TEXT = {
-  CONFIG_NOT_ISOLATED: 'the test-tunnel configuration is not isolated',
+  CONFIG_NOT_ISOLATED: 'measured on the live tunnel; the test-tunnel configuration is not isolated',
   PATH_DIRECT_TARGET: 'the destination would go DIRECT, not through the tunnel',
   EXIT_EQUALS_UPLINK: 'traffic left directly instead of through the tunnel',
   EXIT_EQUALS_SERVING: 'the exit matches the serving connection, so ownership is unproven',
@@ -78,9 +78,34 @@ export const REASON_TEXT = {
   ROUTE_EXPLAIN_UNAVAILABLE: 'the routing policy could not be evaluated for a target',
   ISOLATION_UNVERIFIED: 'isolated-test isolation has not been verified on this host',
   TARGET_REJECTED: 'the download target was rejected by the security checks',
-  BUDGET_REACHED: 'the traffic budget was reached',
-  NO_PROVEN_RESULT: 'a proven relay result is required before a speed test',
+  BUDGET_REACHED: 'the batch traffic budget was spent before this connection',
+  NO_PROVEN_RESULT: 'a recent HTTPS measurement is required before a speed test',
 };
+
+// mbps is megabits/s as counted by the test; MB/s is bytes over elapsed time.
+export function mbPerSec(result) {
+  if (!result || !result.bytes || !result.seconds) return 0;
+  return result.bytes / result.seconds / 1e6;
+}
+
+export function throughputText(result) {
+  if (!result || result.kind !== 'speed' || !result.mbps) return '';
+  const parts = [`${result.mbps.toFixed(1)} Mbps`];
+  const mbs = mbPerSec(result);
+  if (mbs > 0) parts.push(`${mbs.toFixed(2)} MB/s`);
+  return parts.join(' · ');
+}
+
+export function downloadedText(result) {
+  if (!result || !result.bytes || !result.seconds) return '';
+  return `${fmtBytes(result.bytes)} in ${result.seconds.toFixed(2)} s`;
+}
+
+function fmtBytes(bytes) {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
 
 export function reasonText(code) {
   if (!code) return '';
@@ -89,6 +114,7 @@ export function reasonText(code) {
 
 const RESULT_STATE = {
   ok: 'healthy',
+  measured: 'info',
   inconclusive: 'inconclusive',
   unavailable: 'unavailable',
   failed: 'failed',
@@ -98,6 +124,7 @@ const RESULT_STATE = {
 
 const RESULT_LABEL = {
   ok: 'Healthy',
+  measured: 'Measured',
   inconclusive: 'Inconclusive',
   unavailable: 'Unavailable',
   failed: 'Failed',
@@ -126,6 +153,11 @@ export function connectivityOf(result) {
       return verifiedResult(result)
         ? { code: 'answered', text: 'answered through the proven path' }
         : { code: 'answered', text: 'answered; proof incomplete, not ranked' };
+    case 'measured':
+      return {
+        code: 'answered',
+        text: `${ms > 0 ? `answered in ${ms} ms` : 'answered through the tested connection'}; exit ownership unproven`,
+      };
     case 'inconclusive':
       if (ms > 0) return { code: 'answered', text: `answered in ${ms} ms; exit ownership unproven` };
       if (result.path && result.path.tunneled_https) {
@@ -137,7 +169,7 @@ export function connectivityOf(result) {
     case 'cancelled':
       return { code: 'not_measured', text: 'not measured (cancelled)' };
     case 'skipped':
-      return { code: 'not_measured', text: 'not run' };
+      return { code: 'not_measured', text: result.reason === 'BUDGET_REACHED' ? 'not run (traffic budget spent)' : 'not run' };
     default:
       return { code: 'unknown', text: 'unknown' };
   }
@@ -149,8 +181,16 @@ export function evidenceOf(result) {
   if (result.status === 'ok' && !verifiedResult(result)) return 'stale or incomplete path proof; not ranked';
   if (result.status === 'ok') {
     const parts = [];
-    if (result.kind === 'speed' && result.mbps) parts.push(`${result.mbps.toFixed(1)} Mbps`);
+    if (result.kind === 'speed' && result.mbps) parts.push(throughputText(result));
     else if (result.p50_ms) parts.push(`${result.p50_ms} ms`);
+    if (result.tested_at) parts.push(timeAgo(result.tested_at));
+    return parts.join(' · ');
+  }
+  if (result.status === 'measured') {
+    const parts = [];
+    if (result.kind === 'speed' && result.mbps) parts.push(throughputText(result));
+    else if (result.p50_ms) parts.push(`${result.p50_ms} ms`);
+    parts.push('exit unproven');
     if (result.tested_at) parts.push(timeAgo(result.tested_at));
     return parts.join(' · ');
   }
@@ -195,14 +235,14 @@ export function verifiedResult(result) {
 export function invalidateSupersededResults(results) {
   const latest = new Map();
   for (const r of results || []) {
-    if (['ok', 'skipped'].includes(r.status)) continue;
+    if (['ok', 'measured', 'skipped'].includes(r.status)) continue;
     const cur = latest.get(r.connection_id);
     if (!cur || Date.parse(r.tested_at) >= Date.parse(cur.tested_at)) latest.set(r.connection_id, r);
   }
   return (results || []).map((r) => {
     const last = latest.get(r.connection_id);
-    return last && r.status === 'ok' && Date.parse(last.tested_at) >= Date.parse(r.tested_at)
-      ? { ...r, superseded: true } : r;
+    const supersede = last && ['ok', 'measured'].includes(r.status) && Date.parse(last.tested_at) >= Date.parse(r.tested_at);
+    return supersede ? { ...r, superseded: true } : r;
   });
 }
 

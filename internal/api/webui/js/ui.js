@@ -12,6 +12,7 @@ export const html = htm.bind(h);
 export const stateGlyph = {
   serving: '✓',
   healthy: '✓',
+  info: '◉',
   degraded: '!',
   failed: '✕',
   unavailable: '⊘',

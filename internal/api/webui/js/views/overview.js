@@ -160,7 +160,7 @@ export default function OverviewView({ state }) {
     </div>
     ${(state.results || []).length === 0
       ? html`<${Empty} icon="◎" title="No measurements yet"
-          text="Relay and latency tests prove what path a connection actually uses. Speed tests only run on connections with a proven relay result."
+          text="Relay tests measure real HTTPS latency through each connection. Speed tests need a recent HTTPS measurement, not a proven exit."
           action=${html`<button class="btn primary small" type="button" onClick=${() => navigate('tests', 'run')}>Open Tests</button>`} />`
       : html`<div class="clist">
           ${(state.results || []).slice().sort((a, b) => String(b.tested_at || '').localeCompare(String(a.tested_at || ''))).slice(0, 4).map((result) => html`

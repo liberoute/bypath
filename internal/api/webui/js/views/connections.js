@@ -12,7 +12,7 @@ import {
 } from '../data.js';
 import {
   connectionName, protocolShort, fmtLatency, timeAgo, verdictOf, evidenceOf,
-  reasonText, pathKind, latestResult, tunnelServing,
+  reasonText, pathKind, latestResult, tunnelServing, throughputText, downloadedText, verifiedResult,
 } from '../format.js';
 import {
   GroupDialog, MoveDialog, DeleteConnectionDialog, CredentialsDialog,
@@ -53,7 +53,7 @@ export default function ConnectionsView({ state }) {
   const byStable = new Map(visible.map((connection) => [connection.stable_id || connection.id, connection]));
   const latencyOf = (connection) => {
     const result = latestResult(state.results || [], connection.stable_id || connection.id, 'latency');
-    return result && result.status === 'ok' ? (result.p50_ms || result.latency_ms || 0) : null;
+    return result && ['ok', 'measured'].includes(result.status) ? (result.p50_ms || result.latency_ms || 0) : null;
   };
 
   const sortRows = (rows) => {
@@ -290,7 +290,7 @@ function MigrationDialog({ plan, onClose, onDone }) {
 export function ConnectionRow({ connection, state, serving, selected, onOpen, onConnect }) {
   const relay = latestResult(state.results || [], connection.stable_id || connection.id, 'latency');
   const speed = latestResult(state.results || [], connection.stable_id || connection.id, 'speed');
-  const latency = relay && relay.status === 'ok' ? (relay.p50_ms || relay.latency_ms) : 0;
+  const latency = relay && ['ok', 'measured'].includes(relay.status) ? (relay.p50_ms || relay.latency_ms) : 0;
   const needsCreds = connection.requires_auth && !connection.has_credentials;
   return html`<div class=${`crow ${serving ? 'serving' : ''}`} role="button" tabindex="0"
       onClick=${onOpen} onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen(); } }}>
@@ -422,10 +422,12 @@ function ConnectionDrawer({ connection, state, onClose, onConnect, onRefresh }) 
         </div>
         <div class="small muted">${result.tested_at ? `${timeAgo(result.tested_at)} · ${pathKind(result)}` : ''}</div>
         ${result.status !== 'ok' ? html`<div class="small">${result.detail || reasonText(result.reason) || 'No usable evidence.'}</div>` : null}
-        ${result.status === 'ok' ? html`<${KV} rows=${[
-          result.kind === 'speed' ? ['Throughput', result.mbps ? `${result.mbps.toFixed(1)} Mbps` : '—'] : ['Median latency', fmtLatency(result.p50_ms || result.latency_ms)],
-          result.kind === 'speed' ? ['Target', result.target || '—'] : ['p90 latency', fmtLatency(result.p90_ms)],
-          ['Path proof', result.path ? `${result.path.level} · ${result.path.kind}` : '—'],
+        ${['ok', 'measured'].includes(result.status) ? html`<${KV} rows=${[
+          result.kind === 'speed' ? ['Throughput', throughputText(result) || '—'] : ['Median latency', fmtLatency(result.p50_ms || result.latency_ms)],
+          result.kind === 'speed' ? ['Downloaded', downloadedText(result) || '—'] : ['p90 latency', fmtLatency(result.p90_ms)],
+          result.kind === 'speed' ? ['Target', result.target || '—'] : null,
+          ['Evidence', verifiedResult(result) ? 'verified path (L1+L2)' : result.status === 'measured' ? 'operational measurement · exit ownership unproven' : 'incomplete proof'],
+          ['Path proof', result.path ? `${result.path.level || '—'} · ${result.path.kind || '—'}` : '—'],
           ['Exit before', result.path && result.path.exit_ip_before],
           ['Exit after', result.path && result.path.exit_ip_after],
           ['Uplink address', result.path && result.path.uplink_ip],

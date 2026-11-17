@@ -6,5 +6,6 @@ BYPATH [FULL]  CONNECTED  pid 4242  ·  running Maple-IPv4
  Scope  all   s cycles · g group · l link                                                                               
  Hidden no   i toggles                                                                                                  
                                                                                                                         
- No job yet. Enter starts a measurement; relay results carry L1+L2 evidence, and a speed run needs one first.           
+ No job yet. Enter starts a measurement; relay results carry L1+L2 evidence, and a measured (not necessarily verified)  
+ HTTPS result is enough for a bounded speed run.                                                                        
  t run/results/compare  K kind  s scope  g group  l link  i hidden  enter start/evidence  c cancel  r reload  ↑/↓ move  

@@ -246,6 +246,7 @@ label.check input { width: 18px; height: 18px; accent-color: var(--brand); }
 .chip.failed, .chip.bad { color: var(--bad); background: var(--bad-bg); border-color: color-mix(in srgb, var(--bad) 40%, transparent); --glyph: "✕"; }
 .chip.unavailable { color: var(--muted-state); background: var(--muted-state-bg); border-color: color-mix(in srgb, var(--muted-state) 40%, transparent); --glyph: "⊘"; }
 .chip.inconclusive { color: var(--inc); background: var(--inc-bg); border-color: color-mix(in srgb, var(--inc) 40%, transparent); --glyph: "?"; }
+.chip.info { color: var(--info); background: var(--info-bg); border-color: color-mix(in srgb, var(--info) 40%, transparent); --glyph: "◉"; }
 .chip.testing { color: var(--info); background: var(--info-bg); border-color: color-mix(in srgb, var(--info) 40%, transparent); --glyph: "◌"; }
 .chip.testing::before { display: inline-block; animation: spin 1.2s linear infinite; }
 .chip.untested { color: var(--fg-3); background: var(--surface-2); --glyph: "–"; }
@@ -261,6 +262,7 @@ label.check input { width: 18px; height: 18px; accent-color: var(--brand); }
 .badge.warn { background: var(--warn-bg); color: var(--warn); border-color: transparent; }
 .badge.bad { background: var(--bad-bg); color: var(--bad); border-color: transparent; }
 .badge.accent { background: var(--info-bg); color: var(--info); border-color: transparent; }
+.badge.info { background: var(--info-bg); color: var(--info); border-color: transparent; }
 .badge.inc { background: var(--inc-bg); color: var(--inc); border-color: transparent; }
 .badge.stale { background: var(--stale-bg); color: var(--stale); border-style: dashed; border-color: var(--stale); }
 .evidence { color: var(--fg-3); font-size: 11.6px; font-weight: 550; }

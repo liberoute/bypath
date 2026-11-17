@@ -2,15 +2,15 @@ BYPATH [FULL]  CONNECTED  pid 4242
  3/12 Tests                             
                                         
  Tests ·  Run  Results  Compare    t cyc
- latency · 2 proven ranked · 2 not ranke
+ latency · 2 verified · 0 measured · 2 n
                                         
- Ranked (proven path)                   
-  1. Maple-IP…  HEALTHY       p50 41 m… 
-  2. 东京节点…  HEALTHY       p50 180 … 
- Not ranked                             
- An inconclusive result does not mean   
- the link is bad; its path was not      
- proven, so it is not used for ranking. 
+ Verified (ranked)                      
+  1. Maple-IP…  VERIFIED      p50 41 m… 
+  2. 东京节点…  VERIFIED      p50 180 … 
+ Not measured                           
+ No usable number was produced. This is 
+ not automatically a dead link; the     
+ reason column says what stopped it.    
   1. eu-tcp     FAILED        the DIRE… 
   2. Example …  INCONCLUSIVE  the exit… 
  ↑/↓ move · enter evidence · K kind · r 

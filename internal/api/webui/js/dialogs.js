@@ -687,20 +687,21 @@ export function BudgetDialog({ request, onClose, onStart }) {
         title=${overBudget ? 'Monthly budget would be exceeded' : 'Worst case before starting'}
         text=${overBudget
           ? `This run could use ${budget.worst_case_mb} MB on top of ${usedMB} MB already counted this month; the cap is ${cap} MB.`
-          : `At most ${budget.worst_case_mb} MB, across ${budget.links} connection${budget.links === 1 ? '' : 's'}.`} />
+          : `At most ${budget.worst_case_mb} MB, across ${budget.links_measured || budget.links} of ${budget.links} connection${budget.links === 1 ? '' : 's'}${budget.links_skipped ? `; ${budget.links_skipped} would be skipped by budget` : ''}.`} />
       <${KV} rows=${[
         ['Target host', budget.target],
         ['Target address', budget.target_url],
         ['Route check', budget.route_check ? html`<span class="route-outcome ${routeKind}">${budget.route_check}</span>` : (budget.check_note || '—')],
         ['Per connection cap', `${budget.per_link_mb} MB`],
         ['Per batch cap', `${budget.per_batch_mb} MB`],
+        ['Connections measured', `${budget.links_measured || budget.links} of ${budget.links}${budget.links_skipped ? ` · ${budget.links_skipped} skipped by budget` : ''}`],
         ['Worst case', `${budget.worst_case_mb} MB`],
-        ['Monthly cap', cap ? `${cap} MB (${usedMB} MB used)` : 'not set'],
+        ['Monthly cap', cap ? `${cap} MB (${usedMB} MB used${budget.month_remaining_mb ? `, ${budget.month_remaining_mb} MB remaining` : ''})` : 'not set'],
         ['Upload testing', budget.upload_enabled ? 'enabled' : 'disabled — download only'],
         ['Order', 'serial, one connection at a time'],
       ]} />
       ${budget.check_note ? html`<p class="notice info">${budget.check_note}</p>` : null}
-      <p class="muted small">A speed result requires a proven relay result for the same connection. Connections without one are skipped, not measured.</p>
+      <p class="muted small">A speed run needs a recent HTTPS measurement for the connection, not a proven exit. Connections without one are skipped as not measured; a connection skipped by budget is marked separately and is not a failure.</p>
       <p class="footnote">Counted bytes are payload read by Bypath. Protocol overhead and retransmissions are not included, so real link usage is higher. ${usage && usage.label ? usage.label : ''}</p>
     </div>` : null}
   <//>`;

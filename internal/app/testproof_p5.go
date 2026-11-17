@@ -30,6 +30,7 @@ const (
 var openTestSession = bench.Open
 var pickTestProbe = bench.PickProbeURL
 var readTestExit = echoThrough
+var diagnoseEndpoint = bench.DiagnoseEndpoint
 var sampleTestSession = func(s *bench.Session, ctx context.Context, target string, limit int64) (time.Duration, []byte, error) {
 	return s.Sample(ctx, target, limit)
 }
@@ -134,6 +135,8 @@ func finishAttempt(res *TestResult, parent context.Context) {
 		switch res.Status {
 		case TestStatusOK:
 			res.Category = CategoryVerified
+		case TestStatusMeasured:
+			res.Category = CategoryExitUnverified
 		case TestStatusInconclusive:
 			res.Category = CategoryExitUnverified
 		case TestStatusUnavailable:
@@ -143,6 +146,18 @@ func finishAttempt(res *TestResult, parent context.Context) {
 		}
 	}
 	if res.Status == TestStatusOK && !VerifiedTestResult(*res) {
+		if res.HTTPSProven && (res.P50MS > 0 || res.LatencyMS > 0 || res.MBps > 0) {
+			// The request really answered through the tested connection. It is
+			// usable as an operational measurement, never as a proven path.
+			res.Status, res.Category = TestStatusMeasured, CategoryExitUnverified
+			if res.Reason == "" {
+				res.Reason = ReasonExitUnknown
+			}
+			if res.Detail == "" {
+				res.Detail = "HTTPS answered through the tested connection, but the isolated engine-owned path and independent exit identity are not fully verified"
+			}
+			return
+		}
 		res.Status, res.Category, res.Reason = TestStatusInconclusive, CategoryExitUnverified, ReasonExitUnknown
 		res.Detail = "HTTPS answered, but the isolated engine-owned path and independent exit identity are not fully verified"
 		zeroMeasurement(res)
@@ -150,11 +165,13 @@ func finishAttempt(res *TestResult, parent context.Context) {
 }
 
 // InvalidateSupersededResults retains honest history but prevents an older
-// success (including a speed proof) surviving a later failed/inconclusive try.
+// success (including a speed proof) surviving a later failed try. An
+// operational measurement is a success for this purpose: it is not evidence
+// that a later failure did not happen.
 func InvalidateSupersededResults(results []TestResult) {
 	latestFailure := map[string]TestResult{}
 	for _, r := range results {
-		if r.Status == TestStatusOK || r.Status == TestStatusSkipped {
+		if r.Status == TestStatusOK || r.Status == TestStatusMeasured || r.Status == TestStatusSkipped {
 			continue
 		}
 		if cur, ok := latestFailure[r.ConnectionID]; !ok || TestResultAtLeastAsNew(r, cur) {
@@ -163,7 +180,8 @@ func InvalidateSupersededResults(results []TestResult) {
 	}
 	for i := range results {
 		last, ok := latestFailure[results[i].ConnectionID]
-		if ok && TestResultAtLeastAsNew(last, results[i]) && results[i].Status == TestStatusOK {
+		if ok && TestResultAtLeastAsNew(last, results[i]) &&
+			(results[i].Status == TestStatusOK || results[i].Status == TestStatusMeasured) {
 			results[i].Superseded = true
 		}
 	}

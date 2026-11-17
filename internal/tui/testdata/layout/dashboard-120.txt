@@ -11,6 +11,6 @@ BYPATH [FULL]  CONNECTED  pid 4242  ·  running Maple-IPv4
  Restarts        0   data-path 0   recovery attempt 0                                                                   
  Profiles        12 connections in 1 source(s)                                                                          
  Organisation    not created yet — press M in Connections                                                               
- Tests           4 connection(s) tested · 2 proven (only proven paths are ranked)                                       
+ Tests           4 connection(s) tested · 2 verified · 0 measured (only verified paths are ranked as proven)            
  Listeners       api 8080 · socks 2801 · dns 53                                                                         
  2 connections  3 tests  8 import  p probe exit IP  r refresh  q quit                                                   

@@ -1,6 +1,6 @@
-// Tests: relay and latency first, download speed only on proven connections.
-// Every result shown here carries the proof that produced it; nothing is
-// ranked without L1+L2.
+// Tests: operational benchmarks (real HTTPS latency and bounded speed) are
+// separated from independent path verification. Every result shows which layer
+// it came from; nothing is ranked as a proven path without L1+L2.
 
 import { html, Chip, Banner, Empty, Skeleton, Tabs, Progress, KV, Footnote, ByteNote, ResultChip, RelTime } from '../ui.js';
 import { useState, useEffect } from '../../vendor/hooks.module.js';
@@ -12,7 +12,7 @@ import {
 } from '../data.js';
 import {
   connectionName, evidenceOf, connectivityOf, verdictOf, reasonText, pathKind, fmtLatency, fmtMB, timeAgo,
-  verifiedResult, invalidateSupersededResults,
+  verifiedResult, invalidateSupersededResults, throughputText, downloadedText, mbPerSec,
 } from '../format.js';
 import { BudgetDialog, TargetAddDialog, TargetDeleteDialog } from '../dialogs.js';
 
@@ -30,7 +30,7 @@ export default function TestsView({ state }) {
   return html`<div class="view-head">
     <div>
       <h1>Tests</h1>
-      <div class="sub">A test proves what a connection does. Relay and latency results carry the path evidence; a speed result is only produced for a connection that already has one.</div>
+      <div class="sub">A test measures what a connection actually carries. An operational result answers real HTTPS traffic through the selected engine; a verified result additionally proves the isolated path and the independent exit, and only that layer is ranked as a proven path.</div>
     </div>
     <div class="view-actions">
       ${running ? html`<button class="btn danger" type="button" onClick=${() => cancelTestJob().catch(toastError)}>Cancel job</button>` : null}
@@ -67,6 +67,7 @@ function RunPanel({ state }) {
   const job = state.job;
   const running = !!(job && ['queued', 'running'].includes(job.state));
   const results = (job && job.results) || [];
+  const skippedByBudget = results.filter((result) => result.status === 'skipped' && result.reason === 'BUDGET_REACHED').length;
 
   useEffect(() => {
     if (scopeKind === 'group' && !group && groups.length) setGroup(groups[0]);
@@ -134,8 +135,8 @@ function RunPanel({ state }) {
       <button class="btn ghost" type="button" onClick=${() => loadResults().catch(toastError)}>Reload results</button>
     </div>
     <p class="muted small">${kind === 'speed'
-      ? 'Speed runs are serial, one connection at a time, and are capped per connection and per batch. Upload testing is not available in this release.'
-      : 'Relay tests start an isolated test tunnel per connection and compare the observed exit with the uplink and the serving tunnel. A result without L1+L2 is reported as inconclusive, never as healthy.'}</p>
+      ? 'Speed runs are serial, one connection at a time, and are capped per connection and per batch. A connection needs a recent HTTPS measurement, not a proven exit. Upload testing is not available in this release.'
+      : 'Relay tests start an isolated test tunnel per connection, answer a real HTTPS probe through it and compare the observed exit with the uplink and the serving tunnel. A result without L1+L2 is reported as a measured operational result, never as a proven path.'}</p>
 
     ${job ? html`<div class="stack" style="margin-top:12px">
       <div class="row">
@@ -145,6 +146,10 @@ function RunPanel({ state }) {
       </div>
       <${Progress} completed=${job.completed || 0} total=${job.total || 0} state=${job.state} />
       <div class="muted small">${job.stage ? `${job.stage} · ` : ''}${job.completed || 0} of ${job.total || 0}${job.error ? ` · ${job.error}` : ''}</div>
+      ${job.kind === 'speed' && job.planned_links ? html`<div class="muted small">
+        Plan: ${job.planned_links} of ${job.total || 0} connections measured, at most ${fmtMB(job.planned_bytes || 0)} this batch${job.budget_skipped ? ` · ${job.budget_skipped} would be skipped by budget` : ''}. The batch stops on the bytes it actually spent.
+      </div>` : null}
+      ${skippedByBudget ? html`<div class="muted small">${skippedByBudget} connection${skippedByBudget === 1 ? ' was' : 's were'} not measured because the batch traffic budget was spent. They are not failures.</div>` : null}
       ${results.length ? html`<div class="table-wrap"><table class="data">
         <thead><tr><th>Connection</th><th>Result</th><th>Evidence</th><th>Path</th></tr></thead>
         <tbody>${results.map((result) => html`<tr key=${`${result.connection_id}:${result.kind}:${result.tested_at}`}>
@@ -160,25 +165,53 @@ function RunPanel({ state }) {
   <div class="panel">
     <h2>What makes a result trustworthy</h2>
     <ul class="bullets muted">
+      <li><strong>Operational measurement</strong>: a real HTTPS probe answers through the tested connection, and latency or downloaded bytes are recorded only from that answer. An open listener or a bare TCP handshake never counts.</li>
       <li><strong>L1 construction audit</strong>: the test engine configuration is checked before it starts; a shared or non-isolated configuration is refused.</li>
       <li><strong>L2 independent exit identity</strong>: two echo services must agree on the public address, and it must differ from the uplink and from the serving tunnel.</li>
       <li><strong>Route decisions</strong>: the target must be routed through the test tunnel; a DIRECT target invalidates the measurement.</li>
       <li><strong>Stability</strong>: the policy revision and the exit must not change during the measurement.</li>
       <li><strong>Negative control</strong>: the serving tunnel re-checks that DIRECT traffic is not silently absorbed by the tunnel.</li>
     </ul>
-    <p class="footnote">An inconclusive result names the reason. It is never presented as a failure of the link, and it is never ranked.</p>
+    <p class="footnote">A measured result is usable evidence that traffic flowed, even when the exit is shared or could not be identified. Only a verified result is ranked as a proven path. EXIT_EQUALS_UPLINK stays a refusal: that traffic went DIRECT, so nothing was measured.</p>
   </div>`;
+}
+
+function failureRank(result) {
+  switch (result.status) {
+    case 'failed': return 0;
+    case 'unavailable': return 1;
+    case 'inconclusive': return 2;
+    default: return 3;
+  }
+}
+
+function sortResults(list, mode) {
+  const ms = (result) => result.p50_ms || result.latency_ms || 0;
+  const recent = (a, b) => String(b.tested_at || '').localeCompare(String(a.tested_at || ''));
+  const rows = list.slice();
+  if (mode === 'latency') {
+    return rows.sort((a, b) => ((ms(a) || Number.POSITIVE_INFINITY) - (ms(b) || Number.POSITIVE_INFINITY)) || recent(a, b));
+  }
+  if (mode === 'speed') {
+    return rows.sort((a, b) => (b.mbps || -1) - (a.mbps || -1) || recent(a, b));
+  }
+  if (mode === 'failures') {
+    return rows.sort((a, b) => failureRank(a) - failureRank(b) || recent(a, b));
+  }
+  return rows.sort(recent);
 }
 
 function ResultsPanel({ state }) {
   const [connectionFilter, setConnectionFilter] = useState('');
   const [kindFilter, setKindFilter] = useState('');
+  const [sortBy, setSortBy] = useState('recent');
   const [expanded, setExpanded] = useState('');
-  const results = invalidateSupersededResults(state.results).filter((result) => {
+  const filtered = invalidateSupersededResults(state.results).filter((result) => {
     if (connectionFilter && result.connection_id !== connectionFilter) return false;
     if (kindFilter && result.kind !== kindFilter) return false;
     return true;
-  }).slice().sort((a, b) => String(b.tested_at || '').localeCompare(String(a.tested_at || '')));
+  });
+  const results = sortResults(filtered, sortBy);
   const connectionIds = Array.from(new Set((state.results || []).map((result) => result.connection_id)));
 
   return html`<div class="panel">
@@ -195,13 +228,19 @@ function ResultsPanel({ state }) {
         <option value="latency">Relay and latency</option>
         <option value="speed">Download speed</option>
       </select>
+      <select aria-label="Sort results" value=${sortBy} onChange=${(e) => setSortBy(e.target.value)}>
+        <option value="recent">Last tested</option>
+        <option value="latency">Lowest latency</option>
+        <option value="speed">Fastest download</option>
+        <option value="failures">Failures first</option>
+      </select>
       <button class="btn ghost small" type="button" onClick=${() => loadResults().catch(toastError)}>Refresh</button>
       <span class="muted small">${results.length} result${results.length === 1 ? '' : 's'} · kept per connection with a cap</span>
     </div>
     ${!state.resultsLoaded ? html`<${Skeleton} rows=${4} />` : null}
     ${state.resultsLoaded && results.length === 0 ? html`<${Empty} icon="◎" title="No results match"
       text=${kindFilter === 'speed'
-        ? 'No speed result matches this filter. Speed runs are bounded and only produce a result on a connection that already has a proven path.'
+        ? 'No speed result matches this filter. A speed run needs a registered target and a recent HTTPS measurement for the connection; the exit does not have to be proven.'
         : 'Run a relay test first. Results are stored on the gateway, so they survive a panel reload.'}
       action=${html`<button class="btn primary small" type="button" onClick=${() => navigate('tests', 'run')}>Run a test</button>`} />` : null}
     ${results.length ? html`<div class="clist">
@@ -214,7 +253,7 @@ function ResultsPanel({ state }) {
             <div class="avatar">${result.kind === 'speed' ? 'SPD' : 'RT'}<span class="p">${result.protocol || ''}</span></div>
             <div class="c-main">
               <div class="c-name">${result.remark || result.connection_id}</div>
-              <div class="c-sub">${evidenceOf(result) || '—'}${result.status === 'ok' ? '' : ` · ${timeAgo(result.tested_at)}`}</div>
+              <div class="c-sub">${evidenceOf(result) || '—'}${['ok', 'measured'].includes(result.status) ? '' : ` · ${timeAgo(result.tested_at)}`}</div>
             </div>
             <div class="c-end"><${ResultChip} result=${result} /></div>
           </div>
@@ -225,8 +264,10 @@ function ResultsPanel({ state }) {
             <${KV} rows=${[
               ['Connection id', result.connection_id],
               ['Connectivity', connectivityOf(result).text],
+              ['Evidence', result.status === 'ok' && verifiedResult(result) ? 'verified path (L1+L2)' : result.status === 'measured' ? 'operational measurement · exit ownership unproven' : 'no verified proof'],
               ['Path', pathKind(result) || 'no proof recorded'],
-              result.kind === 'speed' ? ['Throughput', result.mbps ? `${result.mbps.toFixed(1)} Mbps` : '—'] : ['Median / p90', `${fmtLatency(result.p50_ms || result.latency_ms)} / ${fmtLatency(result.p90_ms)}`],
+              result.kind === 'speed' ? ['Throughput', throughputText(result) || '—'] : ['Median / p90', `${fmtLatency(result.p50_ms || result.latency_ms)} / ${fmtLatency(result.p90_ms)}`],
+              result.kind === 'speed' ? ['Downloaded', downloadedText(result) || '—'] : null,
               result.kind === 'speed' ? ['Target', result.target || '—'] : null,
               result.kind === 'speed' ? ['Counted bytes', result.bytes ? `${result.bytes} B` : '—'] : null,
               ['Exit before', result.path && result.path.exit_ip_before],
@@ -258,11 +299,32 @@ function ComparePanel({ state }) {
     if (!current || Date.parse(result.tested_at) >= Date.parse(current.tested_at)) latest.set(result.connection_id, result);
   }
   const all = Array.from(latest.values());
-  const proven = all.filter(verifiedResult)
-    .sort((a, b) => kind === 'speed'
-      ? (b.mbps || 0) - (a.mbps || 0)
-      : (a.p50_ms || a.latency_ms || Infinity) - (b.p50_ms || b.latency_ms || Infinity));
-  const rest = all.filter((result) => !proven.includes(result));
+  const byValue = (a, b) => kind === 'speed'
+    ? (b.mbps || -1) - (a.mbps || -1)
+    : ((a.p50_ms || a.latency_ms || Number.POSITIVE_INFINITY) - (b.p50_ms || b.latency_ms || Number.POSITIVE_INFINITY));
+  const proven = all.filter(verifiedResult).sort(byValue);
+  const operational = all
+    .filter((result) => !verifiedResult(result) && result.status === 'measured' && !result.superseded && !result.stale)
+    .sort(byValue);
+  const rest = all.filter((result) => !proven.includes(result) && !operational.includes(result));
+
+  const rankRows = (list, badge) => html`<div class="rank">
+    ${list.map((result, index) => html`<div class=${`rk ${index === 0 ? 'best' : ''}`} key=${result.connection_id}>
+      <div class="pos">${index + 1}</div>
+      <div class="grow">
+        <div class="rk-name">${result.remark || result.connection_id}${index === 0 ? html`<span class=${`badge ${badge.cls}`}>${badge.label}</span>` : null}</div>
+        <div class="rk-facts">${result.protocol ? result.protocol.toUpperCase() : ''}${result.engine ? ` · ${result.engine}` : ''} · ${pathKind(result) || 'no proof recorded'} · ${connectivityOf(result).text} · ${timeAgo(result.tested_at)}</div>
+      </div>
+      <div class="rk-nums">
+        ${kind === 'speed'
+          ? html`<div><div class="v">${result.mbps ? result.mbps.toFixed(1) : '—'}</div><div class="k">Mbps</div></div>
+              <div><div class="v">${mbPerSec(result) ? mbPerSec(result).toFixed(2) : '—'}</div><div class="k">MB/s</div></div>`
+          : html`<div><div class="v">${fmtLatency(result.p50_ms || result.latency_ms)}</div><div class="k">p50</div></div>
+              <div><div class="v">${fmtLatency(result.p90_ms)}</div><div class="k">p90</div></div>`}
+        <div><div class="v"><${ResultChip} result=${result} /></div><div class="k">evidence</div></div>
+      </div>
+    </div>`)}
+  </div>`;
 
   return html`<div class="panel">
     <div class="toolbar">
@@ -270,30 +332,23 @@ function ComparePanel({ state }) {
         <option value="latency">Relay latency</option>
         <option value="speed">Download speed</option>
       </select>
-      <span class="muted small">${proven.length} proven result${proven.length === 1 ? '' : 's'} ranked · ${rest.length} not ranked</span>
+      <span class="muted small">${proven.length} verified · ${operational.length} measured (exit unproven) · ${rest.length} not ranked</span>
     </div>
     ${all.length === 0 ? html`<${Empty} icon="◎" title="Nothing to compare yet"
-      text=${kind === 'speed' ? 'A speed result requires a proven relay result for the same connection.' : 'Run a relay test across the connections you care about.'}
+      text=${kind === 'speed' ? 'A speed run needs a recent HTTPS measurement and a registered target; the exit does not have to be proven.' : 'Run a relay test across the connections you care about.'}
       action=${html`<button class="btn primary small" type="button" onClick=${() => navigate('tests', 'run')}>Run a test</button>`} />` : null}
-    ${proven.length ? html`<div class="rank">
-      ${proven.map((result, index) => html`<div class=${`rk ${index === 0 ? 'best' : ''}`} key=${result.connection_id}>
-        <div class="pos">${index + 1}</div>
-        <div class="grow">
-          <div class="rk-name">${result.remark || result.connection_id}${index === 0 ? html`<span class="badge ok">fastest proven</span>` : null}</div>
-          <div class="rk-facts">${result.protocol ? result.protocol.toUpperCase() : ''}${result.engine ? ` · ${result.engine}` : ''} · ${pathKind(result)} · ${connectivityOf(result).text} · ${timeAgo(result.tested_at)}</div>
-        </div>
-        <div class="rk-nums">
-          ${kind === 'speed'
-            ? html`<div><div class="v">${result.mbps ? result.mbps.toFixed(1) : '—'}</div><div class="k">Mbps</div></div>`
-            : html`<div><div class="v">${fmtLatency(result.p50_ms || result.latency_ms)}</div><div class="k">p50</div></div>
-                <div><div class="v">${fmtLatency(result.p90_ms)}</div><div class="k">p90</div></div>`}
-          <div><div class="v"><${ResultChip} result=${result} /></div><div class="k">evidence</div></div>
-        </div>
-      </div>`)}
+    ${proven.length ? html`<div class="stack" style="gap:8px">
+      <h3>Verified · ranked as a proven path</h3>
+      ${rankRows(proven, { label: 'fastest proven', cls: 'ok' })}
+    </div>` : null}
+    ${operational.length ? html`<div class="stack" style="margin-top:12px; gap:8px">
+      <h3>Measured · operational (exit unproven)</h3>
+      <p class="muted small">These numbers came from real HTTPS traffic through the tested connection. They are usable for choosing a connection, but the exit ownership was not independently proven.</p>
+      ${rankRows(operational, { label: 'fastest measured', cls: 'info' })}
     </div>` : null}
     ${rest.length ? html`<div class="stack" style="margin-top:12px">
       <h3>Not ranked</h3>
-      <p class="muted small">These results are shown for honesty, not for selection. An inconclusive result does not mean the connection is bad; it means its path was not proven.</p>
+      <p class="muted small">These results are shown for honesty, not for selection. An inconclusive result does not mean the connection is bad; it means no real HTTPS measurement was recorded through it.</p>
       <div class="clist">
         ${rest.map((result) => html`<div class="crow" key=${result.connection_id}>
           <div class="avatar">${result.kind === 'speed' ? 'SPD' : 'RT'}</div>

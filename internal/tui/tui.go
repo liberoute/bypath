@@ -55,6 +55,7 @@ var (
 	styleOK     = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 	styleWarn   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 	styleErr    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	styleInfo   = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
 	styleLabel  = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	styleActive = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("39"))
 	styleDanger = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true)

@@ -724,15 +724,23 @@ func (s *Local) BudgetFor(ctx context.Context, req TestRequest) (TestBudget, err
 	out := TestBudget{
 		Kind:          kind,
 		Links:         links,
+		LinksMeasured: links,
 		PerLinkMB:     int(perLink >> 20),
 		PerBatchMB:    int(perBatch >> 20),
 		MonthlyCapMB:  int(monthly >> 20),
 		UploadEnabled: false,
 		CheckNote:     "the target is checked again when the test starts",
 	}
+	var used int64
 	if s.layer != nil {
 		if usage, err := s.layer.Usage(); err == nil && usage.Month == time.Now().UTC().Format("2006-01") {
+			used = usage.Bytes
 			out.MonthUsedMB = int(usage.Bytes >> 20)
+		}
+	}
+	if monthly > 0 {
+		if remaining := monthly - used; remaining > 0 {
+			out.RemainingMB = int(remaining >> 20)
 		}
 	}
 	if kind == TestKindSpeed {
@@ -745,11 +753,13 @@ func (s *Local) BudgetFor(ctx context.Context, req TestRequest) (TestBudget, err
 			out.TargetURL = list[0].URL
 			out.RouteCheck = list[0].LastRoute
 		}
-		worst := int64(links) * perLink
-		if worst > perBatch {
-			worst = perBatch
-		}
-		out.WorstCaseMB = int(worst >> 20)
+		// The worst case reserves the per-link cap for every connection the
+		// batch may start. Actual spend is counted per attempt, so a cheap run
+		// can still cover connections beyond this estimate.
+		out.LinksMeasured = budgetLinkCount(links, perLink, perBatch)
+		out.LinksSkipped = links - out.LinksMeasured
+		out.WorstCaseMB = int(int64(out.LinksMeasured) * perLink >> 20)
+		out.CheckNote = "the target is checked again when the test starts; the batch stops on the bytes it actually spent, so this worst case is a cap, not a promise"
 	} else {
 		// Latency runs are small: five requests per link.
 		out.WorstCaseMB = 0

@@ -192,6 +192,10 @@ type Local struct {
 	// testLink is the per-link measurement. Tests replace it; nil means the
 	// real isolated relay path.
 	testLink func(ctx context.Context, t testTarget, shared testShared) TestResult
+	// testMeasure replaces the serial throughput measurement in tests and
+	// returns the bytes the attempt spent. It exists separately because a
+	// speed job never calls testLink; nil means the real measurement.
+	testMeasure func(t testTarget) (TestResult, int64)
 
 	// routingApplyMu serialises routing writes. It is separate from mu so a
 	// slow tunnel restart never blocks status or read-only API calls.

@@ -17,35 +17,57 @@ type targetRejectedError struct{ reason string }
 
 func (e targetRejectedError) Error() string { return e.reason }
 
-// provenRelay reports whether the connection's latest latency result is a
-// proven, non-stale relay result. A speed number without one would describe an
-// unproven path.
-func (s *Local) provenRelay(connectionID string) (bool, string) {
+// speedPreflight reports whether the connection's latest measurement proved
+// that HTTPS actually answered through it. Exit ownership is deliberately not
+// required: a subscription that shares one exit address is measured normally.
+// An open listener or a TCP handshake never qualifies.
+func (s *Local) speedPreflight(connectionID string) (bool, string) {
+	const needHTTPS = "run the relay and latency test for this connection first; a download needs a proven HTTPS answer"
 	if s.layer == nil {
-		return false, "run a latency test for this connection first; a speed result needs a proven path"
+		return false, needHTTPS
 	}
 	results, err := s.TestResults(context.Background(), connectionID)
 	if err != nil || len(results) == 0 {
-		return false, "run a latency test for this connection first; a speed result needs a proven path"
+		return false, needHTTPS
 	}
 	for i := len(results) - 1; i >= 0; i-- {
 		res := results[i]
 		if res.Kind == TestKindSpeed {
 			continue
 		}
-		if res.Kind == "" && res.LatencyMS == 0 && res.Status != TestStatusOK {
+		if res.Kind == "" && res.LatencyMS == 0 && res.Status != TestStatusOK && res.Status != TestStatusMeasured {
 			// Pre-kind history cannot prove a path.
 			continue
 		}
-		if VerifiedTestResult(res) {
+		if resultStale(res.TestedAt) {
+			return false, "the last HTTPS measurement is stale; run the relay and latency test again"
+		}
+		if operationalHTTPS(res) {
 			return true, ""
 		}
-		if res.Status == TestStatusOK {
-			return false, "the last proof is stale, superseded, or not bound to this configuration; test again first"
-		}
-		return false, "the last latency test did not prove the path; a speed result would be meaningless"
+		return false, "the last measurement did not prove an HTTPS answer through this connection; run the relay and latency test again"
 	}
-	return false, "run a latency test for this connection first; a speed result needs a proven path"
+	return false, needHTTPS
+}
+
+// operationalHTTPS reports whether a stored row records a completed HTTPS
+// request through the tested connection, regardless of the exit proof.
+func operationalHTTPS(res TestResult) bool {
+	measured := res.P50MS > 0 || res.LatencyMS > 0
+	if res.Kind == TestKindSpeed {
+		measured = res.MBps > 0 && res.Bytes > 0
+	}
+	switch res.Status {
+	case TestStatusOK:
+		return VerifiedTestResult(res) || (res.HTTPSProven && measured)
+	case TestStatusMeasured:
+		return res.HTTPSProven && measured
+	case TestStatusInconclusive:
+		// Rows stored before the operational layer existed carry the same fact
+		// in their path proof: the probe answered HTTPS through the instance.
+		return res.Path != nil && res.Path.TunneledHTTPS && measured
+	}
+	return false
 }
 
 // speedThrough validates a target on the tested path and downloads it from the
@@ -97,6 +119,19 @@ func (s *Local) chargeSpeedAttempt(dres downloadResult) {
 	if dres.Spent > 0 {
 		s.addCountedBytes(dres.Spent)
 	}
+}
+
+// countedBytes is the month's counted payload. A batch compares what it
+// actually spent against its cap instead of trusting a worst-case estimate.
+func (s *Local) countedBytes() int64 {
+	if s.layer == nil {
+		return 0
+	}
+	usage, err := s.layer.Usage()
+	if err != nil || usage.Month != time.Now().UTC().Format("2006-01") {
+		return 0
+	}
+	return usage.Bytes
 }
 
 // speedFailure maps a transfer failure onto the result contract. A target that

@@ -166,6 +166,8 @@ func (s *Local) StartTestJob(ctx context.Context, req TestRequest) (TestJob, err
 	}
 	cfg := s.Config()
 	parallel := testParallelFor(kind, req.Parallel, cfg, len(targets))
+	var plannedLinks int
+	var plannedBytes int64
 	// Throughput is strictly serial: one link at a time, one job at a time.
 	// Parallel transfers would share the uplink and distort each other.
 	if kind == TestKindSpeed {
@@ -173,16 +175,16 @@ func (s *Local) StartTestJob(ctx context.Context, req TestRequest) (TestJob, err
 			return TestJob{}, errorf(CodeConflict, "the host is too busy to start a speed test: %s", why)
 		}
 		perLink, perBatch, monthly := speedBudget(cfg)
-		worst := int64(len(targets)) * perLink
-		if worst > perBatch {
-			worst = perBatch
-		}
+		// The plan reserves the per-link cap for every connection it starts, so
+		// the monthly refusal stays a worst case the run can never exceed.
+		plannedLinks = budgetLinkCount(len(targets), perLink, perBatch)
+		plannedBytes = int64(plannedLinks) * perLink
 		if monthly > 0 && s.layer != nil {
 			usage, _ := s.layer.Usage()
 			if usage.Month != time.Now().UTC().Format("2006-01") {
 				usage.Bytes = 0
 			}
-			if usage.Bytes+worst > monthly {
+			if usage.Bytes+plannedBytes > monthly {
 				remaining := monthly - usage.Bytes
 				if remaining < 0 {
 					// Usage can exceed the cap after a cap decrease or a
@@ -192,7 +194,7 @@ func (s *Local) StartTestJob(ctx context.Context, req TestRequest) (TestJob, err
 				}
 				return TestJob{}, errorf(CodeConflict,
 					"this run could use %d MB but only %d MB remain in this month's budget",
-					worst>>20, remaining>>20)
+					plannedBytes>>20, remaining>>20)
 			}
 		}
 	}
@@ -216,13 +218,16 @@ func (s *Local) StartTestJob(ctx context.Context, req TestRequest) (TestJob, err
 	jobCtx, cancel := context.WithCancel(context.Background())
 	job := &testJob{
 		job: TestJob{
-			ID:        id,
-			Kind:      kind,
-			Scope:     scope,
-			State:     TestJobRunning,
-			Stage:     "preflight",
-			Total:     len(targets),
-			StartedAt: proofTimestamp(),
+			ID:            id,
+			Kind:          kind,
+			Scope:         scope,
+			State:         TestJobRunning,
+			Stage:         "preflight",
+			Total:         len(targets),
+			StartedAt:     proofTimestamp(),
+			PlannedBytes:  plannedBytes,
+			PlannedLinks:  plannedLinks,
+			BudgetSkipped: len(targets) - plannedLinks,
 		},
 		subs: make(map[chan TestEvent]struct{}),
 		done: make(chan struct{}),
@@ -523,9 +528,12 @@ func (s *Local) runTestJob(ctx context.Context, cancel context.CancelFunc, job *
 	}
 }
 
-// runSerialSpeed measures links one at a time and stops the batch when the
-// per-batch byte budget is spent. A stopped link is Skipped ("budget reached"),
-// never Failed: nothing about the link was measured.
+// runSerialSpeed measures links one at a time. Before each connection it
+// reserves that connection's per-link cap against the batch budget, and after
+// each attempt it charges what was really transferred, so a cheap run can
+// cover more connections than the worst-case plan promised. A stopped link is
+// Skipped ("budget reached"), never Failed: nothing about the link was
+// measured.
 func (s *Local) runSerialSpeed(ctx context.Context, job *testJob, targets []testTarget, shared testShared) {
 	cfg := s.Config()
 	perLink, perBatch, _ := speedBudget(cfg)
@@ -537,17 +545,27 @@ func (s *Local) runSerialSpeed(ctx context.Context, job *testJob, targets []test
 		return
 	}
 	target := targetsList[0]
-	allowed := budgetLinkCount(len(targets), perLink, perBatch)
-	for i, tgt := range targets {
+	var spent int64
+	for _, tgt := range targets {
 		if ctx.Err() != nil {
 			job.addResult(s.cancelledResult(tgt, TestKindSpeed))
 			continue
 		}
-		if i >= allowed {
-			job.addResult(s.skippedResult(tgt, ReasonBudgetReached, "traffic budget reached"))
+		if perLink > 0 && perBatch > 0 && spent+perLink > perBatch {
+			job.addResult(s.skippedResult(tgt, ReasonBudgetReached,
+				"the batch traffic budget is spent; this connection was not measured"))
 			continue
 		}
-		res := s.measureLink(ctx, tgt, shared, TestKindSpeed, &target, perLink)
+		var res TestResult
+		var linkSpent int64
+		if s.testMeasure != nil {
+			res, linkSpent = s.testMeasure(tgt)
+		} else {
+			res, linkSpent = s.measureLink(ctx, tgt, shared, TestKindSpeed, &target, perLink)
+		}
+		if linkSpent > 0 {
+			spent += linkSpent
+		}
 		job.addResult(res)
 	}
 }
@@ -580,14 +598,16 @@ func (s *Local) cancelledResult(t testTarget, kind string) TestResult {
 
 // runLinkTest measures one link's latency in its own isolated instance.
 func (s *Local) runLinkTest(ctx context.Context, t testTarget, shared testShared) TestResult {
-	return s.measureLink(ctx, t, shared, TestKindLatency, nil, 0)
+	res, _ := s.measureLink(ctx, t, shared, TestKindLatency, nil, 0)
+	return res
 }
 
 // measureLink measures one link and records the proof that produced the
 // verdict. The serving connection is measured on its own live path; every other
 // link runs in an isolated instance, either here or in the host worker when
-// this process lives inside the gateway network namespace.
-func (s *Local) measureLink(ctx context.Context, t testTarget, shared testShared, kind string, target *SpeedTarget, capBytes int64) (result TestResult) {
+// this process lives inside the gateway network namespace. The returned byte
+// count is what the attempt actually transferred, including failed transfers.
+func (s *Local) measureLink(ctx context.Context, t testTarget, shared testShared, kind string, target *SpeedTarget, capBytes int64) (result TestResult, spent int64) {
 	defer func() {
 		finishAttempt(&result, ctx)
 		if result.Status != TestStatusSkipped {
@@ -596,7 +616,7 @@ func (s *Local) measureLink(ctx context.Context, t testTarget, shared testShared
 	}()
 	link := t.link
 	if kind == TestKindSpeed {
-		if ok, why := s.provenRelay(t.id); !ok {
+		if ok, why := s.speedPreflight(t.id); !ok {
 			return TestResult{
 				ConnectionID: t.id,
 				Group:        link.Group,
@@ -607,18 +627,23 @@ func (s *Local) measureLink(ctx context.Context, t testTarget, shared testShared
 				Reason:       ReasonNoProvenResult,
 				Detail:       why,
 				TestedAt:     proofTimestamp(),
-			}
+			}, 0
 		}
 	}
 	// The serving connection is measured on its own live path. Starting a second
 	// instance for it would compete with the tunnel that carries user traffic.
 	if shared.servingLink != nil && shared.servingLink.Group == link.Group && shared.servingLink.Remark == link.Remark {
-		return s.measureLiveLink(ctx, t, shared, kind, target, capBytes)
+		before := s.countedBytes()
+		res := s.measureLiveLink(ctx, t, shared, kind, target, capBytes)
+		if after := s.countedBytes(); after > before {
+			return res, after - before
+		}
+		return res, 0
 	}
 
 	if required, daemonNS := isolatedWorkerRequired(); required {
-		res, spent, final, err := s.runWorkerMeasurement(ctx, t, shared, kind, target, capBytes, daemonNS)
-		s.chargeSpeedAttempt(downloadResult{Spent: spent})
+		res, workerSpent, final, err := s.runWorkerMeasurement(ctx, t, shared, kind, target, capBytes, daemonNS)
+		s.chargeSpeedAttempt(downloadResult{Spent: workerSpent})
 		if err != nil {
 			return TestResult{
 				ConnectionID: t.id,
@@ -630,16 +655,16 @@ func (s *Local) measureLink(ctx context.Context, t testTarget, shared testShared
 				Reason:       ReasonWorkerUnavailable,
 				Detail:       Redact(err.Error()),
 				TestedAt:     proofTimestamp(),
-			}
+			}, 0
 		}
 		_ = final // all terminal attempts are saved by the deferred recorder
-		return res
+		return res, workerSpent
 	}
 
-	res, spent, final := s.measureIsolated(ctx, t, shared, kind, target, capBytes)
-	s.chargeSpeedAttempt(downloadResult{Spent: spent})
+	res, isoSpent, final := s.measureIsolated(ctx, t, shared, kind, target, capBytes)
+	s.chargeSpeedAttempt(downloadResult{Spent: isoSpent})
 	_ = final
-	return res
+	return res, isoSpent
 }
 
 // measureIsolated measures one link in its own isolated instance, in this
@@ -730,7 +755,7 @@ func (s *Local) measureIsolated(ctx context.Context, t testTarget, shared testSh
 		// The engine started, so its own error is not observable here. Probe the
 		// endpoint directly to separate a dead server from a TLS/SNI mismatch;
 		// anything else stays an infrastructure failure rather than a guess.
-		if diagnosed := bench.DiagnoseEndpoint(lctx, link, opts); diagnosed != nil {
+		if diagnosed := diagnoseEndpoint(lctx, link, opts); diagnosed != nil {
 			failAttempt(&res, diagnosed, ctx)
 		} else {
 			failAttempt(&res, perr, ctx)
@@ -738,37 +763,34 @@ func (s *Local) measureIsolated(ctx context.Context, t testTarget, shared testSh
 		return res, spent, false
 	}
 	proof.TunneledHTTPS = true
-	exitBefore, echoes, err := readTestExit(lctx, session.Port, echoServiceA, echoServiceB)
-	if err != nil {
-		res.Status, res.Category, res.Reason = TestStatusInconclusive, CategoryExitUnverified, ReasonExitUnknown
-		res.Detail = "HTTPS answered, but independent exit identity services did not verify the exit"
-		return res, spent, false
-	}
+	res.HTTPSProven = true
+
+	// The exit identity is operational context, not a precondition. Identity
+	// services can be blocked, and a subscription can share one exit address
+	// across every link; neither makes a carried HTTPS request a dead link.
+	exitBefore, echoes, idErr := readTestExit(lctx, session.Port, echoServiceA, echoServiceB)
 	proof.ExitBefore = exitBefore
 	proof.Echoes = echoes
-	if len(echoes) == 2 && echoes[0].IP != echoes[1].IP {
-		res.Status = TestStatusInconclusive
-		res.Reason = ReasonExitAmbiguous
-		res.Detail = fmt.Sprintf("echo services disagree: %s vs %s", echoes[0].Service, echoes[1].Service)
-		return res, spent, false
-	}
-	if exitBefore == "" {
-		res.Status = TestStatusInconclusive
-		res.Reason = ReasonExitUnknown
-		return res, spent, false
-	}
-	if shared.uplink != "" && exitBefore == shared.uplink {
+	unverified, unverifiedDetail := "", ""
+	switch {
+	case idErr != nil || exitBefore == "":
+		unverified = ReasonExitUnknown
+		unverifiedDetail = "HTTPS answered through the tested connection, but the independent exit identity is unverified"
+	case len(echoes) == 2 && echoes[0].IP != echoes[1].IP:
+		unverified = ReasonExitAmbiguous
+		unverifiedDetail = fmt.Sprintf("echo services disagree: %s vs %s; HTTPS was measured, exit ownership is unproven",
+			echoes[0].Service, echoes[1].Service)
+	case shared.uplink != "" && exitBefore == shared.uplink:
+		// The same address this host presents without a proxy: the traffic did
+		// not demonstrably leave through the tunnel, so a throughput number
+		// would describe a DIRECT path and is refused.
 		res.Status = TestStatusInconclusive
 		res.Reason = ReasonExitEqualsUplink
+		res.Detail = "traffic left directly instead of through the tunnel; nothing was measured"
 		return res, spent, false
-	}
-	if shared.servingExit != "" && exitBefore == shared.servingExit {
-		// Without per-outbound counters this build cannot prove the bytes
-		// left through the tested link rather than the serving exit.
-		res.Status = TestStatusInconclusive
-		res.Reason = ReasonExitEqualsServing
-		proof.Note = "shares exit address with the serving connection"
-		return res, spent, false
+	case shared.servingExit != "" && exitBefore == shared.servingExit:
+		unverified = ReasonExitEqualsServing
+		unverifiedDetail = "shares the exit address with the serving connection; a shared exit is not a failed connection"
 	}
 
 	var measured bool
@@ -777,6 +799,12 @@ func (s *Local) measureIsolated(ctx context.Context, t testTarget, shared testSh
 			res.Status = TestStatusUnavailable
 			res.Detail = "no speed target is registered"
 			return res, spent, false
+		}
+		// One small timed request records the HTTPS latency of the same path
+		// the download is about to use.
+		if elapsed, _, err := sampleTestSession(session, lctx, probeURL, 4096); err == nil {
+			res.LatencyMS = int64(elapsed / time.Millisecond)
+			res.P50MS = res.LatencyMS
 		}
 		dres, check, err := s.speedThrough(lctx, session.Port, false, *target, capBytes)
 		spent = dres.Spent
@@ -815,21 +843,33 @@ func (s *Local) measureIsolated(ctx context.Context, t testTarget, shared testSh
 		return res, spent, false
 	}
 
-	exitAfter, _, err := readTestExit(lctx, session.Port, echoServiceA, "")
-	if err != nil || exitAfter != exitBefore {
-		proof.ExitAfter = exitAfter
-		res.Status = TestStatusInconclusive
-		res.Reason = ReasonExitChanged
-		zeroMeasurement(&res)
-		return res, spent, false
+	if exitBefore != "" {
+		if exitAfter, _, err := readTestExit(lctx, session.Port, echoServiceA, ""); err == nil && exitAfter != "" {
+			proof.ExitAfter = exitAfter
+			if exitAfter != exitBefore && unverified == "" {
+				unverified = ReasonExitChanged
+				unverifiedDetail = "the exit changed during the measurement; the numbers describe the interval, not a stable path"
+			}
+		} else if unverified == "" {
+			unverified = ReasonExitUnknown
+			unverifiedDetail = "the exit could not be re-verified after the measurement"
+		}
 	}
-	proof.ExitAfter = exitAfter
 
-	if !shared.isolation {
-		res.Status = TestStatusInconclusive
-		res.Reason = ReasonIsolationUnverified
-	} else {
+	switch {
+	case unverified == "" && shared.isolation:
 		res.Status = TestStatusOK
+		res.Evidence = EvidenceVerified
+	case unverified == "":
+		res.Status = TestStatusMeasured
+		res.Evidence = EvidenceOperational
+		res.Reason = ReasonIsolationUnverified
+		res.Detail = "HTTPS was measured through the tested connection; isolated-test isolation is not verified on this host"
+	default:
+		res.Status = TestStatusMeasured
+		res.Evidence = EvidenceOperational
+		res.Reason = unverified
+		res.Detail = unverifiedDetail
 	}
 	return res, spent, true
 }
@@ -949,35 +989,29 @@ func (s *Local) measureLiveLink(ctx context.Context, t testTarget, shared testSh
 	}
 	proof.RouteDecisions = append(proof.RouteDecisions, dec)
 	proof.TunneledHTTPS = true
+	res.HTTPSProven = true
+	// Identity is best-effort on the live path too: a shared or unreadable
+	// exit is a fact about ownership, not a reason to leave the serving
+	// connection unmeasured.
+	note, noteDetail := "", ""
 	exitBefore, echoes, err := echoThrough(lctx, port, echoServiceA, echoServiceB)
-	if err != nil {
-		res.Status, res.Category, res.Reason = TestStatusInconclusive, CategoryExitUnverified, ReasonExitUnknown
-		res.Detail = "HTTPS answered, but independent exit identity is unverified"
-		return res
-	}
 	proof.ExitBefore = exitBefore
 	proof.Echoes = echoes
-	if len(echoes) == 2 && echoes[0].IP != echoes[1].IP {
-		res.Status = TestStatusInconclusive
-		res.Reason = ReasonExitAmbiguous
-		res.Detail = fmt.Sprintf("echo services disagree: %s vs %s", echoes[0].Service, echoes[1].Service)
-		return res
-	}
-	if exitBefore == "" {
-		res.Status = TestStatusInconclusive
-		res.Reason = ReasonExitUnknown
-		return res
-	}
-	if shared.uplink != "" && exitBefore == shared.uplink {
+	switch {
+	case err != nil || exitBefore == "":
+		note = ReasonExitUnknown
+		noteDetail = "HTTPS answered on the live tunnel, but the exit identity is unverified"
+	case len(echoes) == 2 && echoes[0].IP != echoes[1].IP:
+		note = ReasonExitAmbiguous
+		noteDetail = fmt.Sprintf("echo services disagree: %s vs %s", echoes[0].Service, echoes[1].Service)
+	case shared.uplink != "" && exitBefore == shared.uplink:
 		res.Status = TestStatusInconclusive
 		res.Reason = ReasonExitEqualsUplink
+		res.Detail = "traffic left directly instead of through the tunnel; nothing was measured"
 		return res
-	}
-	if shared.servingExit != "" && exitBefore != shared.servingExit {
-		res.Status = TestStatusInconclusive
-		res.Reason = ReasonExitChanged
-		res.Detail = "the serving exit changed since the job started"
-		return res
+	case shared.servingExit != "" && exitBefore != shared.servingExit:
+		note = ReasonExitChanged
+		noteDetail = "the serving exit changed since the job started"
 	}
 
 	if kind == TestKindSpeed {
@@ -985,6 +1019,13 @@ func (s *Local) measureLiveLink(ctx context.Context, t testTarget, shared testSh
 			res.Status = TestStatusUnavailable
 			res.Detail = "no speed target is registered"
 			return res
+		}
+		// One small timed request records the HTTPS latency of the same path
+		// the download is about to use.
+		start := time.Now()
+		if _, err := profile.FetchThroughProxy(lctx, port, probeURL, 4096); err == nil {
+			res.LatencyMS = int64(time.Since(start) / time.Millisecond)
+			res.P50MS = res.LatencyMS
 		}
 		dres, check, err := s.speedThrough(lctx, port, true, *target, capBytes)
 		s.chargeSpeedAttempt(dres)
@@ -1024,29 +1065,39 @@ func (s *Local) measureLiveLink(ctx context.Context, t testTarget, shared testSh
 		res.P90MS = int64(percentile(samples, 0.9) / time.Millisecond)
 	}
 
-	exitAfter, _, err := echoThrough(lctx, port, echoServiceA, "")
-	if err != nil || exitAfter != exitBefore {
-		proof.ExitAfter = exitAfter
-		res.Status = TestStatusInconclusive
-		res.Reason = ReasonExitChanged
-		zeroMeasurement(&res)
-		return res
+	if exitBefore != "" {
+		if exitAfter, _, err := echoThrough(lctx, port, echoServiceA, ""); err == nil && exitAfter != "" {
+			proof.ExitAfter = exitAfter
+			if exitAfter != exitBefore && note == "" {
+				note = ReasonExitChanged
+				noteDetail = "the exit changed during the measurement"
+			}
+		}
 	}
-	proof.ExitAfter = exitAfter
 
 	if after := routingRevision(cfg); after != shared.policyRev {
 		proof.PolicyAfter = after
-		res.Status = TestStatusInconclusive
-		res.Reason = ReasonPolicyChanged
-		zeroMeasurement(&res)
-		res.Bytes = 0
-		return res
+		if note == "" {
+			note = ReasonPolicyChanged
+			noteDetail = "the routing policy changed during the measurement"
+		}
+	} else {
+		proof.PolicyAfter = shared.policyRev
 	}
-	proof.PolicyAfter = shared.policyRev
 
-	// Live policy decisions alone do not bind to an isolated engine-owned config.
-	res.Status, res.Category, res.Reason = TestStatusInconclusive, CategoryExitUnverified, ReasonConfigNotIsolated
-	res.Detail = "live HTTPS measurement is not an isolated engine-owned proof"
+	// Live policy decisions alone do not bind to an isolated engine-owned
+	// config, so this is operational evidence even when every identity check
+	// agreed.
+	res.Status = TestStatusMeasured
+	res.Evidence = EvidenceOperational
+	res.Reason = ReasonConfigNotIsolated
+	res.Detail = "measured on the live serving tunnel; a live measurement is operational evidence, not an isolated engine-owned proof"
+	if note != "" {
+		res.Reason = note
+		if noteDetail != "" {
+			res.Detail = noteDetail + "; " + res.Detail
+		}
+	}
 	return res
 }
 

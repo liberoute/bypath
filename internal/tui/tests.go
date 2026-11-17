@@ -49,6 +49,7 @@ type testState struct {
 	offset      int
 	connFilter  string // connection id ("" = all)
 	kindFilter  string // "" | latency | speed
+	sortBy      string // "" (last tested) | latency | speed | failures
 	compareKind string // latency | speed
 	compareCur  int
 	compareOff  int
@@ -105,15 +106,19 @@ func (m *Menu) testSummary() string {
 	if len(latest) == 0 {
 		return styleMuted.Render("no results yet — run a relay test")
 	}
-	proven := 0
+	proven, measured := 0, 0
 	for _, res := range latest {
 		if app.VerifiedTestResult(res) {
 			proven++
+			continue
+		}
+		if res.Status == app.TestStatusMeasured {
+			measured++
 		}
 	}
-	out := fmt.Sprintf("%d connection(s) tested · %d proven", len(latest), proven)
-	if proven < len(latest) {
-		out += " (only proven paths are ranked)"
+	out := fmt.Sprintf("%d connection(s) tested · %d verified · %d measured", len(latest), proven, measured)
+	if proven+measured < len(latest) {
+		out += " (only verified paths are ranked as proven)"
 	}
 	return out
 }
@@ -297,13 +302,14 @@ func (m *Menu) handleBudget(msg budgetMsg) tea.Cmd {
 	m.tests.budget = &msg.budget
 	m.tests.budgetReq = msg.req
 	b := msg.budget
-	detail := fmt.Sprintf("Target: %s\nLinks: %d · per link %d MB · per batch %d MB\nWorst case: %d MB · used this month: %d MB",
-		orDash(b.TargetURL), b.Links, b.PerLinkMB, b.PerBatchMB, b.WorstCaseMB, b.MonthUsedMB)
+	detail := fmt.Sprintf("Target: %s\nLinks: %d · planned %d · skipped by budget %d\nPer link %d MB · per batch %d MB\nWorst case: %d MB · used this month: %d MB",
+		orDash(b.TargetURL), b.Links, b.LinksMeasured, b.LinksSkipped, b.PerLinkMB, b.PerBatchMB, b.WorstCaseMB, b.MonthUsedMB)
 	if b.MonthlyCapMB > 0 {
-		detail += fmt.Sprintf(" of %d MB", b.MonthlyCapMB)
+		detail += fmt.Sprintf(" of %d MB (remaining %d MB)", b.MonthlyCapMB, b.RemainingMB)
 	}
 	detail += "\n" + b.CheckNote
 	detail += "\n\nSpeed runs are serial; upload is not enabled in this release."
+	detail += "\nA speed run needs a recent HTTPS measurement for the connection; exit ownership is not required."
 	m.confirmChoice("Review the speed budget", detail,
 		[]choice{{label: "Start bounded speed test"}, {label: "Cancel"}},
 		func(m *Menu, idx int) tea.Cmd {
@@ -371,7 +377,7 @@ func (m *Menu) testRunRows(w int) []string {
 		if m.tests.jobErr != "" {
 			rows = append(rows, m.indentedLines(m.tests.jobErr, 1, styleErr)...)
 		}
-		rows = append(rows, mutedLines("No job yet. Enter starts a measurement; relay results carry L1+L2 evidence, and a speed run needs one first.", w)...)
+		rows = append(rows, mutedLines("No job yet. Enter starts a measurement; relay results carry L1+L2 evidence, and a measured (not necessarily verified) HTTPS result is enough for a bounded speed run.", w)...)
 		return rows
 	}
 	stateStyle := styleMuted
@@ -393,6 +399,13 @@ func (m *Menu) testRunRows(w int) []string {
 	}
 	rows = append(rows, head)
 	rows = append(rows, " "+styleMuted.Render(truncatePlain("job "+job.ID, w-2)))
+	if job.Kind == "speed" && job.PlannedLinks > 0 {
+		plan := fmt.Sprintf("plan: %d of %d connections, at most %d MB this batch", job.PlannedLinks, job.Total, job.PlannedBytes>>20)
+		if job.BudgetSkipped > 0 {
+			plan += fmt.Sprintf(" · %d skipped in the worst case", job.BudgetSkipped)
+		}
+		rows = append(rows, " "+styleMuted.Render(truncatePlain(plan, w-2)))
+	}
 	rows = append(rows, "")
 	if len(job.Results) == 0 {
 		rows = append(rows, " "+styleMuted.Render("Results appear as each connection finishes."))
@@ -440,8 +453,82 @@ func (m *Menu) filteredResults() []app.TestResult {
 		}
 		out = append(out, res)
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].TestedAt > out[j].TestedAt })
+	sortResults(out, m.tests.sortBy)
 	return out
+}
+
+// sortResults orders the results list. An unmeasured row sorts after every
+// measured row under a metric order, so sorting never promotes a connection
+// whose test produced nothing.
+func sortResults(list []app.TestResult, mode string) {
+	switch mode {
+	case "latency":
+		sort.SliceStable(list, func(i, j int) bool {
+			a, b := latencyMS(list[i]), latencyMS(list[j])
+			if (a > 0) != (b > 0) {
+				return a > 0
+			}
+			if a > 0 && a != b {
+				return a < b
+			}
+			return list[i].TestedAt > list[j].TestedAt
+		})
+	case "speed":
+		sort.SliceStable(list, func(i, j int) bool {
+			a, b := list[i].MBps, list[j].MBps
+			if (a > 0) != (b > 0) {
+				return a > 0
+			}
+			if a > 0 && a != b {
+				return a > b
+			}
+			return list[i].TestedAt > list[j].TestedAt
+		})
+	case "failures":
+		sort.SliceStable(list, func(i, j int) bool {
+			ra, rb := failureRank(list[i]), failureRank(list[j])
+			if ra != rb {
+				return ra < rb
+			}
+			return list[i].TestedAt > list[j].TestedAt
+		})
+	default:
+		sort.SliceStable(list, func(i, j int) bool { return list[i].TestedAt > list[j].TestedAt })
+	}
+}
+
+// failureRank puts the rows that need attention first; a skipped row is not a
+// failure and stays behind measured rows.
+func failureRank(res app.TestResult) int {
+	switch res.Status {
+	case app.TestStatusFailed:
+		return 0
+	case app.TestStatusUnavailable:
+		return 1
+	case app.TestStatusInconclusive:
+		return 2
+	case app.TestStatusCancelled:
+		return 3
+	case app.TestStatusSkipped:
+		return 4
+	case app.TestStatusMeasured:
+		return 5
+	case app.TestStatusOK:
+		return 6
+	}
+	return 6
+}
+
+func sortLabel(mode string) string {
+	switch mode {
+	case "latency":
+		return "latency"
+	case "speed":
+		return "download speed"
+	case "failures":
+		return "failures first"
+	}
+	return "last tested"
 }
 
 func (m *Menu) testResultsRows(w int) []string {
@@ -450,7 +537,8 @@ func (m *Menu) testResultsRows(w int) []string {
 	if m.tests.connFilter != "" {
 		conn = m.linkLabel(m.tests.connFilter)
 	}
-	rows := []string{" " + styleMuted.Render(fmt.Sprintf("filter: %s · kind: %s · %d result(s)", conn, kind, len(m.filteredResults())))}
+	rows := []string{" " + styleMuted.Render(fmt.Sprintf("filter: %s · kind: %s · sort: %s · %d result(s)",
+		conn, kind, sortLabel(m.tests.sortBy), len(m.filteredResults())))}
 	if m.tests.resultsErr != "" {
 		rows = append(rows, m.indentedLines(m.tests.resultsErr, 1, styleErr)...)
 	}
@@ -461,7 +549,7 @@ func (m *Menu) testResultsRows(w int) []string {
 	if len(list) == 0 {
 		rows = append(rows, "")
 		if m.tests.kindFilter == "speed" {
-			rows = append(rows, mutedLines("No speed result matches this filter. A speed run is bounded and only produces a result on a connection that already has a proven path.", w)...)
+			rows = append(rows, mutedLines("No speed result matches this filter. A speed run is bounded and needs a recent HTTPS measurement for the connection.", w)...)
 		} else {
 			rows = append(rows, mutedLines("No result matches. Run a relay test first; results are stored on the gateway and survive a reload.", w)...)
 		}
@@ -487,7 +575,7 @@ func (m *Menu) testResultsRows(w int) []string {
 	if end < len(list) {
 		rows = append(rows, " "+styleMuted.Render(fmt.Sprintf("… %d more", len(list)-end)))
 	}
-	rows = append(rows, " "+styleMuted.Render("enter evidence · K kind · g connection · c clear · r reload"))
+	rows = append(rows, " "+styleMuted.Render("enter evidence · K kind · s sort · g connection · c clear · r reload"))
 	return rows
 }
 
@@ -495,11 +583,23 @@ func (m *Menu) testResultsRows(w int) []string {
 // its own trailing column, so repeating it inside the evidence would waste the
 // width that the reason needs.
 func evidenceWithoutAge(res app.TestResult) string {
-	if !app.VerifiedTestResult(res) {
+	if res.Superseded {
+		return evidenceOf(res)
+	}
+	if res.Status == "measured" {
+		if res.Kind == "speed" && res.MBps > 0 {
+			return throughputLine(res) + " · exit unproven"
+		}
+		if res.P50MS > 0 {
+			return fmt.Sprintf("%d ms · exit unproven", res.P50MS)
+		}
+		return "measured; exit unproven"
+	}
+	if res.Status != "ok" || !app.VerifiedTestResult(res) {
 		return evidenceOf(res)
 	}
 	if res.Kind == "speed" && res.MBps > 0 {
-		return fmt.Sprintf("%.1f Mbps", res.MBps)
+		return throughputLine(res)
 	}
 	if res.P50MS > 0 {
 		return fmt.Sprintf("%d ms", res.P50MS)
@@ -543,8 +643,11 @@ type compareEntry struct {
 	rank    int
 }
 
-// compareEntries returns the latest result per connection for the kind, proven
-// rows first (sorted by the kind's metric), then the unranked ones.
+// compareEntries returns the latest result per connection for the kind,
+// verified rows first, then operational measurements ranked by the kind's
+// metric, then the rows that produced no measurement. Operational results are
+// ranked separately so a shared-exit subscription still yields a useful
+// latency/speed order without pretending the path was proven.
 func (m *Menu) compareEntries() []compareEntry {
 	kind := m.compareKind()
 	latest := map[string]app.TestResult{}
@@ -559,61 +662,80 @@ func (m *Menu) compareEntries() []compareEntry {
 			latest[res.ConnectionID] = res
 		}
 	}
-	var proven, rest []app.TestResult
+	var verified, operational, rest []app.TestResult
 	for _, res := range latest {
-		if app.VerifiedTestResult(res) {
-			proven = append(proven, res)
-		} else {
+		switch {
+		case app.VerifiedTestResult(res):
+			verified = append(verified, res)
+		case res.Status == app.TestStatusMeasured && compareValue(res, kind) > 0:
+			operational = append(operational, res)
+		default:
 			rest = append(rest, res)
 		}
 	}
 	if kind == "speed" {
-		sort.SliceStable(proven, func(i, j int) bool { return proven[i].MBps > proven[j].MBps })
+		sort.SliceStable(verified, func(i, j int) bool { return verified[i].MBps > verified[j].MBps })
+		sort.SliceStable(operational, func(i, j int) bool { return operational[i].MBps > operational[j].MBps })
 	} else {
-		sort.SliceStable(proven, func(i, j int) bool { return latencyMS(proven[i]) < latencyMS(proven[j]) })
+		sort.SliceStable(verified, func(i, j int) bool { return latencyMS(verified[i]) < latencyMS(verified[j]) })
+		sort.SliceStable(operational, func(i, j int) bool { return latencyMS(operational[i]) < latencyMS(operational[j]) })
 	}
 	sort.SliceStable(rest, func(i, j int) bool { return rest[i].TestedAt > rest[j].TestedAt })
-	out := make([]compareEntry, 0, len(proven)+len(rest))
-	for i, res := range proven {
-		entry := compareEntry{res: res, rank: i + 1}
-		if i == 0 {
-			entry.heading = "Ranked (proven path)"
+	out := make([]compareEntry, 0, len(verified)+len(operational)+len(rest))
+	add := func(list []app.TestResult, heading string) {
+		for i, res := range list {
+			entry := compareEntry{res: res, rank: i + 1}
+			if i == 0 {
+				entry.heading = heading
+			}
+			out = append(out, entry)
 		}
-		out = append(out, entry)
 	}
-	for i, res := range rest {
-		entry := compareEntry{res: res, rank: i + 1}
-		if i == 0 {
-			entry.heading = "Not ranked"
-		}
-		out = append(out, entry)
-	}
+	add(verified, "Verified (ranked)")
+	add(operational, "Measured · operational (exit unproven)")
+	add(rest, "Not measured")
 	return out
+}
+
+// compareValue is the ranking metric of a result; zero means the row carries
+// no usable number for this kind.
+func compareValue(res app.TestResult, kind string) float64 {
+	if kind == "speed" {
+		return res.MBps
+	}
+	return float64(latencyMS(res))
 }
 
 func (m *Menu) testCompareRows(w int) []string {
 	kind := m.compareKind()
 	entries := m.compareEntries()
-	proven := len(entries)
-	rest := 0
-	for i, entry := range entries {
-		if entry.heading == "Not ranked" {
-			proven = i
-			rest = len(entries) - i
-			break
+	verified, operational, rest := 0, 0, 0
+	section := ""
+	for _, entry := range entries {
+		if entry.heading != "" {
+			section = entry.heading
+		}
+		switch section {
+		case "Verified (ranked)":
+			verified++
+		case "Measured · operational (exit unproven)":
+			operational++
+		case "Not measured":
+			rest++
 		}
 	}
-	rows := []string{" " + styleMuted.Render(fmt.Sprintf("%s · %d proven ranked · %d not ranked", kind, proven, rest))}
+	rows := []string{" " + styleMuted.Render(fmt.Sprintf("%s · %d verified · %d measured · %d not measured",
+		kind, verified, operational, rest))}
 	if len(entries) == 0 {
 		text := "Run a relay test across the connections you care about."
 		if kind == "speed" {
-			text = "A speed result requires a proven relay result for the same connection."
+			text = "A speed result requires a recent HTTPS measurement for the same connection."
 		}
 		rows = append(rows, "")
 		return append(rows, mutedLines(text, w)...)
 	}
 	// The cursor walks ranked rows first; the window scrolls over the whole list
-	// so a long unranked tail stays reachable.
+	// so a long unmeasured tail stays reachable.
 	m.tests.compareCur = clampInt(m.tests.compareCur, 0, len(entries)-1)
 	visible := m.testVisible()
 	if m.tests.compareCur < m.tests.compareOff {
@@ -634,8 +756,11 @@ func (m *Menu) testCompareRows(w int) []string {
 		entry := entries[i]
 		if entry.heading != "" {
 			rows = append(rows, " "+styleTitle.Render(entry.heading))
-			if entry.heading == "Not ranked" {
-				rows = append(rows, mutedLines("An inconclusive result does not mean the link is bad; its path was not proven, so it is not used for ranking.", w)...)
+			switch entry.heading {
+			case "Measured · operational (exit unproven)":
+				rows = append(rows, mutedLines("These connections answered HTTPS and were measured. Their exit address is shared or not independently proven, which does not make them bad; they are not ranked as verified paths.", w)...)
+			case "Not measured":
+				rows = append(rows, mutedLines("No usable number was produced. This is not automatically a dead link; the reason column says what stopped it.", w)...)
 			}
 		}
 		rows = append(rows, m.compareRow(i, entry, w))
@@ -651,9 +776,9 @@ func (m *Menu) compareRow(cursor int, entry compareEntry, w int) string {
 	res := entry.res
 	verdict, vstyle := resultVerdict(res)
 	value := ""
-	if res.Status == "ok" {
+	if res.Status == "ok" || res.Status == "measured" {
 		if res.Kind == "speed" {
-			value = fmt.Sprintf("%.1f Mbps", res.MBps)
+			value = throughputLine(res)
 		} else {
 			value = fmt.Sprintf("p50 %s · p90 %s", fmtMs(latencyMS(res)), fmtMs(res.P90MS))
 		}
@@ -796,6 +921,18 @@ func (m *Menu) testResultsKey(key string) tea.Cmd {
 		}
 	case "g":
 		m.pickResultConnection()
+	case "s":
+		switch m.tests.sortBy {
+		case "":
+			m.tests.sortBy = "latency"
+		case "latency":
+			m.tests.sortBy = "speed"
+		case "speed":
+			m.tests.sortBy = "failures"
+		default:
+			m.tests.sortBy = ""
+		}
+		m.tests.cursor, m.tests.offset = 0, 0
 	case "c":
 		m.tests.connFilter, m.tests.kindFilter = "", ""
 		m.tests.cursor, m.tests.offset = 0, 0
@@ -965,7 +1102,9 @@ func resultVerdict(res app.TestResult) (string, lipgloss.Style) {
 	}
 	switch res.Status {
 	case "ok":
-		return "HEALTHY", styleOK
+		return "VERIFIED", styleOK
+	case "measured":
+		return "MEASURED", styleInfo
 	case "inconclusive":
 		return "INCONCLUSIVE", styleWarn
 	case "failed":
@@ -981,10 +1120,10 @@ func resultVerdict(res app.TestResult) (string, lipgloss.Style) {
 }
 
 var testReasonText = map[string]string{
-	"CONFIG_NOT_ISOLATED":       "the test-tunnel configuration is not isolated",
+	"CONFIG_NOT_ISOLATED":       "measured on the live tunnel; the test-tunnel configuration is not isolated",
 	"PATH_DIRECT_TARGET":        "the destination would go DIRECT, not through the tunnel",
 	"EXIT_EQUALS_UPLINK":        "traffic left directly instead of through the tunnel",
-	"EXIT_EQUALS_SERVING":       "the exit matches the serving connection, so ownership is unproven",
+	"EXIT_EQUALS_SERVING":       "the exit address is shared with the serving connection; ownership is unproven",
 	"EXIT_AMBIGUOUS":            "two identity services disagreed about the exit",
 	"EXIT_CHANGED":              "the exit changed during the measurement",
 	"EXIT_UNKNOWN":              "the exit identity could not be determined",
@@ -994,7 +1133,7 @@ var testReasonText = map[string]string{
 	"ISOLATION_UNVERIFIED":      "isolated-test isolation has not been verified on this host",
 	"TARGET_REJECTED":           "the download target was rejected by the security checks",
 	"BUDGET_REACHED":            "the traffic budget was reached",
-	"NO_PROVEN_RESULT":          "a proven relay result is required before a speed test",
+	"NO_PROVEN_RESULT":          "a recent HTTPS measurement is required before a speed test",
 }
 
 func reasonText(code string) string {
@@ -1008,24 +1147,39 @@ func reasonText(code string) string {
 }
 
 // connectivityNote separates "the connection carried traffic" from "the exit
-// was proven". An inconclusive result with a measured latency did work; only
-// its path ownership is unproven, and the row must say so instead of reading
-// like a dead link.
+// was proven". A measured or inconclusive row with a latency did work; only its
+// path ownership is unproven, and the row must say so instead of reading like a
+// dead link.
 func connectivityNote(res app.TestResult) string {
-	if res.Status != "inconclusive" || !answered(res) {
+	switch res.Status {
+	case "measured":
+		if ms := latencyMS(res); ms > 0 {
+			return fmt.Sprintf("answered in %d ms; exit ownership unproven", ms)
+		}
+		if answered(res) {
+			return "answered through the tested instance; exit identity unproven"
+		}
 		return ""
+	case "inconclusive":
+		if res.Reason == app.ReasonExitEqualsUplink && answered(res) {
+			return "answered directly instead of through the tunnel; not measured"
+		}
+		if !answered(res) {
+			return ""
+		}
+		if ms := latencyMS(res); ms > 0 {
+			return fmt.Sprintf("answered in %d ms; path ownership unproven", ms)
+		}
+		return "answered through the tested instance; exit identity unproven"
 	}
-	if ms := latencyMS(res); ms > 0 {
-		return fmt.Sprintf("traffic answered in %d ms; path ownership unproven", ms)
-	}
-	return "answered through the tested instance; exit identity unproven"
+	return ""
 }
 
 // answered reports whether the run itself observed a completed request. The
 // latency probe is not attempted once the exit check fails, but an isolated
 // instance that completed the HTTPS probe still carried traffic.
 func answered(res app.TestResult) bool {
-	return latencyMS(res) > 0 || (res.Path != nil && res.Path.TunneledHTTPS)
+	return latencyMS(res) > 0 || res.HTTPSProven || (res.Path != nil && res.Path.TunneledHTTPS)
 }
 
 // connectivityLine states what the evidence shows about carrying traffic,
@@ -1037,7 +1191,18 @@ func connectivityLine(res app.TestResult) string {
 			return "answered through the proven path"
 		}
 		return "answered; path proof incomplete, not ranked"
+	case "measured":
+		if ms := latencyMS(res); ms > 0 {
+			return fmt.Sprintf("answered in %d ms; exit ownership unproven", ms)
+		}
+		if answered(res) {
+			return "answered through the tested instance; exit identity unproven"
+		}
+		return "no answer recorded"
 	case "inconclusive":
+		if res.Reason == app.ReasonExitEqualsUplink && answered(res) {
+			return "answered directly instead of through the tunnel; not measured"
+		}
 		if ms := latencyMS(res); ms > 0 {
 			return fmt.Sprintf("answered in %d ms; exit ownership unproven", ms)
 		}
@@ -1055,6 +1220,20 @@ func connectivityLine(res app.TestResult) string {
 	return "unknown"
 }
 
+// throughputLine states the measured transfer in both units: the API stores
+// megabits per second, and the counted payload over the elapsed seconds gives
+// the MB/s figure v2rayN-style comparisons use.
+func throughputLine(res app.TestResult) string {
+	if res.Kind != "speed" || res.MBps <= 0 {
+		return ""
+	}
+	line := fmt.Sprintf("%.1f Mbps", res.MBps)
+	if res.Seconds > 0 && res.Bytes > 0 {
+		line += fmt.Sprintf(" · %.2f MB/s", float64(res.Bytes)/res.Seconds/1e6)
+	}
+	return line
+}
+
 func evidenceOf(res app.TestResult) string {
 	if res.Superseded {
 		return "a later attempt invalidated this proof"
@@ -1062,12 +1241,15 @@ func evidenceOf(res app.TestResult) string {
 	if res.Status == "ok" && !app.VerifiedTestResult(res) {
 		return "stale or incomplete path proof; not ranked"
 	}
-	if res.Status == "ok" {
+	if res.Status == "ok" || res.Status == "measured" {
 		parts := []string{}
 		if res.Kind == "speed" && res.MBps > 0 {
-			parts = append(parts, fmt.Sprintf("%.1f Mbps", res.MBps))
+			parts = append(parts, throughputLine(res))
 		} else if res.P50MS > 0 {
 			parts = append(parts, fmt.Sprintf("%d ms", res.P50MS))
+		}
+		if res.Status == "measured" {
+			parts = append(parts, "exit unproven")
 		}
 		if res.TestedAt != "" {
 			parts = append(parts, timeAgo(res.TestedAt))
@@ -1141,14 +1323,22 @@ func testEvidenceText(res app.TestResult) string {
 	fmt.Fprintf(&b, "Connection: %s\n", orDash(res.Remark))
 	fmt.Fprintf(&b, "Kind:       %s · %s\n", res.Kind, verdict)
 	fmt.Fprintf(&b, "Tested:     %s\n", orDash(res.TestedAt))
-	if res.Status != "ok" {
+	switch res.Evidence {
+	case app.EvidenceVerified:
+		fmt.Fprintf(&b, "Evidence:   verified path (isolated engine-owned config, independent exit)\n")
+	case app.EvidenceOperational:
+		fmt.Fprintf(&b, "Evidence:   operational measurement (exit ownership unproven)\n")
+	}
+	if res.Status != "ok" && res.Status != "measured" {
 		fmt.Fprintf(&b, "Reason:     %s\n", orDash(evidenceOf(res)))
+	} else if res.Status == "measured" && res.Reason != "" {
+		fmt.Fprintf(&b, "Reason:     %s\n", orDash(reasonText(res.Reason)))
 	}
 	fmt.Fprintf(&b, "Connectivity: %s\n", connectivityLine(res))
 	if res.Kind == "speed" {
-		fmt.Fprintf(&b, "Throughput: %.1f Mbps\n", res.MBps)
+		fmt.Fprintf(&b, "Throughput: %s\n", orDash(throughputLine(res)))
+		fmt.Fprintf(&b, "Downloaded: %d B in %.2f s (counted payload, not link billing)\n", res.Bytes, res.Seconds)
 		fmt.Fprintf(&b, "Target:     %s\n", orDash(res.Target))
-		fmt.Fprintf(&b, "Bytes:      %d B counted by Bypath (payload, not link billing)\n", res.Bytes)
 	} else {
 		fmt.Fprintf(&b, "Median/p90: %s / %s\n", fmtMs(latencyMS(res)), fmtMs(res.P90MS))
 	}

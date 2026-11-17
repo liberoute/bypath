@@ -394,15 +394,15 @@ func TestTestsCompareRanksOnlyProven(t *testing.T) {
 	if entries[0].res.Remark != "Maple-IPv4" || entries[1].res.Remark != "东京节点-非常长-的-连接名称" {
 		t.Fatalf("proven rows not ranked by latency: %q, %q", entries[0].res.Remark, entries[1].res.Remark)
 	}
-	if entries[2].heading != "Not ranked" {
-		t.Fatalf("third entry heading = %q, want Not ranked", entries[2].heading)
+	if entries[2].heading != "Not measured" {
+		t.Fatalf("third entry heading = %q, want Not measured", entries[2].heading)
 	}
-	if entries[2].res.Status == "ok" || entries[3].res.Status == "ok" {
+	if app.VerifiedTestResult(entries[2].res) || app.VerifiedTestResult(entries[3].res) {
 		t.Fatal("an unproven result was ranked above the section boundary")
 	}
 
 	view := stripANSI(m.testsView(28))
-	for _, want := range []string{"Ranked (proven path)", "Not ranked", "the exit matches the serving connection"} {
+	for _, want := range []string{"Verified (ranked)", "Not measured", "the exit address is shared with the serving"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("compare view lost %q:\n%s", want, view)
 		}
