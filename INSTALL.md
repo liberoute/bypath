@@ -203,10 +203,16 @@ it is currently active. If no previous binary is recorded, the installer
 refuses and changes nothing.
 
 Before rolling back from 3.0.0-rc.4 or later, run `sudo bypath stop` once with
-the installed build. That stop finishes any proxy guard left by a crash; the
-older binary then starts from a clean firewall instead of refusing the stale
-`BYPATH_PROXY_IN` chain. A current build also waits for the pre-fix guard lock,
-so an older daemon that is still running is never overridden by a newer binary.
+the installed build and confirm the firewall is clean
+(`sudo iptables -S BYPATH_PROXY_IN` reports no chain). That stop removes the
+proxy guard, including one left by a crash, so the older binary starts from a
+clean firewall instead of refusing the stale `BYPATH_PROXY_IN` chain. Keep
+`/var/lib/bypath` mounted and do not delete `/var/lib/bypath/proxy-guard.lock`:
+a current build holds that lock so a lock-aware older daemon is excluded in
+both directions. An older build that predates every lock (`d175a19`,
+`bb11c37`) cannot be excluded while it runs; if one takes over a live guard,
+the current daemon detects the ownership change and stops instead of serving
+unguarded. That is why the stop above is required, not optional.
 See `TROUBLESHOOTING.md`.
 
 Rollback does not revert configuration changes. Keep a copy of

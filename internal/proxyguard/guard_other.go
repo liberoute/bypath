@@ -20,10 +20,12 @@ func Cleanup() error { return nil }
 // unchanged; there is never a guard to remove on a platform without the Linux
 // firewall.
 var (
-	ErrGuardBusy     = errors.New("proxy guard is in use by a running bypath process")
-	ErrGuardReplaced = errors.New("proxy guard belongs to a different run")
-	ErrGuardUnshared = errors.New("proxy guard state directory is not shared with the firewall owner")
+	ErrGuardBusy        = errors.New("proxy guard is in use by a running bypath process")
+	ErrGuardReplaced    = errors.New("proxy guard belongs to a different run")
+	ErrGuardUnshared    = errors.New("proxy guard state directory is not shared with the firewall owner")
+	ErrGuardLockChanged = errors.New("proxy guard lock file was removed or replaced while the guard was held")
 )
 
-func RecordToken() string       { return "" }
-func CleanupOwned(string) error { return nil }
+func RecordToken() string           { return "" }
+func CleanupOwned(string) error     { return nil }
+func CleanupInstalled(string) error { return nil }

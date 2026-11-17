@@ -102,9 +102,13 @@ func cmdRun(args []string) {
 	// all (root without NET_ADMIN), so it has nothing to reconcile here. A guard
 	// left by an earlier LAN run stays fail-closed until a LAN start or
 	// 'bypath stop' reconciles it.
+	guardToken := ""
 	if cfg.Server.SOCKSListenAddress() != "127.0.0.1" {
+		guardToken = proxyguard.RecordToken()
+		// Scoped to this run: if a legacy binary replaced the guard, that guard
+		// is not ours to delete on the way out.
 		defer func() {
-			if err := proxyguard.Cleanup(); err != nil {
+			if err := proxyguard.CleanupInstalled(guardToken); err != nil {
 				log.Printf("Proxy firewall ownership retained: %v", err)
 			}
 		}()
@@ -127,6 +131,18 @@ func cmdRun(args []string) {
 		case stopCh <- struct{}{}:
 		default:
 		}
+	}
+
+	// A binary that predates the guard lease and the lock file (d175a19,
+	// bb11c37) cannot be excluded while it runs; if it removes this run's guard,
+	// the daemon must stop instead of serving the LAN unguarded. Registered
+	// after the Cleanup defer so it stops before the guard is removed.
+	if guardToken != "" {
+		stopGuardWatch := proxyguard.Watch(guardToken, 2*time.Second, func() {
+			log.Printf("⛔ Proxy guard ownership changed while running — stopping so the LAN proxy never serves unguarded")
+			requestStop()
+		})
+		defer stopGuardWatch()
 	}
 
 	// Session credentials belong to one daemon run. A crash or SIGKILL can leave

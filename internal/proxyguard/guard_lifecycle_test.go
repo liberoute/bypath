@@ -7,6 +7,7 @@ package proxyguard
 // the named point; each one must recover without manual firewall surgery.
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -85,10 +86,11 @@ func TestCleanupRecoversInterruptedInstall(t *testing.T) {
 	requireNoGuard(t, f)
 }
 
-// A pruning tool or an interrupted write can remove the record while the
-// daemon is down. The chain's name, uniform marker and exact shape still prove
-// it is the guard, so it is adopted and removed before a fresh install.
-func TestCleanupAdoptsOrphanWithoutRecord(t *testing.T) {
+// A pruning tool can remove the record while the daemon is down. The chain's
+// name and shape are not proof: an independent state mount of the same host
+// firewall shows exactly the same nothing, so a chain without its record is
+// retained and the next start refuses.
+func TestCleanupKeepsOrphanWithoutRecord(t *testing.T) {
 	f := setup(t)
 	if err := Ensure(lanConfig()); err != nil {
 		t.Fatal(err)
@@ -96,19 +98,18 @@ func TestCleanupAdoptsOrphanWithoutRecord(t *testing.T) {
 	if err := os.Remove(statePath); err != nil {
 		t.Fatal(err)
 	}
-	if err := Cleanup(); err != nil {
-		t.Fatalf("orphan without record: %v", err)
+	if err := Cleanup(); !errors.Is(err, ErrGuardUnshared) {
+		t.Fatalf("recordless chain was not retained: %v", err)
 	}
-	requireNoGuard(t, f)
-	if err := Ensure(lanConfig()); err != nil {
-		t.Fatalf("restart over an adopted orphan: %v", err)
+	if !guardInstalled(f, 2) {
+		t.Fatal("recordless chain was modified")
 	}
-	if err := Cleanup(); err != nil {
-		t.Fatal(err)
+	if err := Ensure(lanConfig()); err == nil {
+		t.Fatal("startup accepted a chain without its ownership record")
 	}
 }
 
-func TestAdoptionRefusesForeignRule(t *testing.T) {
+func TestOrphanRefusesForeignRule(t *testing.T) {
 	f := setup(t)
 	if err := Ensure(lanConfig()); err != nil {
 		t.Fatal(err)
@@ -118,8 +119,8 @@ func TestAdoptionRefusesForeignRule(t *testing.T) {
 	}
 	f.chains[chain] = append(f.chains[chain], "-j ACCEPT")
 	err := Cleanup()
-	if err == nil || !strings.Contains(err.Error(), "unverified") {
-		t.Fatalf("foreign rule adopted: %v", err)
+	if !errors.Is(err, ErrGuardUnshared) {
+		t.Fatalf("recordless chain with a foreign rule was not retained: %v", err)
 	}
 	if len(f.chains[chain]) != 5 {
 		t.Fatal("foreign rule was deleted")
@@ -138,8 +139,8 @@ func TestAdoptionRefusesForeignJump(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.chains["INPUT"] = append([]string{"-p tcp --dport 9999 -j " + chain}, f.chains["INPUT"]...)
-	if err := Cleanup(); err == nil || !strings.Contains(err.Error(), "unverified") {
-		t.Fatalf("foreign jump adopted: %v", err)
+	if err := Cleanup(); !errors.Is(err, ErrGuardUnshared) {
+		t.Fatalf("recordless chain with a foreign jump was not retained: %v", err)
 	}
 	if len(f.chains["INPUT"]) != 3 {
 		t.Fatal("foreign jump was deleted")
@@ -177,7 +178,7 @@ func TestCleanupRemovesCorruptRecordWhenNothingInstalled(t *testing.T) {
 	}
 }
 
-func TestCleanupAdoptsVerifiedChainWithCorruptRecord(t *testing.T) {
+func TestCleanupKeepsChainWithCorruptRecord(t *testing.T) {
 	f := setup(t)
 	if err := Ensure(lanConfig()); err != nil {
 		t.Fatal(err)
@@ -185,10 +186,12 @@ func TestCleanupAdoptsVerifiedChainWithCorruptRecord(t *testing.T) {
 	if err := os.WriteFile(statePath, []byte("{not json"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := Cleanup(); err != nil {
-		t.Fatalf("verified guard rejected because the record was corrupt: %v", err)
+	if err := Cleanup(); err == nil {
+		t.Fatal("chain was removed while its record was corrupt")
 	}
-	requireNoGuard(t, f)
+	if !guardInstalled(f, 2) {
+		t.Fatal("chain was modified while its record was corrupt")
+	}
 }
 
 func TestCleanupRefusesForeignChainWithCorruptRecord(t *testing.T) {

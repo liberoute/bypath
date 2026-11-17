@@ -179,48 +179,55 @@ fault.
 
 ## The proxy guard refuses to start after a crash or an upgrade
 
-`Proxy firewall setup failed: refusing foreign proxy firewall chain` or
-`retaining unverified proxy firewall ownership` means `BYPATH_PROXY_IN` is
-installed but cannot be proven to belong to this run. Older builds deleted the
-ownership record (`/var/lib/bypath/proxy-input.json`) before, or without,
-removing the chain; with the record gone they could not start again.
+`Proxy firewall setup failed: refusing foreign proxy firewall chain`,
+`retaining unverified proxy firewall ownership`, or
+`proxy guard state directory is not shared with the firewall owner` means
+`BYPATH_PROXY_IN` is installed but cannot be proven to belong to this run.
 
-Current builds prove ownership from the record when it survives, and from the
-chain's own uniform marker and exact shape when it does not, then finish the
-removal and install a fresh guard. A chain that contains any rule without a
-marker is left untouched and startup keeps refusing: inspect it rather than
-deleting it.
+The ownership record (`/var/lib/bypath/proxy-input.json`) is the only proof.
+A chain is removed only when the record names it and the installed rules still
+match what the record describes, allowing for a removal that a crash cut short.
+A chain without a record is never adopted, even when `/var/lib/bypath` already
+exists and the chain has the expected shape: an existing directory does not
+prove that two host-network containers share it, and each can mount its own.
+Startup refuses such a chain and leaves it untouched.
 
-The guard is owned by a process as well as by a marker. The daemon holds an
-exclusive kernel lease for its whole lifetime, and every install or removal runs
-under that lease. The lease is an abstract Unix socket name, so it has no file
-to delete, cannot be unlinked or recreated, and is released automatically when
-the process dies. Its scope is the network namespace, which is exactly the scope
-of the iptables state it protects:
+The guard is owned by a process as well as by a record. The daemon holds an
+exclusive abstract-socket lease for its whole lifetime and also creates and
+holds the lock file `/var/lib/bypath/proxy-guard.lock`:
 
-- Every `docker run --network host` or Compose `network_mode: host` container
-  shares the host namespace and therefore the same lease.
-- A container with its own network namespace has its own iptables and rightly
-  has its own lease.
-- A current build also honours the older `/var/lib/bypath/proxy-guard.lock`
-  flock when one exists, so a pre-3.0.0-rc.4 binary that is still running keeps
-  excluding a newer one during an upgrade.
+- The lease is an abstract Unix socket name, so it has no file to delete,
+  cannot be unlinked or recreated, and is released automatically when the
+  process dies. Its scope is the network namespace, exactly the scope of the
+  iptables state it protects. It excludes every current build: a second
+  daemon, a supervisor restart, a stop command, another host-network container.
+- The lock file excludes builds that already used a lock (3.0.0-rc.4 builds
+  from `2916c1e`) in both directions. A current daemon creates it and keeps it
+  locked, so a running legacy daemon is excluded as well as a legacy stop or
+  start that finds the current daemon. The lease remains authoritative for
+  current builds, so deleting and recreating the lock file can never let a
+  current build act. The file lives in `/var/lib/bypath`, must persist, and
+  must not be deleted while bypath runs.
 
-The lease prevents accidental concurrent owners: a second daemon, a supervisor
-restart, a stop command, another host-network container. It is not a defence
-against a process that already has host root; such a process can rewrite
-iptables directly.
+Neither mechanism is a defence against a process that already has host root.
+Builds older than every lock (`d175a19`, `bb11c37`) cannot be excluded by
+anything they do not participate in: a fresh `run` of such a binary removes
+whatever the shared record names and installs its own guard. What current
+builds guarantee in that case is detection, not prevention: the running daemon
+re-checks the record and, when it no longer names its own guard, logs
+`Proxy guard ownership changed while running` and stops instead of serving the
+LAN unguarded. That is why the migration procedure below is mandatory.
 
-The ownership record still lives in `/var/lib/bypath`, and that directory must be
-the same one for every process that manages the same firewall. The Compose file
-mounts it; keep that mount. Without it, a second container cannot prove whose
-chain it sees, so it fails closed instead of guessing:
+The ownership record and the lock file must live in the same `/var/lib/bypath`
+for every process that manages the same firewall. The Compose file mounts it;
+keep that mount. Without it a second container cannot prove whose chain it
+sees, so it fails closed instead of guessing:
 
-- Starting a LAN-mode guard in a container with its own empty state directory is
-  refused while a chain it cannot attribute is installed.
-- `bypath stop` reports `Proxy guard kept: this state directory is not the
-  firewall owner's.` and leaves the guard installed. Run the stop in the
-  container that owns the state directory, or mount `/var/lib/bypath`.
+- Starting a LAN-mode guard in a container with its own empty state directory
+  is refused while a chain it cannot attribute is installed, and
+  `bypath stop` reports `Proxy guard kept: this state directory holds no record
+  of the installed guard.` leaving the guard installed.
+- Mount `/var/lib/bypath` into every host-network container that runs bypath.
 
 `bypath stop` removes only the guard of the run it stopped, and these messages
 mean a guard was deliberately kept:
@@ -231,8 +238,14 @@ mean a guard was deliberately kept:
 - `Proxy guard kept: a newer bypath run installed its own guard.`
   The stopped run's record was replaced before the cleanup ran; the newer run's
   guard is left alone.
-- `Proxy guard kept: this state directory is not the firewall owner's.`
+- `Proxy guard kept: this state directory holds no record of the installed
+  guard.`
   See the shared state directory note above.
+- `Proxy guard kept: the guard lock file was removed or replaced while bypath
+  was running.`
+  The lock file that excludes older builds is gone or belongs to someone else.
+  Run `bypath stop` again: once the daemon has exited, the stop reconciles the
+  guard with a fresh lock file.
 
 None of them is an error. To remove that guard, stop the running bypath service
 first. The stop command waits up to two seconds for the guard lease before
@@ -249,11 +262,30 @@ and needs no `iptables` access, including in containers without `NET_ADMIN`. A
 guard left by an earlier LAN-mode run stays installed and keeps clients blocked
 until a LAN-mode start or `bypath stop` reconciles it.
 
-After a crash, `sudo bypath stop` removes the guard once the daemon is confirmed
-gone. Run that stop with the current build before installing an older binary:
-builds before 3.0.0-rc.4 cannot always finish a guard left by a crash, and a
-documented stop is what makes the rollback start from a clean firewall. Do not
-delete `BYPATH_PROXY_IN` or its INPUT jumps by hand unless the rules are
+## Changing the binary while a guard is installed
+
+Every supported change of the installed binary follows the same order: stop
+with the installed build, verify the firewall is clean, swap the binary, start.
+
+```bash
+sudo bypath stop
+sudo iptables -S BYPATH_PROXY_IN        # must report no chain
+sudo ./install.sh --rollback            # or --version vX.Y.Z
+sudo systemctl start bypath
+```
+
+`bypath stop` with a current build removes the guard of the daemon it stopped,
+including one left by a SIGKILL, so the older binary starts from a clean
+firewall. It refuses to remove a guard that a still-running process owns.
+
+Rolling back from a current build to `d175a19` with this procedure is
+supported and covered by the lifecycle tests. Skipping the stop is not: an
+older unmodified executable started while the current daemon runs cannot be
+prevented from taking the guard, as described above. If that happens, the
+current daemon exits within a few seconds and reports the ownership change in
+its log; stop the older daemon, then start the current build again so it
+re-establishes a verified guard. Do not delete `BYPATH_PROXY_IN`, its INPUT
+jumps, or `/var/lib/bypath/proxy-guard.lock` by hand unless the rules are
 visibly foreign.
 
 ## Collecting a useful report

@@ -140,28 +140,71 @@ func TestP1LegacyFlockStillExcludes(t *testing.T) {
 	}
 }
 
-// A record-free chain may only be adopted when the state directory pre-existed
-// this process: a directory that had to be created belongs to a different mount,
-// so what is installed there cannot be attributed to this process's bypath.
-func TestP1RecordlessAdoptionRequiresSharedStateDir(t *testing.T) {
+// A pre-existing state directory does not prove that two host-network
+// containers share state: each can mount its own directory that already exists.
+// A chain without a record is therefore never adopted, even here.
+func TestP1RecordlessChainIsNeverAdopted(t *testing.T) {
 	f := setup(t)
 	if err := Ensure(lanConfig()); err != nil {
 		t.Fatal(err)
 	}
 	releaseHeld()
-	dir := filepath.Dir(statePath)
 	if err := os.Remove(statePath); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.RemoveAll(dir); err != nil {
-		t.Fatal(err)
-	}
 	if err := Cleanup(); !errors.Is(err, ErrGuardUnshared) {
-		t.Fatalf("recordless adoption ran without a shared state directory: %v", err)
+		t.Fatalf("recordless chain was adopted from a pre-existing directory: %v", err)
 	}
 	if !guardInstalled(f, 2) {
-		t.Fatal("guard was modified without a shared state directory")
+		t.Fatal("recordless guard was modified")
 	}
+}
+
+// The current build must establish exclusion for the lock-aware legacy build by
+// creating the lock file itself: a legacy stop that finds no file creates one
+// and then deletes a live guard.
+func TestP1CurrentRunCreatesAndHoldsTheLegacyLock(t *testing.T) {
+	setup(t)
+	if err := Ensure(lanConfig()); err != nil {
+		t.Fatal(err)
+	}
+	defer releaseHeld()
+	f, err := os.OpenFile(lockPath(), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("current run did not create the legacy lock file: %v", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+		t.Fatal("legacy contender was not excluded: the lock file was free")
+	}
+}
+
+// Deleting the lock file while the guard is held is exactly the state in which
+// a legacy contender can create a free one. The holder must refuse to remove
+// anything rather than act on an exclusion it no longer has.
+func TestP1ReplacedLockFileRefusesCleanup(t *testing.T) {
+	f := setup(t)
+	if err := Ensure(lanConfig()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(lockPath()); err != nil {
+		t.Fatal(err)
+	}
+	err := Cleanup()
+	if !errors.Is(err, ErrGuardLockChanged) {
+		t.Fatalf("cleanup ran with the lock file gone: %v", err)
+	}
+	if !guardInstalled(f, 2) {
+		t.Fatal("guard was removed after the lock file disappeared")
+	}
+	if _, statErr := os.Stat(statePath); statErr != nil {
+		t.Fatal("ownership record was removed after the lock file disappeared")
+	}
+	releaseHeld()
+	if err := Cleanup(); err != nil {
+		t.Fatalf("a fresh lease with its own lock file did not reconcile: %v", err)
+	}
+	requireNoGuard(t, f)
 }
 
 // P1-B: chain creation failed because a foreign chain already carried the guard
@@ -324,6 +367,99 @@ func TestP1RealChainCreationFailureKeepsTheExistingChain(t *testing.T) {
 		t.Fatalf("existing chain was removed by the failed install: %v %s", err, out)
 	}
 	forceGuardCleanup()
+}
+
+// A daemon whose guard was replaced by another binary must not delete the
+// replacement on its way out: the token scope is what keeps a legacy daemon
+// guarded while this one shuts down.
+func TestP1ShutdownKeepsAGuardItNoLongerOwns(t *testing.T) {
+	f := setup(t)
+	if err := Ensure(lanConfig()); err != nil {
+		t.Fatal(err)
+	}
+	want := RecordToken()
+	if want == "" {
+		t.Fatal("installed guard has no record token")
+	}
+	replacement := strings.Repeat("b", 32)
+	if err := os.WriteFile(statePath, []byte(`{"Token":"`+replacement+`","Port":1,"Entries":[],"Rules":[]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CleanupInstalled(want); !errors.Is(err, ErrGuardReplaced) {
+		t.Fatalf("shutdown deleted a guard that no longer belonged to this run: %v", err)
+	}
+	if !guardInstalled(f, 2) {
+		t.Fatal("replacement guard was removed by the disarmed run")
+	}
+	forceGuardCleanup()
+}
+
+// A binary that predates every lock cannot be excluded; if it removes the
+// record, the daemon must learn that it is unguarded instead of serving on.
+func TestP1WatchReportsLostOwnershipWhenRecordIsRemoved(t *testing.T) {
+	setup(t)
+	if err := Ensure(lanConfig()); err != nil {
+		t.Fatal(err)
+	}
+	defer releaseHeld()
+	want := RecordToken()
+	if want == "" {
+		t.Fatal("installed guard has no record token")
+	}
+	lost := make(chan struct{}, 1)
+	stop := Watch(want, 5*time.Millisecond, func() { lost <- struct{}{} })
+	defer stop()
+	if err := os.Remove(statePath); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-lost:
+	case <-time.After(2 * time.Second):
+		t.Fatal("lost guard ownership was not reported")
+	}
+}
+
+func TestP1WatchReportsReplacementToken(t *testing.T) {
+	setup(t)
+	if err := Ensure(lanConfig()); err != nil {
+		t.Fatal(err)
+	}
+	defer releaseHeld()
+	want := RecordToken()
+	lost := make(chan struct{}, 1)
+	stop := Watch(want, 5*time.Millisecond, func() { lost <- struct{}{} })
+	defer stop()
+	replacement := strings.Repeat("a", 32)
+	if err := os.WriteFile(statePath, []byte(`{"Token":"`+replacement+`","Port":1,"Entries":[],"Rules":[]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-lost:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a replaced ownership record was not reported")
+	}
+}
+
+func TestP1WatchIsSilentWithoutATokenAndAfterStop(t *testing.T) {
+	setup(t)
+	if err := Ensure(lanConfig()); err != nil {
+		t.Fatal(err)
+	}
+	defer releaseHeld()
+	lost := make(chan struct{}, 1)
+	Watch("", time.Millisecond, func() { lost <- struct{}{} })()
+	stop := Watch(RecordToken(), 5*time.Millisecond, func() { lost <- struct{}{} })
+	time.Sleep(50 * time.Millisecond)
+	stop()
+	if err := os.Remove(statePath); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-lost:
+		t.Fatal("watch reported a change when it should have been inert or stopped")
+	default:
+	}
 }
 
 // TestP1NetnsLeaseHolder and TestP1NetnsLeaseProbe are used by the container

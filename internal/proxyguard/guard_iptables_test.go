@@ -13,6 +13,7 @@ package proxyguard
 // the local iptables binary.
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -139,10 +140,10 @@ func TestIPTablesLifecycleIsIdempotent(t *testing.T) {
 	}
 }
 
-// Deleting the ownership record while the daemon is down must not strand the
-// chain: the chain itself carries the marker and the exact guard shape, which is
-// enough to adopt and remove it before installing a fresh guard.
-func TestIPTablesOrphanWithoutRecordRecovers(t *testing.T) {
+// Deleting the ownership record while the daemon is down leaves a chain that no
+// state directory can prove: the same firewall looks identical from a container
+// with an independent mount, so the chain is retained and the start refuses.
+func TestIPTablesOrphanWithoutRecordIsRetained(t *testing.T) {
 	iptablesTests(t)
 	state := iptablesState(t)
 	if err := Ensure(iptablesConfig()); err != nil {
@@ -151,12 +152,14 @@ func TestIPTablesOrphanWithoutRecordRecovers(t *testing.T) {
 	if err := os.Remove(state); err != nil {
 		t.Fatal(err)
 	}
-	if err := Ensure(iptablesConfig()); err != nil {
-		t.Fatalf("restart over an orphaned chain: %v", err)
+	if err := Ensure(iptablesConfig()); err == nil {
+		t.Fatal("startup adopted a chain without its ownership record")
 	}
-	if err := Cleanup(); err != nil {
-		t.Fatal(err)
+	rules, jumps := guardPresent(t)
+	if rules == 0 || jumps == 0 {
+		t.Fatal("recordless chain was removed")
 	}
+	forceGuardCleanup()
 	requireClean(t)
 }
 
@@ -217,8 +220,8 @@ func TestIPTablesForeignRuleIsRetained(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := Ensure(iptablesConfig())
-	if err == nil || !strings.Contains(err.Error(), "unverified") {
-		t.Fatalf("foreign rule accepted: %v", err)
+	if !errors.Is(err, ErrGuardUnshared) {
+		t.Fatalf("recordless chain with a foreign rule was not retained: %v", err)
 	}
 	rules, _ := guardPresent(t)
 	if rules != 5 {
@@ -241,8 +244,8 @@ func TestIPTablesForeignJumpIsRetained(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := Ensure(iptablesConfig())
-	if err == nil || !strings.Contains(err.Error(), "unverified") {
-		t.Fatalf("foreign jump accepted: %v", err)
+	if !errors.Is(err, ErrGuardUnshared) {
+		t.Fatalf("recordless chain with a foreign jump was not retained: %v", err)
 	}
 	_, jumps := guardPresent(t)
 	if jumps != 3 {

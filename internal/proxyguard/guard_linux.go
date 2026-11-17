@@ -49,24 +49,30 @@ var Command = func(ctx context.Context, args ...string) ([]byte, error) {
 // Trust boundary: this excludes accidental concurrent owners (a second daemon, a
 // supervisor restart, a stop command, another host-network container). A process
 // that already has host root can rewrite iptables directly and is out of scope.
+//
+// The lease alone cannot exclude a legacy binary, which knows nothing about it.
+// This process therefore also creates and holds the legacy lock file
+// (proxy-guard.lock) for its whole lifetime. Every lock-aware legacy build —
+// 3.0.0-rc.4 builds from 2916c1e — honours that file, so current-then-legacy is
+// excluded as well as legacy-then-current. Builds that never locked (d175a19,
+// bb11c37) cannot be excluded by any mechanism while they run; the daemon
+// detects the resulting ownership loss instead of serving on without a guard.
 const guardLockName = "@bypath-proxy-guard-v1"
 
 var (
-	ErrGuardBusy     = errors.New("proxy guard is in use by a running bypath process")
-	ErrGuardReplaced = errors.New("proxy guard belongs to a different run")
-	ErrGuardUnshared = errors.New("proxy guard state directory is not shared with the firewall owner")
-	lockWait         = 2 * time.Second
+	ErrGuardBusy        = errors.New("proxy guard is in use by a running bypath process")
+	ErrGuardReplaced    = errors.New("proxy guard belongs to a different run")
+	ErrGuardUnshared    = errors.New("proxy guard state directory is not shared with the firewall owner")
+	ErrGuardLockChanged = errors.New("proxy guard lock file was removed or replaced while the guard was held")
+	lockWait            = 2 * time.Second
 )
 
-// lease is the exclusive guard lease of this process. legacy carries the pre-fix
-// flock file when one exists, so an older binary that is still running keeps
-// excluding a current one during an upgrade. shared records whether the record
-// directory existed before this process looked at it: a directory this process
-// had to create belongs to this mount only, not to the firewall's owner.
+// lease is the exclusive guard lease of this process. sock is authoritative for
+// current binaries. legacy is the flock of the same-state lock file, created on
+// demand, which keeps lock-aware legacy binaries out in both directions.
 type lease struct {
 	sock   *os.File
 	legacy *os.File
-	shared bool
 }
 
 // held is the lease of the daemon in this process, if any.
@@ -98,8 +104,9 @@ func lockGuard(wait time.Duration) (*lease, error) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	l := &lease{sock: os.NewFile(uintptr(fd), "bypath-proxy-guard.lock")}
-	if _, statErr := os.Stat(filepath.Dir(statePath)); statErr == nil {
-		l.shared = true
+	if err := os.MkdirAll(filepath.Dir(statePath), 0700); err != nil {
+		l.Close()
+		return nil, err
 	}
 	if l.legacy, err = legacyFlock(wait); err != nil {
 		l.Close()
@@ -108,14 +115,13 @@ func lockGuard(wait time.Duration) (*lease, error) {
 	return l, nil
 }
 
-// legacyFlock honours a pre-fix lock file when it exists. It never creates the
-// path: the abstract lease is authoritative, and a recreated path must not be
-// able to grant exclusion on its own.
+// legacyFlock creates and holds the lock file shared with lock-aware legacy
+// builds. Creating it is what excludes them; the abstract lease stays
+// authoritative for current binaries, so a recreated path can never grant a
+// current binary permission to act. A file that cannot be locked means the
+// exclusion cannot be established, and the caller must refuse.
 func legacyFlock(wait time.Duration) (*os.File, error) {
-	f, err := os.OpenFile(lockPath(), os.O_RDWR|syscall.O_NOFOLLOW, 0)
-	if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
-		return nil, nil
-	}
+	f, err := os.OpenFile(lockPath(), os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -148,6 +154,33 @@ func (l *lease) Close() {
 }
 
 func unlockGuard(l *lease) { l.Close() }
+
+// confirm re-checks that the lock file this process holds is still the file the
+// path names. A removed or replaced file means the exclusion this process relies
+// on is gone — typically an operator deleted it, or a legacy binary crashed
+// while replacing it — so the caller must refuse to touch the guard rather than
+// act on a guess. Current binaries are unaffected: the lease, not this file,
+// orders them.
+func (l *lease) confirm() error {
+	if l.legacy == nil {
+		return nil
+	}
+	mine, err := l.legacy.Stat()
+	if err != nil {
+		return err
+	}
+	at, err := os.Stat(lockPath())
+	if err != nil {
+		if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
+			return ErrGuardLockChanged
+		}
+		return err
+	}
+	if !os.SameFile(mine, at) {
+		return ErrGuardLockChanged
+	}
+	return nil
+}
 
 func releaseHeld() {
 	if held == nil {
@@ -443,65 +476,6 @@ func ownedByRecord(v view, r record) bool {
 	return true
 }
 
-// adoptable is the record-free proof: the chain is named exactly like the guard
-// and every rule matches the guard's structure with one shared 32-hex marker.
-// Anything less could be a foreign chain that merely borrowed the name, and is
-// never deleted.
-func adoptable(v view) bool {
-	if v.marker == "" || len(v.extra) > 0 || len(v.jumps) != 2 {
-		return false
-	}
-	var entries []entry
-	loop, tcpDrop, udpDrop := 0, 0, 0
-	tcpPort, udpPort := 0, 0
-	for _, rule := range v.rules {
-		if rule.marker != v.marker {
-			return false
-		}
-		switch rule.target {
-		case "RETURN":
-			if rule.proto != "" || rule.dport != 0 {
-				return false
-			}
-			if rule.iface == "lo" && rule.src == "" {
-				loop++
-				continue
-			}
-			if rule.iface == "" || rule.src == "" {
-				return false
-			}
-			entries = append(entries, entry{CIDR: rule.src, Interface: rule.iface})
-		case "DROP":
-			if rule.src != "" || rule.iface != "" || rule.dport < 1 || rule.dport > 65535 {
-				return false
-			}
-			switch rule.proto {
-			case "tcp":
-				tcpDrop++
-				tcpPort = rule.dport
-			case "udp":
-				udpDrop++
-				udpPort = rule.dport
-			default:
-				return false
-			}
-		default:
-			return false
-		}
-	}
-	if loop != 1 || tcpDrop != 1 || udpDrop != 1 || tcpPort != udpPort {
-		return false
-	}
-	seen := map[string]bool{}
-	for _, j := range v.jumps {
-		if j.marker != v.marker || j.dport != tcpPort || j.iface != "" || j.src != "" || seen[j.proto] || (j.proto != "tcp" && j.proto != "udp") {
-			return false
-		}
-		seen[j.proto] = true
-	}
-	return seen["tcp"] && seen["udp"] && validEntries(entries)
-}
-
 // absentVerified proves the chain is gone from an independent listing before
 // the ownership record may be deleted. Removing the record while the chain is
 // still installed is what turns a crash into a permanent startup refusal.
@@ -550,7 +524,7 @@ func Ensure(cfg *config.Config) error {
 		releaseHeld()
 		return err
 	}
-	if err := cleanupLocked("", false, l.shared); err != nil {
+	if err := cleanupLocked("", false, l); err != nil {
 		return fail(err)
 	}
 	lan, err := trustedLANs(cfg.Gateway.Interface, cfg.Server.SOCKSAllowCIDRs)
@@ -716,22 +690,38 @@ func Cleanup() error {
 	if held != nil {
 		l := held
 		defer releaseHeld()
-		return cleanupLocked("", false, l.shared)
+		return cleanupLocked("", false, l)
 	}
 	l, err := lockGuard(lockWait)
 	if err != nil {
 		return err
 	}
 	defer l.Close()
-	return cleanupLocked("", false, l.shared)
+	return cleanupLocked("", false, l)
+}
+
+// CleanupInstalled is the daemon's own shutdown path. It removes the guard only
+// while the record still names the token this run installed: a legacy binary
+// that replaced the record owns whatever it installed, and this process must not
+// delete that. The next start reconciles it.
+func CleanupInstalled(token string) error {
+	l := held
+	if l == nil {
+		return ErrGuardReplaced
+	}
+	defer releaseHeld()
+	if err := l.confirm(); err != nil {
+		return err
+	}
+	return cleanupLocked(token, true, l)
 }
 
 // CleanupOwned is the stop-time entry point. It removes the guard only when the
 // record still names the token that was sampled before that daemon was stopped.
 // A replacement daemon either holds the guard lease (ErrGuardBusy) or has
 // recorded its own token (ErrGuardReplaced); in both cases its guard is left in
-// place. With a lost or corrupt record the chain is still adopted only when the
-// lease proves no daemon is running and the state directory is the shared one.
+// place. A chain without a record is never removed: the record is the only
+// proof of who installed it.
 func CleanupOwned(token string) error {
 	if held != nil {
 		return ErrGuardBusy
@@ -741,18 +731,29 @@ func CleanupOwned(token string) error {
 		return err
 	}
 	defer l.Close()
-	return cleanupLocked(token, true, l.shared)
+	return cleanupLocked(token, true, l)
 }
 
 // cleanupLocked removes the guard only after proving whose it is, with the
-// guard lease already held. The record is the primary proof; a uniform marker
-// over the exact guard structure is the recovery proof when the record was
-// lost. The record is deleted last and only after two listings confirm the
-// chain is gone, so no crash window can leave an unowned chain behind.
-func cleanupLocked(token string, scoped, shared bool) error {
+// guard lease already held. The record is the only proof; a chain whose record
+// is missing or corrupt is retained, because the state directory a process sees
+// says nothing about which container wrote that chain. The record is deleted
+// last and only after two listings confirm the chain is gone, so no crash window
+// can leave an unowned chain behind.
+func cleanupLocked(token string, scoped bool, l *lease) error {
+	if err := l.confirm(); err != nil {
+		return err
+	}
 	r, recErr := load()
-	if scoped && recErr == nil && (token == "" || r.Token != token) {
-		return ErrGuardReplaced
+	if scoped {
+		// This run sampled its own token. A record that no longer parses or no
+		// longer names it belongs to someone else, and so does the guard.
+		if recErr != nil && !os.IsNotExist(recErr) {
+			return ErrGuardReplaced
+		}
+		if recErr == nil && (token == "" || r.Token != token) {
+			return ErrGuardReplaced
+		}
 	}
 	v, err := inspect()
 	if err != nil {
@@ -770,26 +771,18 @@ func cleanupLocked(token string, scoped, shared bool) error {
 	if recErr == nil {
 		owned = ownedByRecord(v, r)
 	}
-	if !owned && shared {
-		// Shape-based adoption is the record-loss recovery path, but it is only
-		// meaningful in the firewall owner's state directory. In a directory this
-		// process had to create, the chain belongs to someone else's record.
-		owned = adoptable(v)
-	}
 	if !owned {
-		if os.IsNotExist(recErr) && !shared {
-			// Without the owner's state directory there is no record to prove
-			// what this chain is. A directory this process had to create belongs
-			// to a different mount; adopting a chain from it would be a guess.
-			return ErrGuardUnshared
-		}
 		if os.IsNotExist(recErr) {
-			return errors.New("retaining unverified proxy firewall ownership: no record and the installed rules are not a verifiable guard")
+			// The chain carries the guard's name and shape, but a shape is not
+			// proof: an independent state mount shows the same nothing, so
+			// adopting it could delete another deployment's live guard. Only the
+			// record that names this chain may authorize its removal.
+			return ErrGuardUnshared
 		}
 		if recErr != nil {
 			return fmt.Errorf("retaining unverified proxy firewall ownership: %v", recErr)
 		}
-		return errors.New("retaining unverified proxy firewall ownership: installed rules do not match the record and the guard structure")
+		return errors.New("retaining unverified proxy firewall ownership: installed rules do not match the record")
 	}
 	return removeVerified(v)
 }

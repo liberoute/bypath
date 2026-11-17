@@ -116,10 +116,10 @@ func cmdStop(args []string) {
 	}
 	// The daemon removes the proxy guard on its own shutdown, but a killed
 	// daemon, or a rollback to a binary older than the crash-consistent guard,
-	// will refuse to start while a recorded or adoptable guard is still
-	// installed. With the daemon confirmed gone, finish that removal here so a
-	// documented stop is enough before any binary is started again. The token
-	// sampled above keeps this bound to the stopped run.
+	// will refuse to start while a recorded guard is still installed. With the
+	// daemon confirmed gone, finish that removal here so a documented stop is
+	// enough before any binary is started again. The token sampled above keeps
+	// this bound to the stopped run.
 	if os.Geteuid() == 0 {
 		switch err := proxyguard.CleanupOwned(guardToken); {
 		case err == nil:
@@ -128,8 +128,11 @@ func cmdStop(args []string) {
 		case errors.Is(err, proxyguard.ErrGuardReplaced):
 			fmt.Println("  🛡️  Proxy guard kept: a newer bypath run installed its own guard.")
 		case errors.Is(err, proxyguard.ErrGuardUnshared):
-			fmt.Println("  🛡️  Proxy guard kept: this state directory is not the firewall owner's.")
+			fmt.Println("  🛡️  Proxy guard kept: this state directory holds no record of the installed guard.")
 			fmt.Println("     Mount /var/lib/bypath into every host-network container that runs bypath.")
+		case errors.Is(err, proxyguard.ErrGuardLockChanged):
+			fmt.Println("  🛡️  Proxy guard kept: the guard lock file was removed or replaced while bypath was running.")
+			fmt.Println("     Run 'bypath stop' again; it reconciles the guard with a fresh lock file.")
 		default:
 			fmt.Printf("  ⚠️  Proxy guard not removed: %v\n", err)
 		}
