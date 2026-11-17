@@ -353,6 +353,8 @@ func scopeLabel(scope string) string {
 	switch scope {
 	case "builtin":
 		return "Built-in safety rule"
+	case "probe":
+		return "Startup health check"
 	case "local-dns":
 		return "Local network DNS"
 	case "force-proxy":

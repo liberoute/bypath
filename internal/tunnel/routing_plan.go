@@ -78,6 +78,23 @@ func (cg *ConfigGenerator) singboxGeoGate(kind, value string) (string, string) {
 	return tag, ""
 }
 
+// StartupProbeDomains are the hosts the gateway contacts to prove its tunnel.
+// Every generated config forces them through the tunnel ahead of operator and
+// country rules: a startup probe must never pass on a DIRECT rule while the
+// proxy outbound is broken. A suffix covers the www. form the probes use.
+var StartupProbeDomains = []string{"example.com", "gstatic.com"}
+
+// probePlanEntry is the ordered plan entry mirroring that forced rule.
+func probePlanEntry() PlanEntry {
+	return PlanEntry{
+		Scope:       "probe",
+		Kind:        "domain_suffix_list",
+		Domains:     append([]string(nil), StartupProbeDomains...),
+		Outbound:    "proxy",
+		SourceIndex: -1,
+	}
+}
+
 // RoutingPlan builds the ordered plan the named engine evaluates. The panel and
 // the explanation use it so display cannot drift from the generated config.
 func (cg *ConfigGenerator) RoutingPlan(engine string) []PlanEntry {
@@ -191,6 +208,7 @@ func (cg *ConfigGenerator) planWithGate(gate geoGate) []PlanEntry {
 		Outbound:    "direct",
 		SourceIndex: -1,
 	}}
+	plan = append(plan, probePlanEntry())
 
 	if len(cg.RoutingRules) > 0 {
 		for _, rule := range cg.LocalDNSRules {

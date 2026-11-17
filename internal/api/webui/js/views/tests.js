@@ -11,7 +11,7 @@ import {
   validateSpeedTarget, deleteSpeedTarget,
 } from '../data.js';
 import {
-  connectionName, evidenceOf, verdictOf, reasonText, pathKind, fmtLatency, fmtMB, timeAgo,
+  connectionName, evidenceOf, connectivityOf, verdictOf, reasonText, pathKind, fmtLatency, fmtMB, timeAgo,
   verifiedResult, invalidateSupersededResults,
 } from '../format.js';
 import { BudgetDialog, TargetAddDialog, TargetDeleteDialog } from '../dialogs.js';
@@ -224,6 +224,7 @@ function ResultsPanel({ state }) {
             ${result.status !== 'ok' ? html`<div>${result.detail || reasonText(result.reason) || 'No usable evidence.'}</div>` : null}
             <${KV} rows=${[
               ['Connection id', result.connection_id],
+              ['Connectivity', connectivityOf(result).text],
               ['Path', pathKind(result) || 'no proof recorded'],
               result.kind === 'speed' ? ['Throughput', result.mbps ? `${result.mbps.toFixed(1)} Mbps` : '—'] : ['Median / p90', `${fmtLatency(result.p50_ms || result.latency_ms)} / ${fmtLatency(result.p90_ms)}`],
               result.kind === 'speed' ? ['Target', result.target || '—'] : null,
@@ -279,7 +280,7 @@ function ComparePanel({ state }) {
         <div class="pos">${index + 1}</div>
         <div class="grow">
           <div class="rk-name">${result.remark || result.connection_id}${index === 0 ? html`<span class="badge ok">fastest proven</span>` : null}</div>
-          <div class="rk-facts">${result.protocol ? result.protocol.toUpperCase() : ''}${result.engine ? ` · ${result.engine}` : ''} · ${pathKind(result)} · ${timeAgo(result.tested_at)}</div>
+          <div class="rk-facts">${result.protocol ? result.protocol.toUpperCase() : ''}${result.engine ? ` · ${result.engine}` : ''} · ${pathKind(result)} · ${connectivityOf(result).text} · ${timeAgo(result.tested_at)}</div>
         </div>
         <div class="rk-nums">
           ${kind === 'speed'

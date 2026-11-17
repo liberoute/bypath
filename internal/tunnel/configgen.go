@@ -1176,6 +1176,9 @@ func (cg *ConfigGenerator) singboxRouteFromRulesFor(proxyTag string) map[string]
 		"action":        "route",
 		"outbound":      "direct",
 	})
+	// Startup health probes are forced through the tunnel here so no operator or
+	// country DIRECT rule can make them verify the direct path instead.
+	rules = append(rules, singboxProbeRule(proxyTag))
 
 	// Local DNS domains (e.g. .home, .lan) → direct before applying user routing rules.
 	for _, rule := range cg.LocalDNSRules {
@@ -1253,6 +1256,16 @@ func (cg *ConfigGenerator) singboxRouteFromRulesFor(proxyTag string) map[string]
 		route["rule_set"] = ruleSets
 	}
 	return route
+}
+
+// singboxProbeRule routes the startup health-probe hosts through the tunnel.
+// It is emitted before operator and country DIRECT rules on purpose.
+func singboxProbeRule(outbound string) map[string]interface{} {
+	return map[string]interface{}{
+		"domain_suffix": append([]string(nil), StartupProbeDomains...),
+		"action":        "route",
+		"outbound":      outbound,
+	}
 }
 
 // singboxRuleFromMatcher converts a match string + outbound to a sing-box rule map.
@@ -1410,6 +1423,10 @@ func (cg *ConfigGenerator) singboxRouteFor(link *profile.Link, proxyTag string) 
 	// Resolve each name with the resolver its plan class owns. A proxy domain
 	// listed above a bypass rule therefore keeps its query on the tunnel.
 	rules = append(rules, cg.domainResolveRules()...)
+
+	// Rule: startup health probes — always tunnel these, so the startup HTTPS
+	// check verifies the tunnel even when a bypass or country list says DIRECT.
+	rules = append(rules, singboxProbeRule(proxyTag))
 
 	// Rule: force proxy domains — always tunnel these, even if IP is in a whitelisted country.
 	// Must come before bypass_domains and geoip/geosite direct rules.

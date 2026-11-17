@@ -950,15 +950,15 @@ func TestProperty_GeneratedConfigContainsCorrectDomainBypassRule(t *testing.T) {
 			t.Fatalf("rules is not an array, got %T", rulesRaw)
 		}
 
-		// Find the domain_suffix rule that routes traffic (a resolve rule for the
-		// same suffixes may precede it).
+		// Find the domain_suffix rule that routes traffic direct (the forced
+		// startup-probe rule and a resolve rule may precede it).
 		var domainRule map[string]interface{}
 		for _, ruleRaw := range rules {
 			rule, ok := ruleRaw.(map[string]interface{})
 			if !ok {
 				continue
 			}
-			if _, hasDomainSuffix := rule["domain_suffix"]; hasDomainSuffix && rule["action"] == "route" {
+			if _, hasDomainSuffix := rule["domain_suffix"]; hasDomainSuffix && rule["action"] == "route" && rule["outbound"] == "direct" {
 				domainRule = rule
 				break
 			}
@@ -1104,15 +1104,15 @@ whitelist:
 		t.Fatalf("rules is not an array, got %T", rulesRaw)
 	}
 
-	// Find the domain_suffix rule that routes traffic (a resolve rule for the
-	// same suffixes may precede it).
+	// Find the domain_suffix rule that routes traffic direct (the forced
+	// startup-probe rule and a resolve rule may precede it).
 	var domainRule map[string]interface{}
 	for _, ruleRaw := range rules {
 		rule, ok := ruleRaw.(map[string]interface{})
 		if !ok {
 			continue
 		}
-		if _, hasDomainSuffix := rule["domain_suffix"]; hasDomainSuffix && rule["action"] == "route" {
+		if _, hasDomainSuffix := rule["domain_suffix"]; hasDomainSuffix && rule["action"] == "route" && rule["outbound"] == "direct" {
 			domainRule = rule
 			break
 		}

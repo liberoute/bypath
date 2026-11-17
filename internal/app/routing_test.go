@@ -637,8 +637,8 @@ func TestExplainRouteDomainSuffixAndExact(t *testing.T) {
 	if exact.DecidedBy == nil || exact.DecidedBy.Kind != "domain" || exact.DecidedBy.Match != "Exact domain: news.example" {
 		t.Fatalf("wrong deciding rule: %+v", exact.DecidedBy)
 	}
-	if exact.DecidedBy.Position != 2 || exact.DecidedBy.Scope != "rule" {
-		t.Fatalf("deciding rule reported at #%d scope %q, want the second plan entry", exact.DecidedBy.Position, exact.DecidedBy.Scope)
+	if exact.DecidedBy.Position != 3 || exact.DecidedBy.Scope != "rule" {
+		t.Fatalf("deciding rule reported at #%d scope %q, want the first operator rule after the builtin and probe entries", exact.DecidedBy.Position, exact.DecidedBy.Scope)
 	}
 	if !strings.Contains(exact.Summary, "PROXY") {
 		t.Fatalf("summary does not name the action: %q", exact.Summary)

@@ -1134,20 +1134,40 @@ func uplinkInterface(cfg *config.Config) string {
 	return iface
 }
 
+// uplinkTraceEndpoints are echoed back as key=value lines by Cloudflare and are
+// addressed by IP literal on purpose: resolving a name would query a resolver,
+// and in gateway mode the host resolver may itself be the strict DNS path that
+// runs through the tunnel. An IP-literal request keeps the uplink probe free of
+// DNS traffic while the interface binding keeps its TCP on the physical link.
+var uplinkTraceEndpoints = []string{
+	"https://1.1.1.1/cdn-cgi/trace",
+	"https://1.0.0.1/cdn-cgi/trace",
+}
+
+// parseTraceIP extracts the CLIENT address (ip=) from a cdn-cgi/trace body.
+func parseTraceIP(body []byte) string {
+	for _, line := range strings.Split(string(body), "\n") {
+		value, ok := strings.CutPrefix(strings.TrimSpace(line), "ip=")
+		if !ok {
+			continue
+		}
+		if ip := net.ParseIP(strings.TrimSpace(value)); ip != nil {
+			return ip.String()
+		}
+	}
+	return ""
+}
+
 // directUplinkIP asks a public echo what this host looks like without any
 // proxy. It is a comparison value only; a failure leaves it empty and the
 // EXIT_EQUALS_UPLINK guard is skipped rather than guessed.
 func directUplinkIP(ctx context.Context, iface string) string {
-	resolver, err := bench.HostBootstrapResolver()
-	if err != nil {
-		return ""
-	}
-	dialer := &net.Dialer{Timeout: 5 * time.Second, Resolver: resolver, Control: bindDeviceControl(iface)}
+	dialer := &net.Dialer{Timeout: 5 * time.Second, Control: bindDeviceControl(iface)}
 	transport := &http.Transport{Proxy: nil, DialContext: dialer.DialContext}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Timeout: 8 * time.Second, Transport: transport}
-	for _, url := range []string{echoServiceA, echoServiceB, echoServiceC} {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	for _, target := range uplinkTraceEndpoints {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
 			continue
 		}
@@ -1155,13 +1175,13 @@ func directUplinkIP(ctx context.Context, iface string) string {
 		if err != nil {
 			continue
 		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 128))
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
 		if err != nil {
 			continue
 		}
-		if ip := net.ParseIP(strings.TrimSpace(string(body))); ip != nil {
-			return ip.String()
+		if ip := parseTraceIP(body); ip != "" {
+			return ip
 		}
 	}
 	return ""

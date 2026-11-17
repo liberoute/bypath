@@ -1007,6 +1007,44 @@ func reasonText(code string) string {
 	return strings.ToLower(strings.ReplaceAll(code, "_", " "))
 }
 
+// connectivityNote separates "the connection carried traffic" from "the exit
+// was proven". An inconclusive result with a measured latency did work; only
+// its path ownership is unproven, and the row must say so instead of reading
+// like a dead link.
+func connectivityNote(res app.TestResult) string {
+	if res.Status != "inconclusive" {
+		return ""
+	}
+	if ms := latencyMS(res); ms > 0 {
+		return fmt.Sprintf("traffic answered in %d ms; path ownership unproven", ms)
+	}
+	return ""
+}
+
+// connectivityLine states what the evidence shows about carrying traffic,
+// independently of whether the exit could be certified.
+func connectivityLine(res app.TestResult) string {
+	switch res.Status {
+	case "ok":
+		if app.VerifiedTestResult(res) {
+			return "answered through the proven path"
+		}
+		return "answered; path proof incomplete, not ranked"
+	case "inconclusive":
+		if ms := latencyMS(res); ms > 0 {
+			return fmt.Sprintf("answered in %d ms; exit ownership unproven", ms)
+		}
+		return "no measurable answer"
+	case "failed":
+		return "no answer"
+	case "cancelled":
+		return "not measured (cancelled)"
+	case "skipped":
+		return "not run"
+	}
+	return "unknown"
+}
+
 func evidenceOf(res app.TestResult) string {
 	if res.Superseded {
 		return "a later attempt invalidated this proof"
@@ -1027,7 +1065,14 @@ func evidenceOf(res app.TestResult) string {
 		return strings.Join(parts, " · ")
 	}
 	if res.Status == "inconclusive" {
-		return reasonText(res.Reason)
+		reason := reasonText(res.Reason)
+		if note := connectivityNote(res); note != "" {
+			if reason == "" {
+				return note
+			}
+			return note + " · " + reason
+		}
+		return reason
 	}
 	if res.Detail != "" {
 		return res.Detail
@@ -1089,6 +1134,7 @@ func testEvidenceText(res app.TestResult) string {
 	if res.Status != "ok" {
 		fmt.Fprintf(&b, "Reason:     %s\n", orDash(evidenceOf(res)))
 	}
+	fmt.Fprintf(&b, "Connectivity: %s\n", connectivityLine(res))
 	if res.Kind == "speed" {
 		fmt.Fprintf(&b, "Throughput: %.1f Mbps\n", res.MBps)
 		fmt.Fprintf(&b, "Target:     %s\n", orDash(res.Target))

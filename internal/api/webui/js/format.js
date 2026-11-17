@@ -116,6 +116,31 @@ export function verdictOf(result) {
   };
 }
 
+// connectivityOf separates "traffic was carried" from "the path was proven".
+// It never upgrades a verdict; ranking still requires verifiedResult.
+export function connectivityOf(result) {
+  if (!result) return { code: 'unknown', text: 'unknown' };
+  const ms = result.p50_ms || result.latency_ms || 0;
+  switch (result.status) {
+    case 'ok':
+      return verifiedResult(result)
+        ? { code: 'answered', text: 'answered through the proven path' }
+        : { code: 'answered', text: 'answered; proof incomplete, not ranked' };
+    case 'inconclusive':
+      return ms > 0
+        ? { code: 'answered', text: `answered in ${ms} ms; exit ownership unproven` }
+        : { code: 'no_answer', text: 'no measurable answer' };
+    case 'failed':
+      return { code: 'no_answer', text: 'no answer' };
+    case 'cancelled':
+      return { code: 'not_measured', text: 'not measured (cancelled)' };
+    case 'skipped':
+      return { code: 'not_measured', text: 'not run' };
+    default:
+      return { code: 'unknown', text: 'unknown' };
+  }
+}
+
 export function evidenceOf(result) {
   if (!result) return '';
   if (result.superseded) return 'a later attempt invalidated this proof';
@@ -127,7 +152,12 @@ export function evidenceOf(result) {
     if (result.tested_at) parts.push(timeAgo(result.tested_at));
     return parts.join(' · ');
   }
-  if (result.status === 'inconclusive') return reasonText(result.reason);
+  if (result.status === 'inconclusive') {
+    const connectivity = connectivityOf(result);
+    const reason = reasonText(result.reason);
+    if (connectivity.code === 'answered') return `${connectivity.text} · ${reason}`;
+    return reason;
+  }
   if (result.detail) return result.detail;
   if (result.reason) return reasonText(result.reason);
   return result.tested_at ? timeAgo(result.tested_at) : '';

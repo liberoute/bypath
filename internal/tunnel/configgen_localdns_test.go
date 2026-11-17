@@ -37,10 +37,39 @@ func localDNSFixtureRules() []LocalDNSRule {
 }
 
 type localDNSRouteRule struct {
-	Action       string   `json:"action"`
-	Server       string   `json:"server"`
-	Invert       bool     `json:"invert"`
-	DomainSuffix []string `json:"domain_suffix"`
+	Action       string              `json:"action"`
+	Server       string              `json:"server"`
+	Invert       bool                `json:"invert"`
+	DomainSuffix []string            `json:"domain_suffix"`
+	Type         string              `json:"type"`
+	Rules        []localDNSRouteRule `json:"rules"`
+}
+
+// resolveServers lists every DNS server a resolve step references, including
+// the nested conditions of a logical rule.
+func resolveServers(r localDNSRouteRule) []string {
+	var out []string
+	if r.Server != "" {
+		out = append(out, r.Server)
+	}
+	for _, nested := range r.Rules {
+		out = append(out, resolveServers(nested)...)
+	}
+	return out
+}
+
+// excludedSuffixes collects the domain suffixes a resolve step skips via
+// inversion, at any nesting depth.
+func excludedSuffixes(r localDNSRouteRule) ([]string, bool) {
+	var out []string
+	inverted := r.Invert
+	out = append(out, r.DomainSuffix...)
+	for _, nested := range r.Rules {
+		suffixes, nestedInverted := excludedSuffixes(nested)
+		out = append(out, suffixes...)
+		inverted = inverted || nestedInverted
+	}
+	return out, inverted
 }
 
 func assertLocalDNSConfig(t *testing.T, cg *ConfigGenerator) {
@@ -122,13 +151,16 @@ func assertLocalDNSConfig(t *testing.T, cg *ConfigGenerator) {
 	var catchAll *localDNSRouteRule
 	for i := range doc.Route.Rules {
 		r := &doc.Route.Rules[i]
-		if r.Action != "resolve" {
+		servers := resolveServers(*r)
+		if len(servers) == 0 {
 			continue
 		}
-		if !tags[r.Server] {
-			t.Fatalf("route resolve references undefined dns server %q (tags=%v)", r.Server, tags)
+		for _, server := range servers {
+			if !tags[server] {
+				t.Fatalf("route resolve references undefined dns server %q (tags=%v)", server, tags)
+			}
 		}
-		if strings.HasPrefix(r.Server, "dns-local-") {
+		if r.Action == "resolve" && strings.HasPrefix(r.Server, "dns-local-") {
 			localResolve[r.Server] = i
 			continue
 		}
@@ -153,11 +185,14 @@ func assertLocalDNSConfig(t *testing.T, cg *ConfigGenerator) {
 			t.Fatalf("catch-all resolve rule precedes the %s resolve rule: %+v", tag, doc.Route.Rules)
 		}
 	}
-	if !catchAll.Invert {
+	skipped, inverted := excludedSuffixes(*catchAll)
+	if !inverted {
 		t.Fatalf("catch-all resolve must invert the local suffix match: %+v", *catchAll)
 	}
-	want := []string{"home", "lan", "corp"}
-	if !reflect.DeepEqual(catchAll.DomainSuffix, want) {
-		t.Fatalf("catch-all resolve must exclude all local suffixes %v, got %v", want, catchAll.DomainSuffix)
+	// The probe names are forced through the tunnel, so their resolve class is
+	// excluded from the catch-all alongside the local suffixes.
+	want := append(append([]string(nil), StartupProbeDomains...), "home", "lan", "corp")
+	if !reflect.DeepEqual(skipped, want) {
+		t.Fatalf("catch-all resolve must exclude %v, got %v", want, skipped)
 	}
 }

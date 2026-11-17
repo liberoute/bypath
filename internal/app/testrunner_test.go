@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -301,5 +302,37 @@ func TestUplinkInterfaceOnlyForNativeTunGateway(t *testing.T) {
 	}
 	if got := uplinkInterface(nil); got != "" {
 		t.Fatalf("nil config: got %q", got)
+	}
+}
+
+// The uplink probe must not emit DNS: a resolver query would follow the host
+// resolver, which under a strict native-TUN gateway is the tunneled path itself.
+func TestUplinkTraceEndpointsNeedNoDNS(t *testing.T) {
+	if len(uplinkTraceEndpoints) == 0 {
+		t.Fatal("no uplink trace endpoints configured")
+	}
+	for _, raw := range uplinkTraceEndpoints {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatalf("bad endpoint %q: %v", raw, err)
+		}
+		if net.ParseIP(u.Hostname()) == nil {
+			t.Fatalf("endpoint %q is not an IP literal, so it needs DNS", raw)
+		}
+	}
+}
+
+func TestParseTraceIP(t *testing.T) {
+	cases := map[string]string{
+		"fl=20f694\nh=1.1.1.1\nip=203.0.113.7\nts=1.0\n": "203.0.113.7",
+		"ip=2001:db8::7\n":  "2001:db8::7",
+		"fl=1\nh=1.1.1.1\n": "",
+		"ip=not-an-ip\n":    "",
+		"":                  "",
+	}
+	for body, want := range cases {
+		if got := parseTraceIP([]byte(body)); got != want {
+			t.Fatalf("parseTraceIP(%q) = %q, want %q", body, got, want)
+		}
 	}
 }
