@@ -457,8 +457,9 @@ table.data tbody tr:hover { background: var(--surface-2); }
 .rk.best .pos { color: var(--ok); }
 .rk .rk-name { font-weight: 750; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
 .rk .rk-facts { color: var(--fg-3); font-size: 12.3px; }
-.rk .rk-nums { display: flex; gap: var(--sp-3); text-align: right; }
+.rk .rk-nums { display: flex; gap: var(--sp-3); text-align: right; min-width: 0; }
 .rk .rk-nums .v { font-family: var(--mono); font-weight: 700; }
+.rk .rk-nums .chip { max-width: 20ch; overflow: hidden; }
 .rk .rk-nums .k { font-size: 10.4px; color: var(--fg-3); text-transform: uppercase; letter-spacing: .05em; }
 
 .jobpill {

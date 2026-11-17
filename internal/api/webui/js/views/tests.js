@@ -328,7 +328,7 @@ function ComparePanel({ state }) {
               <div><div class="v">${mbPerSec(result) ? mbPerSec(result).toFixed(2) : '—'}</div><div class="k">MB/s</div></div>`
           : html`<div><div class="v">${fmtLatency(delayMS(result))}</div><div class="k">delay</div></div>
               <div><div class="v">${fmtLatency(result.p90_ms)}</div><div class="k">https p90</div></div>`}
-        <div><div class="v"><${ResultChip} result=${result} /></div><div class="k">evidence</div></div>
+        <div><div class="v"><${ResultChip} result=${result} evidence=${false} /></div><div class="k">state</div></div>
       </div>
     </div>`)}
   </div>`;
