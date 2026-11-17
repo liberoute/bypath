@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/url"
 	"os"
@@ -360,5 +361,99 @@ func TestParseEchoIPAcceptsBareAddressAndTrace(t *testing.T) {
 		if err != nil || got != want {
 			t.Fatalf("parseEchoIP(%q) = %q, %v; want %q", body, got, err, want)
 		}
+	}
+}
+
+// The live-path control must fail closed and must only pass when a
+// DIRECT-routed request actually exits through the observed uplink.
+func TestNegativeControlVerdict(t *testing.T) {
+	const uplink = "188.121.134.78"
+	cases := []struct {
+		name       string
+		route      string
+		uplink     string
+		controlIP  string
+		err        error
+		wantState  string
+		wantReason string
+	}{
+		{"direct exits through uplink", "DIRECT", uplink, uplink, nil, negativeControlPass, ""},
+		{"direct exits elsewhere", "DIRECT", uplink, "91.107.181.141", nil, negativeControlFailed, ReasonControlFailed},
+		{"control body unreadable", "DIRECT", uplink, "", errors.New("unexpected echo response"), negativeControlFailed, ReasonControlFailed},
+		{"uplink unknown", "DIRECT", "", uplink, nil, negativeControlFailed, ReasonControlFailed},
+		{"control routed through tunnel", "PROXY", uplink, "", nil, negativeControlNotApplicable, ""},
+	}
+	for _, tc := range cases {
+		state, reason, detail := negativeControlVerdict(tc.route, tc.uplink, tc.controlIP, tc.err)
+		if state != tc.wantState || reason != tc.wantReason {
+			t.Fatalf("%s: got (%q, %q), want (%q, %q)", tc.name, state, reason, tc.wantState, tc.wantReason)
+		}
+		if state == negativeControlFailed && detail == "" {
+			t.Fatalf("%s: a failed control must carry a detail", tc.name)
+		}
+	}
+}
+
+// The control endpoint changed from cp.cloudflare.com (204, empty body) to the
+// trace endpoint. Both must keep the same DIRECT suffix, and an empty body must
+// never be read as an observed address.
+func TestNegativeControlEndpointEchoesTheObservedAddress(t *testing.T) {
+	u, err := url.Parse(negativeControlURL)
+	if err != nil {
+		t.Fatalf("negative control URL %q: %v", negativeControlURL, err)
+	}
+	if u.Scheme != "https" || u.Hostname() != negativeControlHost {
+		t.Fatalf("control %q is not https on the control host %q", negativeControlURL, negativeControlHost)
+	}
+	if !strings.HasSuffix(u.Path, "/cdn-cgi/trace") {
+		t.Fatalf("control %q is not a trace endpoint, so it cannot echo an address", negativeControlURL)
+	}
+	for _, body := range [][]byte{nil, []byte(""), []byte(" ")} {
+		if ip, err := parseEchoIP(body); err == nil {
+			t.Fatalf("an empty body was read as %q; a 204-style answer is not an address", ip)
+		}
+	}
+	trace := []byte("fl=abc\nh=www.cloudflare.com\nip=198.51.100.9\nts=1\n")
+	ip, err := parseEchoIP(trace)
+	if err != nil || ip != "198.51.100.9" {
+		t.Fatalf("trace body parsed as %q, %v; want 198.51.100.9", ip, err)
+	}
+	if state, _, _ := negativeControlVerdict("DIRECT", "198.51.100.9", ip, err); state != negativeControlPass {
+		t.Fatalf("trace address equal to the uplink did not pass the control: %q", state)
+	}
+	if state, reason, _ := negativeControlVerdict("DIRECT", "198.51.100.9", "203.0.113.4", nil); state != negativeControlFailed || reason != ReasonControlFailed {
+		t.Fatalf("a DIRECT request that exited elsewhere was accepted: (%q, %q)", state, reason)
+	}
+}
+
+// A serving gateway runs one benchmark session at a time by default; the cap is
+// explicit and never exceeds the S0.3 budget.
+func TestTestSessionCapSerialOnServingGateway(t *testing.T) {
+	serving := &config.Config{}
+	serving.Gateway.Enabled = true
+	if got := testSessionCap(serving); got != 1 {
+		t.Fatalf("default serving cap: got %d, want 1", got)
+	}
+	if got := testParallelFor(TestKindLatency, 3, serving, 13); got != 1 {
+		t.Fatalf("latency parallelism on a serving gateway: got %d, want 1", got)
+	}
+	serving.Tests.MaxSessions = 2
+	if got := testSessionCap(serving); got != 2 {
+		t.Fatalf("explicit cap: got %d, want 2", got)
+	}
+	serving.Tests.MaxSessions = 99
+	if got := testSessionCap(serving); got != testMaxParallel {
+		t.Fatalf("hard cap: got %d, want %d", got, testMaxParallel)
+	}
+	if got := testParallelFor(TestKindSpeed, 3, serving, 13); got != 1 {
+		t.Fatalf("speed must stay serial: got %d", got)
+	}
+
+	lab := &config.Config{}
+	if got := testSessionCap(lab); got != testMaxParallel {
+		t.Fatalf("lab daemon cap: got %d, want %d", got, testMaxParallel)
+	}
+	if got := testParallelFor(TestKindLatency, 0, lab, 13); got != testDefaultParallel {
+		t.Fatalf("lab default parallelism: got %d, want %d", got, testDefaultParallel)
 	}
 }

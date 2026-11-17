@@ -297,6 +297,7 @@ does not ship a default update feed.
 tests:
   isolation_verified: false
   parallel: 2
+  max_sessions: 1
   speed_per_link_mb: 10
   speed_per_batch_mb: 40
   monthly_budget_mb: 0
@@ -306,6 +307,14 @@ Host capability flags and limits for relay and speed testing. When
 `isolation_verified` is false, isolated results are reported as inconclusive.
 These values are deliberately not writable from the panel: they describe the
 host, not a user preference.
+
+`max_sessions` bounds how many benchmark tunnel sessions may run at once on a
+host that serves a gateway. Every isolated measurement opens its own provider
+session, and those sessions share the account and the uplink with the
+connection carrying user traffic; the default of 1 keeps a benchmark strictly
+serial (one extra session beside the serving one). It is capped at 3, the same
+hard limit as `parallel`, and is ignored when the gateway is disabled, so an
+isolated lab keeps the full S0.3 budget.
 
 ## profiles
 

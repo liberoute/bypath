@@ -40,6 +40,12 @@ type TestsConfig struct {
 	IsolationVerified bool `yaml:"isolation_verified"`
 	// Parallel bounds concurrent isolated instances (default 2, hard cap 3).
 	Parallel int `yaml:"parallel,omitempty"`
+	// MaxSessions bounds concurrent benchmark tunnel sessions on a host that
+	// serves a gateway. Each isolated measurement is its own provider session,
+	// and those sessions compete with the connection carrying user traffic.
+	// Default 1 (strictly serial); the hard cap matches Parallel. Ignored when
+	// the daemon is not serving a gateway.
+	MaxSessions int `yaml:"max_sessions,omitempty"`
 	// SpeedPerLinkMB caps one throughput measurement (default 10, hard max 100).
 	SpeedPerLinkMB int `yaml:"speed_per_link_mb,omitempty"`
 	// SpeedPerBatchMB caps a whole batch (default 40, hard max 300).

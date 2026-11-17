@@ -23,7 +23,10 @@ import (
 const (
 	testDefaultParallel = 2
 	testMaxParallel     = 3
-	testPerLinkTimeout  = 25 * time.Second
+	// testDefaultMaxSessions is the benchmark session ceiling on a serving
+	// gateway: one isolated instance at a time beside the serving connection.
+	testDefaultMaxSessions = 1
+	testPerLinkTimeout     = 25 * time.Second
 	// speedTransferBudget is the extra wall-clock window a speed transfer gets
 	// beyond the per-link setup timeout. Engine startup, the probe and the exit
 	// checks share testPerLinkTimeout; the download must not be killed by a
@@ -53,6 +56,13 @@ const (
 	// uses the trace endpoint instead.
 	negativeControlHost = "www.cloudflare.com"
 	negativeControlURL  = "https://www.cloudflare.com/cdn-cgi/trace"
+)
+
+// Negative-control verdicts recorded on the proof.
+const (
+	negativeControlPass          = "pass"
+	negativeControlFailed        = "failed"
+	negativeControlNotApplicable = "n/a"
 )
 
 type testJob struct {
@@ -254,7 +264,10 @@ func (s *Local) StartTestJob(ctx context.Context, req TestRequest) (TestJob, err
 }
 
 // testParallelFor clamps the requested parallelism to the S0.3 budget. A speed
-// job is always serial; a latency job defaults to 2 and never exceeds 3.
+// job is always serial; a latency job defaults to 2 and never exceeds 3. A
+// daemon that serves a gateway is additionally capped by tests.max_sessions
+// (default 1), so a benchmark never runs more than one extra provider session
+// beside the connection that is carrying traffic.
 func testParallelFor(kind string, requested int, cfg *config.Config, links int) int {
 	if kind == TestKindSpeed {
 		return 1
@@ -269,6 +282,9 @@ func testParallelFor(kind string, requested int, cfg *config.Config, links int) 
 	if parallel > testMaxParallel {
 		parallel = testMaxParallel
 	}
+	if limit := testSessionCap(cfg); parallel > limit {
+		parallel = limit
+	}
 	if parallel > links {
 		parallel = links
 	}
@@ -276,6 +292,23 @@ func testParallelFor(kind string, requested int, cfg *config.Config, links int) 
 		parallel = 1
 	}
 	return parallel
+}
+
+// testSessionCap is the strict session ceiling for benchmark work. An isolated
+// lab keeps the S0.3 budget; a serving gateway defaults to one session at a
+// time because the test sessions share the account and the uplink with the
+// serving connection.
+func testSessionCap(cfg *config.Config) int {
+	if cfg == nil || !cfg.Gateway.Enabled {
+		return testMaxParallel
+	}
+	if cfg.Tests.MaxSessions <= 0 {
+		return testDefaultMaxSessions
+	}
+	if cfg.Tests.MaxSessions > testMaxParallel {
+		return testMaxParallel
+	}
+	return cfg.Tests.MaxSessions
 }
 
 // GetTestJob returns the current state of a job, including finished ones.
@@ -1046,29 +1079,18 @@ func (s *Local) measureLiveLink(ctx context.Context, t testTarget, shared testSh
 	// gateway by requesting a DIRECT-routed name and expecting the uplink IP.
 	if dec, ok := decide(negativeControlHost); ok {
 		proof.RouteDecisions = append(proof.RouteDecisions, dec)
-		switch dec.Decision {
-		case "DIRECT":
-			controlIP, err := fetchEchoIP(setupCtx, port, negativeControlURL)
-			switch {
-			case err != nil:
-				proof.NegativeControl = "failed"
-				res.Status = TestStatusInconclusive
-				res.Reason = ReasonControlFailed
-				res.Detail = "the negative-control request failed, so DIRECT detection is unproven"
-				return res
-			case shared.uplink != "" && controlIP == shared.uplink:
-				proof.NegativeControl = "pass"
-			default:
-				proof.NegativeControl = "failed"
-				res.Status = TestStatusInconclusive
-				res.Reason = ReasonControlFailed
-				res.Detail = "a DIRECT-routed name did not exit through the uplink; route decisions are not trustworthy"
-				return res
-			}
-		default:
-			// A name the policy routes through the tunnel cannot serve as a
-			// DIRECT control.
-			proof.NegativeControl = "n/a"
+		var controlIP string
+		var controlErr error
+		if dec.Decision == "DIRECT" {
+			controlIP, controlErr = fetchEchoIP(setupCtx, port, negativeControlURL)
+		}
+		state, reason, detail := negativeControlVerdict(dec.Decision, shared.uplink, controlIP, controlErr)
+		proof.NegativeControl = state
+		if state == negativeControlFailed {
+			res.Status = TestStatusInconclusive
+			res.Reason = reason
+			res.Detail = detail
+			return res
 		}
 	}
 
@@ -1284,6 +1306,24 @@ func parseEchoIP(body []byte) (string, error) {
 		return ip, nil
 	}
 	return "", fmt.Errorf("unexpected echo response")
+}
+
+// negativeControlVerdict decides what requesting a DIRECT-routed name proved.
+// It fails closed: a control that cannot be requested, or that does not exit
+// through the observed uplink, leaves DIRECT detection unproven. A policy that
+// routes the control name through the tunnel makes the control inapplicable
+// rather than passed by assumption.
+func negativeControlVerdict(routeOutcome, uplink, controlIP string, err error) (state, reason, detail string) {
+	switch {
+	case routeOutcome != "DIRECT":
+		return negativeControlNotApplicable, "", ""
+	case err != nil:
+		return negativeControlFailed, ReasonControlFailed, "the negative-control request failed, so DIRECT detection is unproven"
+	case uplink != "" && controlIP == uplink:
+		return negativeControlPass, "", ""
+	default:
+		return negativeControlFailed, ReasonControlFailed, "a DIRECT-routed name did not exit through the uplink; route decisions are not trustworthy"
+	}
 }
 
 // uplinkInterface names the physical interface the direct-uplink probe must
