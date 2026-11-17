@@ -26,6 +26,11 @@ type WorkerJob struct {
 	ServingCredKey  string `json:"serving_cred_key,omitempty"`
 	ServingExit     string `json:"serving_exit,omitempty"`
 	PolicyRevision  string `json:"policy_revision,omitempty"`
+	// UplinkInterface is the daemon's LAN interface. It names a device only
+	// inside the gateway namespace; the worker uses it when the same name
+	// exists in its own namespace and otherwise falls back to the interface
+	// that carries the host's default route.
+	UplinkInterface string `json:"uplink_interface,omitempty"`
 
 	DaemonNetNS string `json:"daemon_netns"`
 }
@@ -138,7 +143,7 @@ func (s *Local) RunWorkerJob(ctx context.Context, job WorkerJob, selfNS, initNS 
 		job.CapBytes = capBytes
 	}
 
-	uplink := directUplinkIP(ctx, "")
+	uplink := directUplinkIP(ctx, workerUplinkInterface(job.UplinkInterface))
 	if isolated && uplink == "" {
 		// Without the address this host presents directly, an exit can never
 		// be proven different from the uplink; unknown proof is not Healthy.
@@ -146,12 +151,15 @@ func (s *Local) RunWorkerJob(ctx context.Context, job WorkerJob, selfNS, initNS 
 		out.Proof.Isolation = false
 		out.Proof.Detail = "the worker could not measure its direct uplink"
 	}
+	resolver, bootstrap := testBootstrapResolver(s.Config())
 	res, spent, final := s.measureIsolated(ctx, testTarget{id: canonical, link: link},
 		testShared{
 			uplink:      uplink,
 			servingExit: job.ServingExit,
 			isolation:   isolated,
 			policyRev:   job.PolicyRevision,
+			resolver:    resolver,
+			bootstrap:   bootstrap,
 		}, job.Kind, target, job.CapBytes)
 	out.Result = res
 	out.SpentBytes = spent
@@ -220,15 +228,16 @@ func validateWorkerResult(job WorkerJob, out WorkerResult) error {
 // exactly that instead of measuring inside the gateway namespace.
 func (s *Local) runWorkerMeasurement(ctx context.Context, t testTarget, shared testShared, kind string, target *SpeedTarget, capBytes int64, daemonNS string) (TestResult, int64, bool, error) {
 	job := WorkerJob{
-		ConnectionID:   t.id,
-		Kind:           kind,
-		Group:          t.link.Group,
-		Remark:         t.link.Remark,
-		CapBytes:       capBytes,
-		Target:         target,
-		ServingExit:    shared.servingExit,
-		PolicyRevision: shared.policyRev,
-		DaemonNetNS:    daemonNS,
+		ConnectionID:    t.id,
+		Kind:            kind,
+		Group:           t.link.Group,
+		Remark:          t.link.Remark,
+		CapBytes:        capBytes,
+		Target:          target,
+		ServingExit:     shared.servingExit,
+		PolicyRevision:  shared.policyRev,
+		UplinkInterface: uplinkInterface(s.Config()),
+		DaemonNetNS:     daemonNS,
 	}
 	if shared.servingLink != nil {
 		job.ServingGroup = shared.servingLink.Group

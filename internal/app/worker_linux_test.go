@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -219,5 +220,25 @@ func groupChild() {
 	signal.Ignore(syscall.SIGINT)
 	for {
 		time.Sleep(time.Hour)
+	}
+}
+
+// TestWorkerUplinkInterfaceIgnoresAForeignName covers the netns deployment:
+// the daemon's LAN interface name (e.g. a veth inside its namespace) does not
+// exist in the host namespace, and binding to it would fail closed with an
+// empty uplink instead of the host's real uplink.
+func TestWorkerUplinkInterfaceIgnoresAForeignName(t *testing.T) {
+	iface := defaultRouteInterface()
+	if iface == "" {
+		t.Skip("no default route in this environment")
+	}
+	if _, err := net.InterfaceByName(iface); err != nil {
+		t.Fatalf("default route names %q, which is not an interface: %v", iface, err)
+	}
+	if got := workerUplinkInterface("bypath-no-such-iface0"); got != iface {
+		t.Fatalf("workerUplinkInterface fell back to %q, want the default-route device %q", got, iface)
+	}
+	if got := workerUplinkInterface(iface); got != iface {
+		t.Fatalf("workerUplinkInterface rejected a device that exists: got %q", got)
 	}
 }

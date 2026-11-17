@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -39,6 +40,42 @@ func netNSOf(pid int) string {
 
 // NetNSOf exposes the namespace identity to the worker entrypoint.
 func NetNSOf(pid int) string { return netNSOf(pid) }
+
+// workerUplinkInterface names the device the worker's own traffic leaves by.
+// The daemon's configured LAN interface exists only inside the gateway
+// namespace, so it is honoured only when this namespace has a device of that
+// name; otherwise the host's default-route device is the uplink and the only
+// interface an unbound "direct" lookup could be mistaken for.
+func workerUplinkInterface(preferred string) string {
+	if preferred != "" {
+		if _, err := net.InterfaceByName(preferred); err == nil {
+			return preferred
+		}
+	}
+	return defaultRouteInterface()
+}
+
+// defaultRouteInterface reads the host routing table for the device that
+// carries 0.0.0.0/0. It deliberately avoids a netlink dependency for one
+// lookup; /proc/net/route is the kernel's own view.
+func defaultRouteInterface() string {
+	data, err := os.ReadFile("/proc/net/route")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n")[1:] {
+		fields := strings.Fields(line)
+		if len(fields) < 4 || fields[1] != "00000000" {
+			continue
+		}
+		flags, err := strconv.ParseUint(fields[3], 16, 32)
+		if err != nil || flags&0x1 == 0 {
+			continue
+		}
+		return fields[0]
+	}
+	return ""
+}
 
 // isolatedWorkerRequired reports whether this process lives in a network
 // namespace other than the host's. In that case an isolated engine started
