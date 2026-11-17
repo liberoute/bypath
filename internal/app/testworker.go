@@ -77,11 +77,19 @@ func (s *Local) RunWorkerJob(ctx context.Context, job WorkerJob, selfNS, initNS 
 	out.Proof.Isolation = isolated
 	out.Proof.Detail = detail
 
-	id := job.ConnectionID
-	if id == "" {
-		id = ConnectionID(job.Group, job.Remark)
+	// The job's ConnectionID is the daemon's canonical (layer) id, which this
+	// process does not own. The profile store is keyed by group and remark, and
+	// both travel with the job, so resolve through them and report the
+	// canonical id back for the daemon's answer check.
+	canonical := job.ConnectionID
+	ref := ConnectionID(job.Group, job.Remark)
+	if job.Group == "" || job.Remark == "" {
+		ref = job.ConnectionID
 	}
-	link, _, err := s.findLink(id)
+	if canonical == "" {
+		canonical = ref
+	}
+	link, _, err := s.findLink(ref)
 	if err != nil {
 		out.Error = err.Error()
 		return out
@@ -138,7 +146,7 @@ func (s *Local) RunWorkerJob(ctx context.Context, job WorkerJob, selfNS, initNS 
 		out.Proof.Isolation = false
 		out.Proof.Detail = "the worker could not measure its direct uplink"
 	}
-	res, spent, final := s.measureIsolated(ctx, testTarget{id: id, link: link},
+	res, spent, final := s.measureIsolated(ctx, testTarget{id: canonical, link: link},
 		testShared{
 			uplink:      uplink,
 			servingExit: job.ServingExit,

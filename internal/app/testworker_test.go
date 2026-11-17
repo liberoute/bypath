@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -102,5 +103,29 @@ func TestValidateWorkerResult(t *testing.T) {
 	failed.Error = "missing credentials"
 	if err := validateWorkerResult(job, failed); err == nil {
 		t.Fatal("a worker error was accepted as a result")
+	}
+}
+
+// A daemon that runs in its own network namespace hands the worker a canonical
+// (layer) connection id, which the worker's profile store does not know. The
+// group and remark travel with the job, so the worker must resolve through
+// them instead of rejecting the job.
+func TestWorkerJobResolvesCanonicalIdThroughGroupAndRemark(t *testing.T) {
+	svc, _ := newTestLocal(t)
+	if _, err := svc.ImportURI(context.Background(), "work", testVLESS); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	out := svc.RunWorkerJob(context.Background(), WorkerJob{
+		ConnectionID: "c_0123456789abcdef01",
+		Kind:         TestKindSpeed,
+		Group:        "work",
+		Remark:       "node-a",
+		DaemonNetNS:  "net:[4026532000]",
+	}, "net:[4026531992]", "net:[4026531992]")
+	if out.Error == "" {
+		t.Fatal("a speed job without a target should fail")
+	}
+	if strings.Contains(out.Error, "invalid connection id") {
+		t.Fatalf("the worker rejected the canonical id instead of resolving the job: %s", out.Error)
 	}
 }
