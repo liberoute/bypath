@@ -191,11 +191,39 @@ removal and install a fresh guard. A chain that contains any rule without a
 marker is left untouched and startup keeps refusing: inspect it rather than
 deleting it.
 
-The guard is owned by a process as well as by a marker: the daemon holds an
-exclusive lock (`/var/lib/bypath/proxy-guard.lock`) for its whole lifetime, and
-every install or removal runs under that lock. `bypath stop` therefore removes
-only the guard of the run it stopped, and two stop messages mean a guard was
-deliberately kept:
+The guard is owned by a process as well as by a marker. The daemon holds an
+exclusive kernel lease for its whole lifetime, and every install or removal runs
+under that lease. The lease is an abstract Unix socket name, so it has no file
+to delete, cannot be unlinked or recreated, and is released automatically when
+the process dies. Its scope is the network namespace, which is exactly the scope
+of the iptables state it protects:
+
+- Every `docker run --network host` or Compose `network_mode: host` container
+  shares the host namespace and therefore the same lease.
+- A container with its own network namespace has its own iptables and rightly
+  has its own lease.
+- A current build also honours the older `/var/lib/bypath/proxy-guard.lock`
+  flock when one exists, so a pre-3.0.0-rc.4 binary that is still running keeps
+  excluding a newer one during an upgrade.
+
+The lease prevents accidental concurrent owners: a second daemon, a supervisor
+restart, a stop command, another host-network container. It is not a defence
+against a process that already has host root; such a process can rewrite
+iptables directly.
+
+The ownership record still lives in `/var/lib/bypath`, and that directory must be
+the same one for every process that manages the same firewall. The Compose file
+mounts it; keep that mount. Without it, a second container cannot prove whose
+chain it sees, so it fails closed instead of guessing:
+
+- Starting a LAN-mode guard in a container with its own empty state directory is
+  refused while a chain it cannot attribute is installed.
+- `bypath stop` reports `Proxy guard kept: this state directory is not the
+  firewall owner's.` and leaves the guard installed. Run the stop in the
+  container that owns the state directory, or mount `/var/lib/bypath`.
+
+`bypath stop` removes only the guard of the run it stopped, and these messages
+mean a guard was deliberately kept:
 
 - `Proxy guard kept: it belongs to a bypath process that is still running.`
   Another bypath process, typically an automatic restart, owns the guard and
@@ -203,10 +231,18 @@ deliberately kept:
 - `Proxy guard kept: a newer bypath run installed its own guard.`
   The stopped run's record was replaced before the cleanup ran; the newer run's
   guard is left alone.
+- `Proxy guard kept: this state directory is not the firewall owner's.`
+  See the shared state directory note above.
 
-Neither message is an error. To remove that guard, stop the running bypath
-service first. The stop command waits up to two seconds for the guard lock
-before reporting either message.
+None of them is an error. To remove that guard, stop the running bypath service
+first. The stop command waits up to two seconds for the guard lease before
+reporting any of them.
+
+A failed install never flushes the chain. Rules are deleted one at a time and
+`BYPATH_PROXY_IN` is deleted only after a fresh listing shows it empty; if chain
+creation itself failed, the chain that already carried the name is left alone.
+When ownership cannot be proven, the record and the chain stay in place and the
+error says so.
 
 A loopback-only listener (`server.socks_listen: 127.0.0.1`) installs no guard
 and needs no `iptables` access, including in containers without `NET_ADMIN`. A

@@ -16,12 +16,13 @@ func Ensure(cfg *config.Config) error {
 }
 func Cleanup() error { return nil }
 
-// RecordToken, CleanupOwned and the two sentinels exist so the stop path
-// compiles unchanged; there is never a guard to remove on a platform without
-// the Linux firewall.
+// RecordToken, CleanupOwned and the sentinels exist so the stop path compiles
+// unchanged; there is never a guard to remove on a platform without the Linux
+// firewall.
 var (
 	ErrGuardBusy     = errors.New("proxy guard is in use by a running bypath process")
 	ErrGuardReplaced = errors.New("proxy guard belongs to a different run")
+	ErrGuardUnshared = errors.New("proxy guard state directory is not shared with the firewall owner")
 )
 
 func RecordToken() string       { return "" }

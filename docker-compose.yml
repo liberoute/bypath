@@ -16,6 +16,10 @@ services:
       - ./data:/app/data
       - ./engines:/app/engines
       - ./logs:/app/logs
+      # The proxy guard record must be the same for every process that manages
+      # this host firewall; without it a second host-network container cannot
+      # prove whose BYPATH_PROXY_IN chain it sees.
+      - /var/lib/bypath:/var/lib/bypath
     environment:
       - TZ=UTC
     sysctls:

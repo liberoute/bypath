@@ -98,11 +98,17 @@ func cmdRun(args []string) {
 	if err := proxyguard.Ensure(cfg); err != nil {
 		log.Fatalf("Proxy firewall setup failed: %v", err)
 	}
-	defer func() {
-		if err := proxyguard.Cleanup(); err != nil {
-			log.Printf("Proxy firewall ownership retained: %v", err)
-		}
-	}()
+	// A loopback-only run installs no guard and may have no firewall access at
+	// all (root without NET_ADMIN), so it has nothing to reconcile here. A guard
+	// left by an earlier LAN run stays fail-closed until a LAN start or
+	// 'bypath stop' reconciles it.
+	if cfg.Server.SOCKSListenAddress() != "127.0.0.1" {
+		defer func() {
+			if err := proxyguard.Cleanup(); err != nil {
+				log.Printf("Proxy firewall ownership retained: %v", err)
+			}
+		}()
+	}
 	engineMgr := engine.NewManager(cfg.Engines)
 	if err := engineMgr.Init(); err != nil {
 		log.Fatalf("❌ Engine init error: %v", err)

@@ -205,7 +205,9 @@ refuses and changes nothing.
 Before rolling back from 3.0.0-rc.4 or later, run `sudo bypath stop` once with
 the installed build. That stop finishes any proxy guard left by a crash; the
 older binary then starts from a clean firewall instead of refusing the stale
-`BYPATH_PROXY_IN` chain. See `TROUBLESHOOTING.md`.
+`BYPATH_PROXY_IN` chain. A current build also waits for the pre-fix guard lock,
+so an older daemon that is still running is never overridden by a newer binary.
+See `TROUBLESHOOTING.md`.
 
 Rollback does not revert configuration changes. Keep a copy of
 `/etc/bypath/config.yaml` before you upgrade if you expect to need it.

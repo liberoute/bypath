@@ -39,10 +39,10 @@ func requireNoGuard(t *testing.T, f *firewall) {
 	}
 }
 
-// A failed chain deletion must keep the record, because the record is what lets
-// the next start finish the job.
+// A failed rule or chain deletion must keep the record, because the record is
+// what lets the next start finish the job.
 func TestCleanupRetainsRecordWhenChainRemovalFails(t *testing.T) {
-	for _, stage := range []string{"-F " + chain, "-X " + chain} {
+	for _, stage := range []string{"-D " + chain, "-X " + chain} {
 		f := setup(t)
 		if err := Ensure(lanConfig()); err != nil {
 			t.Fatal(err)

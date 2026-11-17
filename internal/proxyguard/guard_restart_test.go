@@ -25,15 +25,15 @@ func loopbackConfig() *config.Config {
 	return &config.Config{Server: config.ServerConfig{SOCKSPort: 2901, SOCKSListen: "127.0.0.1"}}
 }
 
-// holdGuardLock represents another bypath process that owns the guard. flock
-// locks are per open file description, so a second descriptor in this test
+// holdGuardLock represents another bypath process that owns the guard. The lease
+// is a kernel object in this network namespace, so a second lease in this test
 // contends with the daemon exactly like a second process does. The returned
 // function releases it early; it is always released at test cleanup.
 func holdGuardLock(t *testing.T) func() {
 	t.Helper()
-	f, err := lockGuard(0)
+	l, err := lockGuard(0)
 	if err != nil {
-		t.Fatalf("could not take the guard lock for the test: %v", err)
+		t.Fatalf("could not take the guard lease for the test: %v", err)
 	}
 	done := false
 	release := func() {
@@ -41,7 +41,7 @@ func holdGuardLock(t *testing.T) func() {
 			return
 		}
 		done = true
-		unlockGuard(f)
+		unlockGuard(l)
 	}
 	t.Cleanup(release)
 	return release

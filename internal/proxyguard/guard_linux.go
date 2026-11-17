@@ -34,18 +34,39 @@ var Command = func(ctx context.Context, args ...string) ([]byte, error) {
 	return exec.CommandContext(ctx, "/usr/sbin/iptables", args...).CombinedOutput()
 }
 
-// Every destructive guard operation runs under one exclusive lock in the
-// record's directory. The daemon holds it for its whole lifetime, so a stop in
-// another process can neither run between a run's ownership proof and its
-// install nor remove a guard a replacement run is holding.
+// Every destructive guard operation runs under one exclusive lease that covers
+// exactly the resource it protects. iptables state is per network namespace, and
+// an abstract Unix socket name is per network namespace too: a host-network
+// container shares the host namespace and therefore the lease, while a container
+// with its own network namespace owns a separate firewall and correctly needs no
+// shared lease. Abstract names have no filesystem entry, so they cannot be
+// unlinked, recreated or replaced, and the kernel releases them when the process
+// dies: there is no stale lock file and no pathname/inode check-then-act window.
+// The daemon holds the lease for its whole lifetime, so a stop in another process
+// can neither run between a run's ownership proof and its install nor remove a
+// guard a replacement run is holding.
+//
+// Trust boundary: this excludes accidental concurrent owners (a second daemon, a
+// supervisor restart, a stop command, another host-network container). A process
+// that already has host root can rewrite iptables directly and is out of scope.
+const guardLockName = "@bypath-proxy-guard-v1"
+
 var (
 	ErrGuardBusy     = errors.New("proxy guard is in use by a running bypath process")
 	ErrGuardReplaced = errors.New("proxy guard belongs to a different run")
+	ErrGuardUnshared = errors.New("proxy guard state directory is not shared with the firewall owner")
 	lockWait         = 2 * time.Second
 )
 
+// lease is the exclusive guard lease of this process. legacy carries the pre-fix
+// flock file when one exists, so an older binary that is still running keeps
+// excluding a current one during an upgrade. shared records whether the record
+// directory existed before this process looked at it: a directory this process
+// had to create belongs to this mount only, not to the firewall's owner.
 type lease struct {
-	file *os.File
+	sock   *os.File
+	legacy *os.File
+	shared bool
 }
 
 // held is the lease of the daemon in this process, if any.
@@ -55,11 +76,46 @@ func lockPath() string {
 	return filepath.Join(filepath.Dir(statePath), "proxy-guard.lock")
 }
 
-func lockGuard(wait time.Duration) (*os.File, error) {
-	if err := os.MkdirAll(filepath.Dir(statePath), 0700); err != nil {
+func lockGuard(wait time.Duration) (*lease, error) {
+	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(lockPath(), os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0600)
+	addr := &syscall.SockaddrUnix{Name: guardLockName}
+	deadline := time.Now().Add(wait)
+	for {
+		if err = syscall.Bind(fd, addr); err == nil {
+			break
+		}
+		if err != syscall.EADDRINUSE {
+			syscall.Close(fd)
+			return nil, err
+		}
+		if time.Now().After(deadline) {
+			syscall.Close(fd)
+			return nil, ErrGuardBusy
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	l := &lease{sock: os.NewFile(uintptr(fd), "bypath-proxy-guard.lock")}
+	if _, statErr := os.Stat(filepath.Dir(statePath)); statErr == nil {
+		l.shared = true
+	}
+	if l.legacy, err = legacyFlock(wait); err != nil {
+		l.Close()
+		return nil, err
+	}
+	return l, nil
+}
+
+// legacyFlock honours a pre-fix lock file when it exists. It never creates the
+// path: the abstract lease is authoritative, and a recreated path must not be
+// able to grant exclusion on its own.
+func legacyFlock(wait time.Duration) (*os.File, error) {
+	f, err := os.OpenFile(lockPath(), os.O_RDWR|syscall.O_NOFOLLOW, 0)
+	if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -81,16 +137,23 @@ func lockGuard(wait time.Duration) (*os.File, error) {
 	}
 }
 
-func unlockGuard(f *os.File) {
-	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-	f.Close()
+func (l *lease) Close() {
+	if l.legacy != nil {
+		_ = syscall.Flock(int(l.legacy.Fd()), syscall.LOCK_UN)
+		l.legacy.Close()
+	}
+	if l.sock != nil {
+		l.sock.Close()
+	}
 }
+
+func unlockGuard(l *lease) { l.Close() }
 
 func releaseHeld() {
 	if held == nil {
 		return
 	}
-	unlockGuard(held.file)
+	held.Close()
 	held = nil
 }
 
@@ -439,17 +502,6 @@ func adoptable(v view) bool {
 	return seen["tcp"] && seen["udp"] && validEntries(entries)
 }
 
-func removeJumps(jumps []ruleView) {
-	for _, j := range jumps {
-		args := append([]string{"-D", j.parent}, j.args...)
-		for {
-			if _, err := run(args...); err != nil {
-				break
-			}
-		}
-	}
-}
-
 // absentVerified proves the chain is gone from an independent listing before
 // the ownership record may be deleted. Removing the record while the chain is
 // still installed is what turns a crash into a permanent startup refusal.
@@ -489,16 +541,16 @@ func Ensure(cfg *config.Config) error {
 		return errors.New("LAN proxy requires root-owned IPv4 firewall")
 	}
 	releaseHeld()
-	f, err := lockGuard(lockWait)
+	l, err := lockGuard(lockWait)
 	if err != nil {
 		return err
 	}
-	held = &lease{file: f}
+	held = l
 	fail := func(err error) error {
 		releaseHeld()
 		return err
 	}
-	if err := cleanupLocked("", false); err != nil {
+	if err := cleanupLocked("", false, l.shared); err != nil {
 		return fail(err)
 	}
 	lan, err := trustedLANs(cfg.Gateway.Interface, cfg.Server.SOCKSAllowCIDRs)
@@ -535,70 +587,113 @@ func Ensure(cfg *config.Config) error {
 	}
 	r.Rules = ruleSet(r)
 	b, _ := json.Marshal(r)
+	if err = os.MkdirAll(filepath.Dir(statePath), 0700); err != nil {
+		return fail(err)
+	}
 	if err = writeState(statePath, b); err != nil {
 		return fail(err)
 	}
-	if err = install(r); err != nil {
+	created, err := install(r)
+	if err != nil {
+		if !created {
+			// Chain creation failed, so this run installed nothing. Only its own
+			// record has to go; the chain that blocked creation belongs to someone
+			// else and is never touched.
+			if rmErr := removeRecord(); rmErr != nil {
+				return fail(fmt.Errorf("%w (record cleanup failed: %v)", err, rmErr))
+			}
+			return fail(err)
+		}
 		// A half-installed chain is recoverable on the next start because the
-		// record names every rule; deleting the record here would strand it.
-		if undoErr := uninstall(r); undoErr != nil {
-			return fail(fmt.Errorf("%w (guard cleanup failed: %v)", err, undoErr))
+		// record names every rule, but rollback must prove that what is installed
+		// is still this run's before deleting any of it.
+		if undoErr := rollback(r); undoErr != nil {
+			return fail(fmt.Errorf("%w (rollback withheld: %v)", err, undoErr))
 		}
 		return fail(err)
 	}
 	return nil
 }
 
-func install(r record) error {
+// install reports whether this run created the chain. A failed -N means the
+// chain already existed and belongs to somebody else: rollback must not run.
+func install(r record) (bool, error) {
 	if _, err := run("-N", chain); err != nil {
-		return err
+		return false, err
 	}
 	for _, rule := range r.Rules {
 		if _, err := run(append([]string{"-A", chain}, rule...)...); err != nil {
-			return err
+			return true, err
 		}
 	}
 	// INPUT position 1 precedes established/accept rules. RETURN preserves host
 	// policy for permitted sources; forbidden clients are always dropped.
 	for _, proto := range []string{"tcp", "udp"} {
 		if _, err := run(append([]string{"-I", "INPUT", "1"}, jump(r, proto)...)...); err != nil {
-			return err
+			return true, err
 		}
 	}
 	if err := owns(r); err != nil {
-		return err
+		return true, err
 	}
 	for _, proto := range []string{"tcp", "udp"} {
 		if _, err := run(append([]string{"-C", "INPUT"}, jump(r, proto)...)...); err != nil {
-			return err
+			return true, err
 		}
 	}
-	return nil
+	return true, nil
 }
 
-func uninstall(r record) error {
-	var first error
-	keep := func(err error) {
-		if err != nil && first == nil {
-			first = err
-		}
+// rollback undoes a failed install. It acts only on objects proven to be this
+// run's by the record it wrote, and it never flushes: rules are deleted one by
+// one and the chain is deleted only after a fresh listing shows it empty.
+func rollback(r record) error {
+	v, err := inspect()
+	if err != nil {
+		return err
 	}
-	for _, proto := range []string{"tcp", "udp"} {
+	if !v.exists {
+		if len(v.jumps)+len(v.extra) > 0 {
+			return errors.New("guard jumps reference a chain that does not exist")
+		}
+		return removeRecord()
+	}
+	if !ownedByRecord(v, r) {
+		return errors.New("installed rules do not match this run's record")
+	}
+	return removeVerified(v)
+}
+
+// removeVerified deletes exactly the observed guard objects and then the chain,
+// but only after an independent listing proves the chain is empty. Anything that
+// cannot be attributed keeps the chain and the record in place.
+func removeVerified(v view) error {
+	for _, j := range v.jumps {
+		args := append([]string{"-D", j.parent}, j.args...)
 		for {
-			if _, err := run(append([]string{"-D", "INPUT"}, jump(r, proto)...)...); err != nil {
+			if _, err := run(args...); err != nil {
 				break
 			}
 		}
 	}
-	if _, err := run("-S", chain); err == nil {
-		keep(run1("-F", chain))
-		keep(run1("-X", chain))
+	for _, rule := range v.rules {
+		args := append([]string{"-D", chain}, rule.args...)
+		for {
+			if _, err := run(args...); err != nil {
+				break
+			}
+		}
+	}
+	if out, err := run("-S", chain); err == nil {
+		if left := chainRules(out); len(left) > 0 {
+			return fmt.Errorf("retaining proxy guard chain: %d unverified rule(s) remain", len(left))
+		}
+		if err := run1("-X", chain); err != nil {
+			return err
+		}
 	}
 	if err := absentVerified(); err != nil {
-		keep(err)
-	}
-	if first != nil {
-		return first
+		return err
 	}
 	return removeRecord()
 }
@@ -619,41 +714,42 @@ func firewallUnavailable(err error) bool {
 // guard that is verifiably bypath's. It is the daemon's shutdown path.
 func Cleanup() error {
 	if held != nil {
+		l := held
 		defer releaseHeld()
-		return cleanupLocked("", false)
+		return cleanupLocked("", false, l.shared)
 	}
-	f, err := lockGuard(lockWait)
+	l, err := lockGuard(lockWait)
 	if err != nil {
 		return err
 	}
-	defer unlockGuard(f)
-	return cleanupLocked("", false)
+	defer l.Close()
+	return cleanupLocked("", false, l.shared)
 }
 
 // CleanupOwned is the stop-time entry point. It removes the guard only when the
 // record still names the token that was sampled before that daemon was stopped.
-// A replacement daemon either holds the guard lock (ErrGuardBusy) or has
-// recorded its own token (ErrGuardReplaced); in both cases its guard is left
-// in place. With a lost or corrupt record the chain is still adopted only when
-// the lock proves no daemon is running (adoption never touches foreign rules).
+// A replacement daemon either holds the guard lease (ErrGuardBusy) or has
+// recorded its own token (ErrGuardReplaced); in both cases its guard is left in
+// place. With a lost or corrupt record the chain is still adopted only when the
+// lease proves no daemon is running and the state directory is the shared one.
 func CleanupOwned(token string) error {
 	if held != nil {
 		return ErrGuardBusy
 	}
-	f, err := lockGuard(lockWait)
+	l, err := lockGuard(lockWait)
 	if err != nil {
 		return err
 	}
-	defer unlockGuard(f)
-	return cleanupLocked(token, true)
+	defer l.Close()
+	return cleanupLocked(token, true, l.shared)
 }
 
 // cleanupLocked removes the guard only after proving whose it is, with the
-// guard lock already held. The record is the primary proof; a uniform marker
+// guard lease already held. The record is the primary proof; a uniform marker
 // over the exact guard structure is the recovery proof when the record was
 // lost. The record is deleted last and only after two listings confirm the
 // chain is gone, so no crash window can leave an unowned chain behind.
-func cleanupLocked(token string, scoped bool) error {
+func cleanupLocked(token string, scoped, shared bool) error {
 	r, recErr := load()
 	if scoped && recErr == nil && (token == "" || r.Token != token) {
 		return ErrGuardReplaced
@@ -674,10 +770,19 @@ func cleanupLocked(token string, scoped bool) error {
 	if recErr == nil {
 		owned = ownedByRecord(v, r)
 	}
-	if !owned {
+	if !owned && shared {
+		// Shape-based adoption is the record-loss recovery path, but it is only
+		// meaningful in the firewall owner's state directory. In a directory this
+		// process had to create, the chain belongs to someone else's record.
 		owned = adoptable(v)
 	}
 	if !owned {
+		if os.IsNotExist(recErr) && !shared {
+			// Without the owner's state directory there is no record to prove
+			// what this chain is. A directory this process had to create belongs
+			// to a different mount; adopting a chain from it would be a guess.
+			return ErrGuardUnshared
+		}
 		if os.IsNotExist(recErr) {
 			return errors.New("retaining unverified proxy firewall ownership: no record and the installed rules are not a verifiable guard")
 		}
@@ -686,15 +791,5 @@ func cleanupLocked(token string, scoped bool) error {
 		}
 		return errors.New("retaining unverified proxy firewall ownership: installed rules do not match the record and the guard structure")
 	}
-	removeJumps(v.jumps)
-	if err = run1("-F", chain); err != nil {
-		return err
-	}
-	if err = run1("-X", chain); err != nil {
-		return err
-	}
-	if err = absentVerified(); err != nil {
-		return err
-	}
-	return removeRecord()
+	return removeVerified(v)
 }

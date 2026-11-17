@@ -127,6 +127,9 @@ func cmdStop(args []string) {
 			fmt.Println("  🛡️  Proxy guard kept: it belongs to a bypath process that is still running.")
 		case errors.Is(err, proxyguard.ErrGuardReplaced):
 			fmt.Println("  🛡️  Proxy guard kept: a newer bypath run installed its own guard.")
+		case errors.Is(err, proxyguard.ErrGuardUnshared):
+			fmt.Println("  🛡️  Proxy guard kept: this state directory is not the firewall owner's.")
+			fmt.Println("     Mount /var/lib/bypath into every host-network container that runs bypath.")
 		default:
 			fmt.Printf("  ⚠️  Proxy guard not removed: %v\n", err)
 		}
