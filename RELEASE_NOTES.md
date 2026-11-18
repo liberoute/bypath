@@ -1,47 +1,82 @@
-# Bypath v3.0.0-rc.3 — pre-release
-nrc.3 adds the connectivity corrections and security closure described in
-[CHANGELOG.md](CHANGELOG.md). The "Changes in rc.2" section below is retained
-as history of the previous candidate.
+# Bypath v3.0.0-rc.4 — pre-release
 
-The second public release candidate of Bypath, a self-hosted network gateway
-and proxy manager, containing reliability corrections for rc.1. This is a
-**pre-release**: it is not marked "latest", it is not a stable release, and it
-makes no support claim beyond the targets below.
+rc.4 is the fourth public release candidate of Bypath, a self-hosted network
+gateway and proxy manager. It is built on the rc.3 tree and adds benchmark
+approval correctness, crash-consistent proxy-guard ownership, and measurement
+and speed-reporting corrections. This is a **pre-release**: it is not marked
+"latest", it is not a stable release, and it makes no support claim beyond the
+targets below.
 
-## Changes in rc.2
+## Behaviour change: benchmark selection needs approval
 
-rc.2 is built from the same public tree as rc.1. `main` and the
-`v3.0.0-rc.1` tag are unchanged; rc.1 remains available.
+`bypath bench` no longer changes the selected link on its own.
 
-- **Exit identity no longer depends on one service.** Activation probes several
-  independent address-echo services with bounded timeouts. Tunnel connectivity
-  is proven separately from exit identity: if every identity service is blocked
-  but traffic passes, the gateway is allowed with the exit marked UNVERIFIED —
-  never Healthy or VERIFIED. An exit equal to the direct address, or a tunnel
-  that carried no traffic, still fails closed. `bypath doctor --egress` uses the
-  same evidence.
-- **Service persistence is an explicit choice.** Installation still does not
-  enable the unit. After a verified first-run start the wizard offers to enable
-  it at boot (`--enable-service` for non-interactive runs) and verifies the
-  result. Starting, enabling and enabling gateway mode are documented as three
-  separate actions.
-- **Host DNS survives a nonstandard gateway DNS port.** With a listener on, for
-  example, 5335, `/etc/resolv.conf` is no longer pointed at a bare `127.0.0.1`
-  that cannot express the port. When the systemd-resolved stub is in use,
-  Bypath writes a managed drop-in to forward host DNS to the listener and
-  removes it on stop; otherwise host DNS is left untouched and the limitation is
-  logged. systemd-resolved and dnsmasq are not stopped when they do not hold the
-  gateway's port.
-- **The 5335 choice is explained up front.** The wizard warns that standard DHCP
-  and client DNS settings cannot specify a port, so every client must be pointed
-  at the gateway address and port explicitly.
-- **Purge is complete.** The runtime control-socket directory
-  `/run/bypath-control` is removed by uninstall and `--purge`.
+- At a terminal it asks `Auto-select this link? [y/N]`; only a typed `y`/`yes`
+  or `--yes` selects.
+- On a pipe, closed stdin or EOF it never approves and prints
+  `Selection unchanged (non-interactive; pass --yes to select the best link).`
+- **`bench --auto` no longer implies approval.** On non-interactive stdin it
+  refuses before benchmarking unless `--yes` is also passed: exit 1 with
+  `--auto needs --yes when stdin is not a terminal; nothing was benchmarked and
+  the selection is unchanged`. Cron jobs and scripts that used `bench --auto`
+  must add `--yes`.
+- `bench --help`/`-h` prints usage and exits 0 without probing; unknown options
+  and positional arguments exit 1 with usage and change nothing.
+- `--single N` still probes one row and never changes the active link; `-g`/
+  `--group` filtering and row numbering are unchanged.
+
+## Changes in rc.4
+
+21 commits since `v3.0.0-rc.3`. The full technical record is in
+[CHANGELOG.md](CHANGELOG.md).
+
+- **Proxy guard lifecycle.** The guard lease is an abstract Unix socket scoped
+  to the network namespace, backed by `/var/lib/bypath/proxy-guard.lock` for
+  lock-aware builds. Ownership is proved from the record; record-free chains
+  are never adopted; a failed install or interrupted stop touches only objects
+  it can prove; a loopback listener needs no `iptables` access. Changing the
+  installed binary follows stop → verify → swap → start (below).
+- **Measurement correctness.** WebSocket early-data hints are translated for
+  both engines; startup proves TLS and HTTP through the tunnel before
+  CONNECTED; probes are forced through the tunnel; the uplink oracle is bound
+  to the physical interface; the serving link falls back to an isolated
+  instance; a carried HTTPS answer with an unproven exit is kept as
+  `measured`/`exit_unverified` instead of being discarded.
+- **Speed and latency.** Fast delay is reported separately from the full
+  sample; transfers get a 45 s budget on top of the 25 s setup window and
+  report phase, elapsed time, TLS/TTFB and bytes; a non-2xx target is
+  `TARGET_REJECTED`, never a speed result.
+- **Benchmark isolation and pinning.** A serving gateway caps concurrent
+  benchmark sessions at one (`tests.max_sessions`, default 1, hard cap 3);
+  `tests.bootstrap_dns` pins tested endpoints through validated private LAN
+  resolvers and reports the failing stage.
+- **CLI.** Help paths are non-interactive and pipe-safe; the bench approval gate
+  and its regression suite are described above.
+
+## Upgrade and guard migration
+
+Changing the installed binary follows the same order for upgrades and rollback
+when a proxy guard may be installed. The installer does not stop or restart the
+service.
+
+```bash
+sudo bypath stop
+sudo iptables -S BYPATH_PROXY_IN        # must report no chain
+sudo ./install.sh --version v3.0.0-rc.4
+sudo systemctl start bypath
+```
+
+Keep `/var/lib/bypath` mounted and do not delete `proxy-guard.lock` or
+`BYPATH_PROXY_IN` by hand. Builds older than every lock (`d175a19`, `bb11c37`)
+cannot be excluded while they run; a current daemon that detects an ownership
+change stops instead of serving unguarded. See [INSTALL.md](INSTALL.md#upgrade)
+and
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#changing-the-binary-while-a-guard-is-installed).
 
 ## Install
 
 ```bash
-VERSION=v3.0.0-rc.3
+VERSION=v3.0.0-rc.4
 mkdir bypath-install && cd bypath-install
 curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/install.sh"
 curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/SHA256SUMS"
@@ -76,7 +111,8 @@ This release publishes 13 binaries (7 full, 6 lite; see the build matrix in `.gi
 The binaries embed sing-box 1.14.4 and Xray-core library 26.3.27 (`v1.260327.0`), and the pinned
 tun2socks 2.5.2 helper. Licence: GPL-3.0-or-later, as a combined work with
 sing-box and tun2socks (GPL-3.0) and Xray-core (MPL-2.0). Sources for the
-pinned dependencies are listed in `THIRD_PARTY_NOTICES.md`.
+pinned dependencies are listed in `THIRD_PARTY_NOTICES.md`. Every asset is
+verified against `SHA256SUMS`; it is not cryptographically signed.
 
 ## Supported platforms
 
@@ -111,24 +147,78 @@ Cross-compilation alone is not treated as evidence of native support.
   auto-created group, selection, honest verification verdicts, clear separation
   of panel, management API and proxy listeners, and supervised restart and
   proxy-port changes that can be rolled back.
+- **Benchmark control.** Results keep carried connectivity separate from a
+  proven exit, rank fast delay beside the full sample, report transfer phase
+  and progress, and never change the selection without explicit approval.
+- **Crash-consistent proxy guard.** Guard ownership is recorded and leased;
+  stop, upgrade and rollback reconcile a chain left by a crash instead of
+  adopting or aborting on it.
 
 ## Known limitations
 
 - IPv6 gateway egress is not validated; forwarded IPv6 is dropped in gateway
   mode.
-- arm64 was validated under emulation only.
-- Country routing needs external geo data whose feeds are not hash-pinned in
-  this pre-release.
+- ARMv7 and mipsle builds are published but the installer refuses them; install
+  by hand after verifying `SHA256SUMS`.
+- ARM64 runtime was not re-tested on native hardware for this candidate; an
+  earlier candidate has an external native proxy-mode report only.
+- Country routing needs external geo data. The shipped sing-box rule sets are
+  pinned; the Xray feeds are refused for the split.
 - OpenVPN links require an external sing-box 1.14+ binary; no OpenVPN profile
   ships with this release.
 - The proxy listener has no client authentication; keep it on loopback or
   restrict it to trusted client subnets and Bypath's firewall allow-list.
 - Native TUN requires a host that permits TUN and firewall changes. Container
   installs where `/etc/resolv.conf` is bind-mounted can use proxy-only mode.
+- Release assets are checksum-verified with SHA-256 but are not signed.
+- rc.3 deferred items R3-01 (direct resolver reachability under native TUN),
+  R3-02 (native-TUN health-check false status), R3-03 (stale-pidfile exit) and
+  R3-04 (doctor port-53 false FAIL) are not recorded as fixed in this
+  candidate.
 
 ## Reporting problems
 
-Attach `bypath version`, `sudo bypath doctor --json` and `sudo journalctl -u
-bypath -n 200 --no-pager`. Review them first: they redact credentials, tokens
-and subscription URLs, but hostnames, interface names and addresses remain
-visible.
+Attach `bypath version`, `sudo bypath doctor --json` and
+`sudo journalctl -u bypath -n 200 --no-pager`. Review them first: they redact
+credentials, tokens and subscription URLs, but hostnames, interface names and
+addresses remain visible.
+
+## Historical release notes
+
+### v3.0.0-rc.3
+
+rc.3 added the connectivity corrections and security closure described in
+[CHANGELOG.md](CHANGELOG.md#v300-rc3--pre-release). Its assets remain available.
+It published the same 13-binary matrix (7 full, 6 lite) as 16 files including
+`SHA256SUMS`, exercised on fresh amd64 installations and under emulated arm64
+only, with the same IPv6, authentication and external-geo limitations.
+
+### Changes in rc.2
+
+rc.2 is built from the same public tree as rc.1. `main` and the
+`v3.0.0-rc.1` tag are unchanged; rc.1 remains available.
+
+- **Exit identity no longer depends on one service.** Activation probes several
+  independent address-echo services with bounded timeouts. Tunnel connectivity
+  is proven separately from exit identity: if every identity service is blocked
+  but traffic passes, the gateway is allowed with the exit marked UNVERIFIED —
+  never Healthy or VERIFIED. An exit equal to the direct address, or a tunnel
+  that carried no traffic, still fails closed. `bypath doctor --egress` uses the
+  same evidence.
+- **Service persistence is an explicit choice.** Installation still does not
+  enable the unit. After a verified first-run start the wizard offers to enable
+  it at boot (`--enable-service` for non-interactive runs) and verifies the
+  result. Starting, enabling and enabling gateway mode are documented as three
+  separate actions.
+- **Host DNS survives a nonstandard gateway DNS port.** With a listener on, for
+  example, 5335, `/etc/resolv.conf` is no longer pointed at a bare `127.0.0.1`
+  that cannot express the port. When the systemd-resolved stub is in use,
+  Bypath writes a managed drop-in to forward host DNS to the listener and
+  removes it on stop; otherwise host DNS is left untouched and the limitation is
+  logged. systemd-resolved and dnsmasq are not stopped when they do not hold the
+  gateway's port.
+- **The 5335 choice is explained up front.** The wizard warns that standard DHCP
+  and client DNS settings cannot specify a port, so every client must be pointed
+  at the gateway address and port explicitly.
+- **Purge is complete.** The runtime control-socket directory
+  `/run/bypath-control` is removed by uninstall and `--purge`.

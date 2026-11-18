@@ -4,6 +4,135 @@ This branch starts a new, independently constructed public history for Bypath.
 Earlier internal development history is not part of it. Entries below describe
 the public release candidate only.
 
+## v3.0.0-rc.4 — pre-release
+
+Benchmark reliability and proxy-guard hardening on the rc.3 tree. This
+candidate contains 21 commits since `v3.0.0-rc.3`; the public tag is created
+from the reviewed export. Release candidate; no support claim beyond the
+platforms in [RELEASE_NOTES.md](RELEASE_NOTES.md).
+
+### Benchmark CLI approval (behaviour change)
+
+- `bypath bench --help` and `-h` print usage and exit 0 without probing or
+  touching the profile store; the command previously had no help path and fell
+  through to a full sweep (D-928d993-1). Unknown options and positional
+  arguments exit 1 with usage and change nothing.
+- A benchmark no longer rewrites the active link automatically. Selection
+  requires `--yes` or an interactive `y`/`yes`; EOF, an empty line, a closed
+  stdin or any non-terminal stdin never approves and prints
+  `Selection unchanged (non-interactive; pass --yes to select the best link).`
+- **`bench --auto` no longer implies approval.** On non-interactive stdin it
+  refuses before benchmarking unless `--yes` is also passed: exit 1 with
+  `--auto needs --yes when stdin is not a terminal; nothing was benchmarked and
+  the selection is unchanged`. Scripts that relied on `bench --auto` from cron
+  or a pipe must add `--yes`.
+- `--single N` still probes one row and never changes the selection; `-g`/
+  `--group` filtering and row numbering (sorted by remark) are unchanged.
+- The CLI help path stays non-interactive and pipe-safe (`5a9143a`). The
+  regression suite covers help, invalid flags, EOF, non-interactive stdin,
+  declined prompts, `--yes`, `--auto --yes` and `--single`, and asserts the
+  persistent selection actually changes only where a write is expected
+  (`f6a615f`, `689759e`).
+
+### Proxy guard lifecycle
+
+- The guard lease is an abstract Unix socket scoped to the network namespace,
+  so it has no pathname to unlink and is released on process death; a file lock
+  at `/var/lib/bypath/proxy-guard.lock` additionally excludes lock-aware builds
+  in both directions (`697648d`, `928d993`).
+- Ownership is proved from the record together with the installed rules; a
+  record-free chain is never adopted, a failed install touches only objects the
+  record can prove, and `bypath stop` removes only the guard of the run it
+  stopped. A chain left by a crash or an interrupted install no longer causes a
+  crash loop (`bb11c37`, `2916c1e`).
+- A loopback-only listener installs no guard and needs no `iptables` access,
+  including in root containers without `NET_ADMIN` (`2916c1e`).
+- Builds older than every lock (`d175a19`, `bb11c37`) cannot be excluded while
+  they run; a current daemon detects the ownership change and stops instead of
+  serving unguarded. The mandatory stop / verify / swap / start procedure is
+  documented in INSTALL.md and
+  [TROUBLESHOOTING.md](TROUBLESHOOTING.md#changing-the-binary-while-a-guard-is-installed).
+
+### Benchmark measurement and evidence
+
+- WebSocket early-data hints in the shared path (`?ed=2560`) are translated for
+  both engines instead of being sent verbatim, and startup verifies a real TLS
+  handshake and HTTP answer through the tunnel before declaring CONNECTED
+  (`9148411`).
+- Startup probes are forced through the tunnel ahead of DIRECT rules, scoped to
+  the daemon's own inbound, and the uplink oracle is bound to the physical
+  interface so it cannot measure the tunnel exit (`8df1837`, `fd7d1f2`,
+  `ed47dee`).
+- The serving link is measured through its own isolated instance when the live
+  path cannot be route-checked (`c26bb4b`). A carried HTTPS answer with an
+  unproven or shared exit is kept as `measured`/`exit_unverified` instead of
+  being discarded; ranking still requires the full L1+L2 proof (`7d4928b`,
+  `d9daec0`).
+- `tests.bootstrap_dns` pins tested endpoints through validated private LAN
+  resolvers before an isolated tunnel exists; failures report the stage
+  (`dns_bootstrap_failure`, `tcp_connection_failure`, `handshake_failure`,
+  `https_failure`) instead of one generic error (`ed47dee`).
+- Host-worker jobs resolve through group and remark, the host worker receives
+  the LAN bootstrap resolver, and the live-path control uses an endpoint that
+  echoes an address (`50e20fb`, `255570e`, `9654670`).
+
+### Benchmark sessions, speed and latency
+
+- A serving gateway caps concurrent benchmark tunnel sessions at one
+  (`tests.max_sessions`, default 1, hard cap 3) so measurements do not compete
+  with the connection carrying user traffic (`d175a19`).
+- Latency reports a fast delay (HTTPS stopped at response headers) separately
+  from the full P50/P90 sample; a failed sample no longer hides an answered
+  probe (`989990f`, `939ad4f`).
+- Speed transfers get a 45 s transfer budget on top of the 25 s setup window,
+  rank from the first body byte after a warm-up, retry only within the byte
+  cap, and report phase, elapsed time, TLS/TTFB and received bytes. A non-2xx
+  target is `TARGET_REJECTED`, never a speed result; the monthly budget charges
+  actual spend (`989990f`).
+- The panel keeps the compare chip to its verdict and ranks completed rows
+  ahead of failed and superseded ones (`e7d59cd`, `939ad4f`).
+
+### Configuration
+
+- `tests.bootstrap_dns` (up to four private `ip[:port]` resolvers; loopback and
+  public addresses are rejected) and `tests.max_sessions` (default 1, hard cap
+  3) are new optional keys. Configurations without them keep the proxy-only
+  defaults recorded in `internal/config/config.go`.
+
+### Validation
+
+- `go vet ./...` and `go test ./...` were green in local runs at `689759e`.
+  Public CI has not yet run at this commit. The guard lifecycle has unit and
+  fault-injection suites; its real-iptables tests skip unless run as root in a
+  disposable namespace with `BYPATH_GUARD_IPTABLES=1`, which the CI test job
+  does not do.
+- The ARMv7 Lite hardware acceptance was performed on `928d993`; the two later
+  commits (`f6a615f`, `689759e`) are CLI/test-only and were verified by unit
+  tests, including mutation tests that suppress the selection write. No
+  hardware re-run of the final artifact is claimed here.
+
+### Known issues carried forward
+
+- IPv6 gateway egress is not validated; forwarded IPv6 is dropped in gateway
+  mode.
+- The country split is refused for Xray; OpenVPN links require an external
+  sing-box 1.14+ binary.
+- The proxy listener has no client authentication.
+- ARMv7 and mipsle builds are published but the installer refuses them; install
+  by hand after verifying `SHA256SUMS`.
+- Windows and macOS builds carry no installer and no support claim.
+- Release assets are SHA-256 verified but not cryptographically signed.
+- rc.3 deferred items R3-01 (direct resolver reachability under native TUN),
+  R3-02 (native-TUN health-check false status), R3-03 (stale-pidfile exit) and
+  R3-04 (doctor port-53 false FAIL) are not recorded as fixed in this candidate.
+
+### Release scope
+
+21 commits since `v3.0.0-rc.3`: `9148411`, `8df1837`, `d9daec0`, `5a9143a`,
+`7d4928b`, `fd7d1f2`, `c26bb4b`, `989990f`, `939ad4f`, `e7d59cd`, `ed47dee`,
+`50e20fb`, `255570e`, `9654670`, `d175a19`, `bb11c37`, `2916c1e`, `697648d`,
+`928d993`, `f6a615f`, `689759e`.
+
 ## v3.0.0-rc.3 — pre-release
 
 Connectivity corrections for rc.2, built on the rc.2 tree. `main` and the rc.1/rc.2 tags are

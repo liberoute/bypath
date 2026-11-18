@@ -1,7 +1,7 @@
-# Installing Bypath v3.0.0-rc.3
+# Installing Bypath v3.0.0-rc.4
 
 This document covers the supported installation procedure for the
-`v3.0.0-rc.3` pre-release, the non-interactive form, upgrades, rollback and
+`v3.0.0-rc.4` pre-release, the non-interactive form, upgrades, rollback and
 uninstall.
 
 ## Supported targets
@@ -22,7 +22,7 @@ the installer reports a missing tool instead of installing one.
 ## 1. Download and verify
 
 ```bash
-VERSION=v3.0.0-rc.3
+VERSION=v3.0.0-rc.4
 mkdir bypath-install && cd bypath-install
 
 curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/install.sh"
@@ -182,14 +182,31 @@ whenever a nonstandard port is chosen.
 ## Upgrade
 
 An upgrade is the same command with a newer exact tag. The running binary is
-preserved as `/opt/bypath/bypath.previous` before replacement. The unit file is
-rewritten; a running service is not restarted automatically. Restart it
-yourself after reviewing the new release notes:
+preserved as `/opt/bypath/bypath.previous` before replacement, and the unit
+file is rewritten.
+
+### Stop, verify, swap, start
+
+Every change of the installed binary — upgrade or rollback — follows the same
+order when a proxy guard may be installed: stop with the installed build,
+verify the firewall is clean, swap the binary, start. The installer never
+stops, starts or restarts the service for you.
 
 ```bash
-sudo ./install.sh --version vX.Y.Z
-sudo systemctl restart bypath
+sudo bypath stop
+sudo iptables -S BYPATH_PROXY_IN        # must report no chain
+sudo ./install.sh --version v3.0.0-rc.4
+sudo systemctl start bypath
 ```
+
+`bypath stop` removes the guard of the run it stopped, including a guard left
+by a crash or SIGKILL, and refuses to remove a guard owned by a process that is
+still running. Keep `/var/lib/bypath` mounted and do not delete
+`/var/lib/bypath/proxy-guard.lock` or `BYPATH_PROXY_IN` by hand. Builds older
+than every lock (`d175a19`, `bb11c37`) cannot be excluded while they run; if one
+takes over a live guard, the current daemon detects the ownership change and
+stops instead of serving unguarded. See
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#changing-the-binary-while-a-guard-is-installed).
 
 ## Rollback
 

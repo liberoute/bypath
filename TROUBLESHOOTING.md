@@ -20,7 +20,7 @@ hostnames and interface names are visible.
   artefact for other targets.
 - **"sha256sum is required"** — install `coreutils` (Debian/Ubuntu) and rerun.
   The installer never proceeds without a checksum tool.
-- **"an exact release tag is required"** — pass `--version v3.0.0-rc.2`. The
+- **"an exact release tag is required"** — pass `--version v3.0.0-rc.4`. The
   installer deliberately rejects `latest`.
 - **"failed its version check when executed from /opt"** — the binary could not
   run where it is installed. Usually `/opt` is mounted `noexec`; install
