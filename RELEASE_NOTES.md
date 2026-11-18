@@ -27,15 +27,17 @@ targets below.
 
 ## Changes in rc.4
 
-21 commits since `v3.0.0-rc.3`. The full technical record is in
+21 implementation commits since `v3.0.0-rc.3`, plus documentation-only
+commits (23 in total at this review). The full technical record is in
 [CHANGELOG.md](CHANGELOG.md).
 
 - **Proxy guard lifecycle.** The guard lease is an abstract Unix socket scoped
   to the network namespace, backed by `/var/lib/bypath/proxy-guard.lock` for
   lock-aware builds. Ownership is proved from the record; record-free chains
   are never adopted; a failed install or interrupted stop touches only objects
-  it can prove; a loopback listener needs no `iptables` access. Changing the
-  installed binary follows stop → verify → swap → start (below).
+  it can prove; a chain that cannot be attributed is retained and can block
+  startup until resolved; a loopback listener needs no `iptables` access.
+  Changing the installed binary follows stop → verify → swap → start (below).
 - **Measurement correctness.** WebSocket early-data hints are translated for
   both engines; startup proves TLS and HTTP through the tunnel before
   CONNECTED; probes are forced through the tunnel; the uplink oracle is bound
@@ -56,8 +58,10 @@ targets below.
 ## Upgrade and guard migration
 
 Changing the installed binary follows the same order for upgrades and rollback
-when a proxy guard may be installed. The installer does not stop or restart the
-service.
+when a proxy guard may be installed. An install or upgrade never stops, starts
+or restarts the service; only `install.sh --rollback` stops a running service
+before restoring the previous binary, and it starts the service again only if
+it was running.
 
 ```bash
 sudo bypath stop
@@ -69,8 +73,10 @@ sudo systemctl start bypath
 Keep `/var/lib/bypath` mounted and do not delete `proxy-guard.lock` or
 `BYPATH_PROXY_IN` by hand. Builds older than every lock (`d175a19`, `bb11c37`)
 cannot be excluded while they run; a current daemon that detects an ownership
-change stops instead of serving unguarded. See [INSTALL.md](INSTALL.md#upgrade)
-and
+change stops instead of serving unguarded. If the verify step still reports a
+chain, do not delete it by hand and do not proceed: automatic recovery requires
+verifiable ownership, an unattributable chain is retained, and startup refuses
+it. See [INSTALL.md](INSTALL.md#upgrade) and
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md#changing-the-binary-while-a-guard-is-installed).
 
 ## Install
@@ -106,7 +112,7 @@ Full documentation: `README.md`, `QUICKSTART.md`, `INSTALL.md`,
 | `SHA256SUMS` | SHA-256 of every asset above, `install.sh` and `THIRD_PARTY_NOTICES.md` |
 | `THIRD_PARTY_NOTICES.md` | Dependency inventory and licenses |
 
-This release publishes 13 binaries (7 full, 6 lite; see the build matrix in `.github/workflows/build.yml`), plus `install.sh`, `THIRD_PARTY_NOTICES.md` and `SHA256SUMS`: 16 files in total.
+This release publishes 13 binaries (6 full, 7 lite; see the build matrix in `.github/workflows/build.yml`), plus `install.sh`, `THIRD_PARTY_NOTICES.md` and `SHA256SUMS`: 16 files in total.
 
 The binaries embed sing-box 1.14.4 and Xray-core library 26.3.27 (`v1.260327.0`), and the pinned
 tun2socks 2.5.2 helper. Licence: GPL-3.0-or-later, as a combined work with
@@ -150,9 +156,11 @@ Cross-compilation alone is not treated as evidence of native support.
 - **Benchmark control.** Results keep carried connectivity separate from a
   proven exit, rank fast delay beside the full sample, report transfer phase
   and progress, and never change the selection without explicit approval.
-- **Crash-consistent proxy guard.** Guard ownership is recorded and leased;
-  stop, upgrade and rollback reconcile a chain left by a crash instead of
-  adopting or aborting on it.
+- **Crash-consistent proxy guard.** Guard ownership is recorded and leased.
+  Stop, upgrade and rollback reconcile a chain left by a crash only when the
+  record and the installed rules prove that ownership; a record-free or
+  unverifiable chain is never adopted, is retained, and can block startup until
+  an operator resolves it.
 
 ## Known limitations
 
@@ -189,7 +197,7 @@ addresses remain visible.
 
 rc.3 added the connectivity corrections and security closure described in
 [CHANGELOG.md](CHANGELOG.md#v300-rc3--pre-release). Its assets remain available.
-It published the same 13-binary matrix (7 full, 6 lite) as 16 files including
+It published the same 13-binary matrix (6 full, 7 lite) as 16 files including
 `SHA256SUMS`, exercised on fresh amd64 installations and under emulated arm64
 only, with the same IPv6, authentication and external-geo limitations.
 

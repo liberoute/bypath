@@ -260,7 +260,9 @@ error says so.
 A loopback-only listener (`server.socks_listen: 127.0.0.1`) installs no guard
 and needs no `iptables` access, including in containers without `NET_ADMIN`. A
 guard left by an earlier LAN-mode run stays installed and keeps clients blocked
-until a LAN-mode start or `bypath stop` reconciles it.
+until a LAN-mode start or `bypath stop` reconciles it from a matching ownership
+record; a chain with no record is never adopted and stays until an operator
+resolves it.
 
 ## Changing the binary while a guard is installed
 

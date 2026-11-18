@@ -130,13 +130,17 @@ looks like this:
 sudo ./install.sh --version "$VERSION" --non-interactive \
   --mode gateway \
   --interface eth0 \
-  --trusted-cidr 192.0.2.0/24 \
+  --trusted-cidr 192.168.1.0/24 \
   --listen localhost \
   --dns-upstream 1.1.1.1 --dns-upstream 8.8.8.8 \
   --web loopback \
   --subscription "https://subscription.example.net/list" \
   --start-service
 ```
+
+The example assumes `eth0` carries the `192.168.1.0/24` LAN. A trusted CIDR
+must be a private IPv4 subnet of the interface named by `--interface`;
+documentation ranges such as `192.0.2.0/24` are rejected.
 
 `--start-service` starts the unit only after the wizard has written a
 configuration; the gateway itself is enabled only if `--enable-gateway` was
@@ -189,8 +193,10 @@ file is rewritten.
 
 Every change of the installed binary — upgrade or rollback — follows the same
 order when a proxy guard may be installed: stop with the installed build,
-verify the firewall is clean, swap the binary, start. The installer never
-stops, starts or restarts the service for you.
+verify the firewall is clean, swap the binary, start. An install or upgrade
+never stops, starts or restarts the service; `--rollback` is the one exception:
+it stops a running service before restoring the previous binary and starts it
+again only if it was running.
 
 ```bash
 sudo bypath stop
@@ -200,8 +206,11 @@ sudo systemctl start bypath
 ```
 
 `bypath stop` removes the guard of the run it stopped, including a guard left
-by a crash or SIGKILL, and refuses to remove a guard owned by a process that is
-still running. Keep `/var/lib/bypath` mounted and do not delete
+by a crash or SIGKILL, when the ownership record and the installed rules prove
+that the guard is that run's; it refuses to remove a guard owned by a process
+that is still running. A chain with no record, or whose rules no longer match
+it, is kept and can block startup until an operator resolves it. Keep
+`/var/lib/bypath` mounted and do not delete
 `/var/lib/bypath/proxy-guard.lock` or `BYPATH_PROXY_IN` by hand. Builds older
 than every lock (`d175a19`, `bb11c37`) cannot be excluded while they run; if one
 takes over a live guard, the current daemon detects the ownership change and
@@ -222,8 +231,10 @@ refuses and changes nothing.
 Before rolling back from 3.0.0-rc.4 or later, run `sudo bypath stop` once with
 the installed build and confirm the firewall is clean
 (`sudo iptables -S BYPATH_PROXY_IN` reports no chain). That stop removes the
-proxy guard, including one left by a crash, so the older binary starts from a
-clean firewall instead of refusing the stale `BYPATH_PROXY_IN` chain. Keep
+proxy guard, including one left by a crash, once ownership is proven from the
+record and the installed rules, so the older binary starts from a clean
+firewall instead of refusing the stale `BYPATH_PROXY_IN` chain. A chain the
+record cannot attribute is kept and may continue to block startup. Keep
 `/var/lib/bypath` mounted and do not delete `/var/lib/bypath/proxy-guard.lock`:
 a current build holds that lock so a lock-aware older daemon is excluded in
 both directions. An older build that predates every lock (`d175a19`,

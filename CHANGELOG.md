@@ -7,7 +7,9 @@ the public release candidate only.
 ## v3.0.0-rc.4 — pre-release
 
 Benchmark reliability and proxy-guard hardening on the rc.3 tree. This
-candidate contains 21 commits since `v3.0.0-rc.3`; the public tag is created
+candidate contains 21 implementation commits since `v3.0.0-rc.3`, plus
+documentation-only commits after `689759e` (`ef73acd` and the correction that
+follows it): 23 commits in total at this review. The public tag is created
 from the reviewed export. Release candidate; no support claim beyond the
 platforms in [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
@@ -43,8 +45,10 @@ platforms in [RELEASE_NOTES.md](RELEASE_NOTES.md).
 - Ownership is proved from the record together with the installed rules; a
   record-free chain is never adopted, a failed install touches only objects the
   record can prove, and `bypath stop` removes only the guard of the run it
-  stopped. A chain left by a crash or an interrupted install no longer causes a
-  crash loop (`bb11c37`, `2916c1e`).
+  stopped. Automatic recovery therefore requires verifiable ownership: a chain
+  with no record, or one whose rules no longer match it, is retained and can
+  block startup until an operator resolves it. A chain left by a crash or an
+  interrupted install no longer causes a crash loop (`bb11c37`, `2916c1e`).
 - A loopback-only listener installs no guard and needs no `iptables` access,
   including in root containers without `NET_ADMIN` (`2916c1e`).
 - Builds older than every lock (`d175a19`, `bb11c37`) cannot be excluded while
@@ -106,10 +110,11 @@ platforms in [RELEASE_NOTES.md](RELEASE_NOTES.md).
   fault-injection suites; its real-iptables tests skip unless run as root in a
   disposable namespace with `BYPATH_GUARD_IPTABLES=1`, which the CI test job
   does not do.
-- The ARMv7 Lite hardware acceptance was performed on `928d993`; the two later
-  commits (`f6a615f`, `689759e`) are CLI/test-only and were verified by unit
-  tests, including mutation tests that suppress the selection write. No
-  hardware re-run of the final artifact is claimed here.
+- The ARMv7 Lite hardware acceptance was performed on `928d993`; the later
+  implementation commits (`f6a615f`, `689759e`) are CLI/test-only and were
+  verified by unit tests, including mutation tests that suppress the selection
+  write. `ef73acd` and this documentation correction change no executable code.
+  No hardware re-run of the final artifact is claimed here.
 
 ### Known issues carried forward
 
@@ -128,10 +133,13 @@ platforms in [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 ### Release scope
 
-21 commits since `v3.0.0-rc.3`: `9148411`, `8df1837`, `d9daec0`, `5a9143a`,
-`7d4928b`, `fd7d1f2`, `c26bb4b`, `989990f`, `939ad4f`, `e7d59cd`, `ed47dee`,
-`50e20fb`, `255570e`, `9654670`, `d175a19`, `bb11c37`, `2916c1e`, `697648d`,
-`928d993`, `f6a615f`, `689759e`.
+The 21 implementation commits since `v3.0.0-rc.3`: `9148411`, `8df1837`,
+`d9daec0`, `5a9143a`, `7d4928b`, `fd7d1f2`, `c26bb4b`, `989990f`, `939ad4f`,
+`e7d59cd`, `ed47dee`, `50e20fb`, `255570e`, `9654670`, `d175a19`, `bb11c37`,
+`2916c1e`, `697648d`, `928d993`, `f6a615f`, `689759e`.
+
+The documentation-only commits after `689759e` are not implementation changes;
+with them the branch holds 23 commits at this review.
 
 ## v3.0.0-rc.3 — pre-release
 
