@@ -253,6 +253,7 @@ support claim.
 - [CONFIGURATION.md](CONFIGURATION.md) — configuration reference.
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — diagnosis and common failures.
 - [SECURITY.md](SECURITY.md) — threat model, exposure rules and reporting.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — bug reports, development and pull requests.
 - [RELEASE_NOTES.md](RELEASE_NOTES.md) — what this release contains and
   what it does not.
 - [CHANGELOG.md](CHANGELOG.md) — changes in this release.
