@@ -1,278 +1,354 @@
 package main
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"os"
 	"strings"
 
-	"github.com/liberoute/bypath/internal/config"
-	"github.com/liberoute/bypath/internal/paths"
-	"github.com/liberoute/bypath/internal/profile"
+	"github.com/liberoute/bypath/internal/app"
 )
 
-// (sub import uses profile.ImportSubscriptionFile)
-
+// cmdSub drives subcommands through the shared application service so the CLI
+// and the TUI cannot disagree about subscription state.
 func cmdSub(args []string) {
 	if len(args) == 0 {
-		fmt.Println("Usage:")
-		fmt.Println("  bypath sub add <url>       Add subscription URL")
-		fmt.Println("  bypath sub update          Fetch latest links")
-		fmt.Println("  bypath sub import <file>   Import links from a local sub dump (plain/base64)")
-		fmt.Println("  bypath sub list [all]      Show subscription URLs (all groups if no -g)")
-		fmt.Println("  bypath sub dedupe          Remove duplicate subscription URLs")
-		fmt.Println("  bypath sub remove <index>  Remove subscription by index (from 'sub list')")
+		printSubUsage()
 		os.Exit(1)
 	}
-
 	subCmd := args[0]
 	subArgs := args[1:]
 
-	mgr, err := profile.NewManager(profileDir(), "default")
+	svc, err := openService()
 	if err != nil {
 		fmt.Printf("❌ %v\n", err)
 		os.Exit(1)
 	}
+	ctx := context.Background()
 
 	switch subCmd {
 	case "add":
-		group := "default"
-		explicitGroup := false
-		var url string
-		for i := 0; i < len(subArgs); i++ {
-			if (subArgs[i] == "-g" || subArgs[i] == "--group") && i+1 < len(subArgs) {
-				group = subArgs[i+1]
-				explicitGroup = true
-				i++
-			} else {
-				url = subArgs[i]
-			}
-		}
+		group, rest := subGroupFlag(subArgs)
+		url := lastArg(rest)
 		if url == "" {
 			fmt.Println("❌ No URL provided")
+			printSubUsage()
 			os.Exit(1)
 		}
-
-		// Desired name from URL #remark (v2rayN convention) or domain.
-		desiredFromURL := groupNameFromURL(url)
-
-		// Already registered anywhere? reuse — optionally rename domain group → #remark.
-		if existing, ok := mgr.FindSubscription(url); ok {
-			final := existing
-			if !explicitGroup && desiredFromURL != "" && desiredFromURL != existing {
-				if _, err := mgr.GetGroup(desiredFromURL); err != nil {
-					if err := mgr.RenameGroup(existing, desiredFromURL); err == nil {
-						fmt.Printf("ℹ️  Already existed as '%s' — renamed to '%s' (from URL #remark)\n", existing, desiredFromURL)
-						final = desiredFromURL
-					} else {
-						fmt.Printf("ℹ️  Already exists in group '%s' (rename to '%s' failed: %v)\n", existing, desiredFromURL, err)
-					}
-				} else {
-					fmt.Printf("ℹ️  Already exists in group '%s' (target name '%s' already taken)\n", existing, desiredFromURL)
-				}
-			} else {
-				fmt.Printf("ℹ️  Already exists in group '%s' — not adding duplicate\n", existing)
+		if group == "" {
+			group = groupNameFromURL(url)
+			if group == "" || group == "default" {
+				group = "sub"
 			}
-			fmt.Println("   Run 'bypath sub update -g " + final + "' to refresh links")
-			return
-		}
-
-		if !explicitGroup {
-			group = desiredFromURL
 			if strings.Contains(url, "#") {
 				fmt.Printf("ℹ️  Using group '%s' from URL #remark\n", group)
 			} else {
-				fmt.Printf("ℹ️  'default' group is reserved for manual links. Using group '%s'\n", group)
+				fmt.Printf("ℹ️  Using group '%s' derived from the URL host\n", group)
 			}
 		}
-
-		if _, err := mgr.GetGroup(group); err != nil {
-			if err := mgr.CreateGroup(group, "subscription"); err != nil {
-				fmt.Printf("❌ %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Printf("📁 Created group '%s'\n", group)
-		} else if !explicitGroup {
-			fmt.Printf("ℹ️  Group '%s' already exists — adding URL there\n", group)
-		}
-
-		if err := mgr.AddSubscription(group, url); err != nil {
-			if errors.Is(err, profile.ErrSubscriptionExists) {
+		sub, err := svc.AddSubscription(ctx, group, url)
+		if err != nil {
+			if app.CodeOf(err) == app.CodeConflict {
 				fmt.Printf("ℹ️  %v\n", err)
+				fmt.Println("   Run 'bypath sub update -g " + group + "' to refresh links")
 				return
 			}
 			fmt.Printf("❌ %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("✅ Subscription added to group '%s'\n", group)
-		fmt.Println("   Run 'bypath sub update -g " + group + "' to fetch links")
+		fmt.Printf("✅ Subscription added to group '%s'\n", sub.Group)
+		fmt.Println("   Run 'bypath sub preview <url>' to see what it contains without storing it")
+		fmt.Println("   Run 'bypath sub update -g " + sub.Group + "' to fetch links")
 
 	case "update":
-		group := ""
-		for i := 0; i < len(subArgs); i++ {
-			if (subArgs[i] == "-g" || subArgs[i] == "--group") && i+1 < len(subArgs) {
-				group = subArgs[i+1]
-				i++
+		group, _ := subGroupFlag(subArgs)
+		list, err := svc.ListSubscriptions(ctx)
+		if err != nil {
+			fmt.Printf("❌ %v\n", err)
+			os.Exit(1)
+		}
+		list = filterSubscriptions(list, group)
+		if len(list) == 0 {
+			if group != "" {
+				fmt.Printf("❌ No subscriptions in group '%s'\n", group)
+			} else {
+				fmt.Println("❌ No subscriptions found")
 			}
+			os.Exit(1)
 		}
 
-		socksPort := 0
-		if cfg, err := config.Load(paths.Get().ConfigFile); err == nil {
-			socksPort = cfg.Server.SOCKSPort
+		ok, failed := 0, 0
+		for _, sub := range list {
+			fmt.Printf("📡 Updating %s (%s)...\n", sub.Group, sub.RedactedURL)
+			refreshed, err := svc.RefreshSubscription(ctx, sub.Group, sub.URL, nil)
+			if err != nil {
+				failed++
+				fmt.Printf("  ⚠️  %v\n", err)
+				continue
+			}
+			ok++
+			fmt.Printf("  ✅ Got %d links\n", refreshed.LinkCount)
 		}
+		if ok == 0 {
+			fmt.Printf("❌ All %d subscription(s) failed to refresh\n", failed)
+			os.Exit(1)
+		}
+		fmt.Printf("\n✅ Updated %d of %d subscription(s)\n", ok, ok+failed)
 
-		if group != "" {
-			fmt.Printf("📡 Updating subscriptions for group '%s'...\n", group)
-			count, err := mgr.UpdateSubscriptions(group, socksPort)
+	case "preview":
+		target := lastArg(subArgs)
+		if target == "" {
+			fmt.Println("❌ Usage: bypath sub preview <url|file>")
+			os.Exit(1)
+		}
+		var preview app.SubscriptionPreview
+		if info, statErr := os.Stat(target); statErr == nil && !info.IsDir() {
+			text, err := readSubscriptionFile(target)
 			if err != nil {
 				fmt.Printf("❌ %v\n", err)
 				os.Exit(1)
 			}
-			fmt.Printf("✅ Got %d links\n", count)
-		} else {
-			groups := mgr.ListGroups()
-			totalLinks := 0
-			updated := 0
-			for _, gName := range groups {
-				g, _ := mgr.GetGroup(gName)
-				if g == nil || len(g.Subscriptions) == 0 {
-					continue
-				}
-				fmt.Printf("📡 Updating group '%s'...\n", gName)
-				count, err := mgr.UpdateSubscriptions(gName, socksPort)
-				if err != nil {
-					fmt.Printf("  ⚠️  %v\n", err)
-					continue
-				}
-				fmt.Printf("  ✅ Got %d links\n", count)
-				totalLinks += count
-				updated++
-			}
-			if updated == 0 {
-				fmt.Println("❌ No groups with subscriptions found")
+			preview, err = svc.PreviewSubscriptionText(ctx, text)
+			if err != nil {
+				fmt.Printf("❌ %v\n", err)
 				os.Exit(1)
 			}
-			fmt.Printf("\n✅ Updated %d groups, total %d links\n", updated, totalLinks)
-		}
-
-	case "import":
-		group := "default"
-		var filePath string
-		for i := 0; i < len(subArgs); i++ {
-			if (subArgs[i] == "-g" || subArgs[i] == "--group") && i+1 < len(subArgs) {
-				group = subArgs[i+1]
-				i++
-			} else {
-				filePath = subArgs[i]
+		} else {
+			var err error
+			preview, err = svc.PreviewSubscription(ctx, target)
+			if err != nil {
+				fmt.Printf("❌ %v\n", err)
+				os.Exit(1)
 			}
 		}
+		printSubscriptionPreview(preview)
+
+	case "import":
+		group, rest := subGroupFlag(subArgs)
+		filePath := lastArg(rest)
 		if filePath == "" {
 			fmt.Println("❌ Usage: bypath sub import [-g group] <file>")
 			os.Exit(1)
 		}
-		if group == "default" {
+		if group == "" || group == "default" {
 			group = "imported"
-			fmt.Printf("ℹ️  Using group '%s'\n", group)
 		}
-		if _, err := mgr.GetGroup(group); err != nil {
-			mgr.CreateGroup(group, "subscription")
-		}
-		count, err := mgr.ImportSubscriptionFile(group, filePath)
+		text, err := readSubscriptionFile(filePath)
 		if err != nil {
 			fmt.Printf("❌ %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("✅ Imported %d links into group '%s'\n", count, group)
-
-	case "remove", "rm", "del":
-		group := "default"
-		var idxStr string
-		for i := 0; i < len(subArgs); i++ {
-			if (subArgs[i] == "-g" || subArgs[i] == "--group") && i+1 < len(subArgs) {
-				group = subArgs[i+1]
-				i++
-			} else {
-				idxStr = subArgs[i]
-			}
-		}
-		if idxStr == "" {
-			fmt.Println("❌ No index provided. Use 'bypath sub list' to see indices.")
-			os.Exit(1)
-		}
-		idx := parseIndex(idxStr)
-		if idx <= 0 {
-			fmt.Println("❌ Invalid index")
-			os.Exit(1)
-		}
-
-		if err := mgr.RemoveSubscription(group, idx-1); err != nil {
+		res, err := svc.ImportSubscriptionText(ctx, group, text)
+		if err != nil {
 			fmt.Printf("❌ %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("✅ Subscription #%d removed from group '%s'\n", idx, group)
-
-	case "list":
-		group := ""
-		listAll := true
-		for i := 0; i < len(subArgs); i++ {
-			if (subArgs[i] == "-g" || subArgs[i] == "--group") && i+1 < len(subArgs) {
-				group = subArgs[i+1]
-				listAll = false
-				i++
-			} else if subArgs[i] == "all" {
-				listAll = true
-			}
+		fmt.Printf("✅ Imported %d link(s) into group '%s'\n", len(res.Created), res.Group)
+		if len(res.Skipped) > 0 {
+			fmt.Printf("   Skipped %d duplicate/invalid entry(ies)\n", len(res.Skipped))
 		}
 
-		if !listAll && group != "" {
-			g, err := mgr.GetGroup(group)
-			if err != nil {
-				fmt.Printf("❌ Group '%s' not found\n", group)
-				os.Exit(1)
+	case "remove", "rm", "del":
+		group, rest := subGroupFlag(subArgs)
+		idx := parseIndex(lastArg(rest))
+		if idx <= 0 {
+			fmt.Println("❌ No valid index provided. Use 'bypath sub list' to see indices.")
+			os.Exit(1)
+		}
+		list, err := svc.ListSubscriptions(ctx)
+		if err != nil {
+			fmt.Printf("❌ %v\n", err)
+			os.Exit(1)
+		}
+		list = filterSubscriptions(list, group)
+		if idx > len(list) {
+			fmt.Printf("❌ Index %d out of range (%d subscription(s))\n", idx, len(list))
+			os.Exit(1)
+		}
+		victim := list[idx-1]
+		opts, optErr := parseDeleteOptions(subArgs)
+		if optErr != nil {
+			fmt.Printf("❌ %v\n", optErr)
+			os.Exit(1)
+		}
+		if err := svc.RemoveSubscriptionWithOptions(ctx, victim.Group, victim.URL, opts); err != nil {
+			fmt.Printf("❌ %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✅ Removed %s from group '%s' (and its linked servers)\n", victim.RedactedURL, victim.Group)
+
+	case "dedupe":
+		list, err := svc.ListSubscriptions(ctx)
+		if err != nil {
+			fmt.Printf("❌ %v\n", err)
+			os.Exit(1)
+		}
+		seen := make(map[string]bool)
+		removed := 0
+		for _, sub := range list {
+			key := sub.Group + "|" + sub.URL
+			if seen[key] {
+				if err := svc.RemoveSubscription(ctx, sub.Group, sub.URL); err != nil {
+					fmt.Printf("  ⚠️  Removing duplicate %s: %v\n", sub.RedactedURL, err)
+					continue
+				}
+				removed++
+				continue
 			}
-			if len(g.Subscriptions) == 0 {
+			seen[key] = true
+		}
+		if removed == 0 {
+			fmt.Println("✅ No duplicate subscriptions")
+		} else {
+			fmt.Printf("✅ Removed %d duplicate subscription entry(ies)\n", removed)
+		}
+
+	case "list":
+		group, _ := subGroupFlag(subArgs)
+		list, err := svc.ListSubscriptions(ctx)
+		if err != nil {
+			fmt.Printf("❌ %v\n", err)
+			os.Exit(1)
+		}
+		list = filterSubscriptions(list, group)
+		if len(list) == 0 {
+			if group != "" {
 				fmt.Printf("No subscriptions in group '%s'\n", group)
-				return
-			}
-			fmt.Printf("Subscriptions in group '%s':\n\n", group)
-			for i, url := range g.Subscriptions {
-				fmt.Printf("  %d. %s\n", i+1, url)
+			} else {
+				fmt.Println("No subscriptions in any group")
 			}
 			return
 		}
-
-		// All groups
-		found := false
-		for _, gName := range mgr.ListGroups() {
-			g, _ := mgr.GetGroup(gName)
-			if g == nil || len(g.Subscriptions) == 0 {
-				continue
+		fmt.Printf("%-3s %-16s %-6s %-20s %s\n", "#", "GROUP", "LINKS", "REFRESHED", "URL")
+		for i, sub := range list {
+			refreshed := sub.LastRefresh
+			if refreshed == "" {
+				refreshed = "never"
 			}
-			found = true
-			fmt.Printf("━━ %s (%d) ━━\n", gName, len(g.Subscriptions))
-			for i, url := range g.Subscriptions {
-				fmt.Printf("  %d. %s\n", i+1, url)
+			if len(refreshed) > 19 {
+				refreshed = refreshed[:19]
 			}
-			fmt.Println()
-		}
-		if !found {
-			fmt.Println("No subscriptions in any group")
-		}
-
-	case "dedupe":
-		n, err := mgr.DedupeSubscriptions()
-		if err != nil {
-			fmt.Printf("❌ %v\n", err)
-			os.Exit(1)
-		}
-		if n == 0 {
-			fmt.Println("✅ No duplicate subscriptions")
-		} else {
-			fmt.Printf("✅ Removed %d duplicate subscription entry(ies)\n", n)
+			fmt.Printf("%-3d %-16s %-6d %-20s %s\n", i+1, sub.Group, sub.LinkCount, refreshed, sub.RedactedURL)
+			if sub.LastError != "" {
+				fmt.Printf("    ⚠️  %s\n", sub.LastError)
+			}
 		}
 
 	default:
-		fmt.Printf("Unknown sub command: %s\n", subCmd)
+		fmt.Printf("Unknown sub command: %s\n\n", subCmd)
+		printSubUsage()
 		os.Exit(1)
 	}
+}
+
+func printSubUsage() {
+	fmt.Println("Usage:")
+	fmt.Println("  bypath sub add [-g group] <url>     Add a subscription URL")
+	fmt.Println("  bypath sub preview <url|file>       Fetch/parse and show contents without storing")
+	fmt.Println("  bypath sub update [-g group]        Fetch latest links")
+	fmt.Println("  bypath sub import [-g group] <file> Import links from a local dump (plain/base64)")
+	fmt.Println("  bypath sub list [-g group]          Show subscriptions (URLs are redacted)")
+	fmt.Println("  bypath sub remove [-g group] <#>    Remove a subscription by index")
+	fmt.Println("  bypath sub dedupe                   Remove duplicate subscription URLs")
+}
+
+// subGroupFlag extracts -g/--group and returns the remaining positional args.
+func subGroupFlag(args []string) (string, []string) {
+	group := ""
+	rest := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-g", "--group":
+			if i+1 < len(args) {
+				group = args[i+1]
+				i++
+			}
+		default:
+			rest = append(rest, args[i])
+		}
+	}
+	return group, rest
+}
+
+func lastArg(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	return args[len(args)-1]
+}
+
+func filterSubscriptions(list []app.Subscription, group string) []app.Subscription {
+	if group == "" {
+		return list
+	}
+	var out []app.Subscription
+	for _, sub := range list {
+		if sub.Group == group {
+			out = append(out, sub)
+		}
+	}
+	return out
+}
+
+func printSubscriptionPreview(p app.SubscriptionPreview) {
+	source := p.RedactedURL
+	if p.Group != "" && p.Group != "imported" {
+		source += "  (group: " + p.Group + ")"
+	}
+	fmt.Printf("Preview of %s\n", source)
+	fmt.Printf("  links: %d   duplicates already stored: %d\n", p.Total, p.Duplicates)
+	if len(p.Links) == 0 {
+		fmt.Println("  (no new links to import)")
+		return
+	}
+	fmt.Println()
+	fmt.Printf("  %-3s %-7s %-24s %-6s %s\n", "#", "PROTO", "ADDRESS", "PORT", "REMARK")
+	limit := len(p.Links)
+	if limit > 20 {
+		limit = 20
+	}
+	for i := 0; i < limit; i++ {
+		l := p.Links[i]
+		flags := make([]string, 0, 4)
+		if l.TLS {
+			flags = append(flags, "tls")
+		}
+		if l.Reality {
+			flags = append(flags, "reality")
+		}
+		if l.EncryptedVLESS {
+			flags = append(flags, "encrypted")
+		}
+		if l.CDN {
+			flags = append(flags, "cdn")
+		}
+		remark := l.Remark
+		if len(flags) > 0 {
+			remark += " [" + strings.Join(flags, ",") + "]"
+		}
+		fmt.Printf("  %-3d %-7s %-24s %-6d %s\n", i+1, l.Protocol, l.Address, l.Port, remark)
+	}
+	if limit < len(p.Links) {
+		fmt.Printf("  … %d more link(s) not shown\n", len(p.Links)-limit)
+	}
+}
+
+// readSubscriptionFile bounds how much a dump can pull into memory.
+func readSubscriptionFile(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("%s is a directory", path)
+	}
+	const maxDump = 8 << 20
+	if info.Size() > maxDump {
+		return "", fmt.Errorf("file is larger than %d MiB", maxDump>>20)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }

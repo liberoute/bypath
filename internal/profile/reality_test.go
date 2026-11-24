@@ -191,7 +191,6 @@ func TestProperty_RealityParameterRoundTrip(t *testing.T) {
 	})
 }
 
-
 // Unit test for legacy JSON deserialization (backward compatibility)
 // Validates: Requirements 5.2
 

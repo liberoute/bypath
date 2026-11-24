@@ -1,86 +1,33 @@
-# Integration test: simulates a clean OS install.
-# Builds both lite and full from source, installs all runtime deps,
-# then runs full E2E: sub add → update → list → select → run → verify tunnel.
+# Clean-container smoke test.
 #
-# Usage:
+# Builds both variants from source, installs them into a minimal image with no
+# configuration, and checks that the pinned-install contract holds: the binary
+# runs, the wizard produces a neutral configuration, and `bypath doctor` gives
+# a truthful read-only report without a provider or a connection.
+#
 #   docker build -f test/integration/Dockerfile.test -t bypath-test .
-#   docker run --rm --cap-add=NET_ADMIN bypath-test
-#
-# With custom subscription:
-#   docker run --rm --cap-add=NET_ADMIN -e TEST_SUB_URL="https://..." bypath-test
-
-FROM golang:1.26-alpine AS base
+#   docker run --rm bypath-test
+FROM golang:1.26-alpine AS build
 
 RUN apk add --no-cache git
-
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 
-# --- Lite Build ---
-FROM base AS build-lite
-RUN CGO_ENABLED=0 GOOS=linux go build \
-    -ldflags="-s -w -X github.com/liberoute/bypath/internal/build.Version=2.6.0-test" \
-    -o /bypath-lite ./cmd/bypath
+RUN CGO_ENABLED=0 go build -o /out/bypath-lite ./cmd/bypath
+RUN CGO_ENABLED=0 go build -tags "full with_utls" -o /out/bypath-full ./cmd/bypath
 
-# --- Full Build ---
-FROM base AS build-full
-RUN CGO_ENABLED=0 GOOS=linux go build \
-    -tags full \
-    -ldflags="-s -w -X github.com/liberoute/bypath/internal/build.Version=2.6.0-test" \
-    -o /bypath-full ./cmd/bypath
-
-# --- Clean OS (simulates fresh Alpine install) ---
 FROM alpine:3.20
 
-# Only install what a real user would need
-RUN apk add --no-cache \
-    bash \
-    curl \
-    jq \
-    unzip \
-    iptables \
-    iproute2 \
-    ca-certificates
-
-# Install sing-box (like a user would)
-RUN ARCH=$(uname -m) && \
-    case "$ARCH" in \
-        x86_64) SB_ARCH="amd64" ;; \
-        aarch64) SB_ARCH="arm64" ;; \
-        armv7l) SB_ARCH="armv7" ;; \
-        *) SB_ARCH="amd64" ;; \
-    esac && \
-    wget -qO /tmp/sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v1.13.12/sing-box-1.13.12-linux-${SB_ARCH}.tar.gz" && \
-    tar -xzf /tmp/sing-box.tar.gz -C /tmp && \
-    mv /tmp/sing-box-*/sing-box /usr/local/bin/sing-box && \
-    chmod +x /usr/local/bin/sing-box && \
-    rm -rf /tmp/sing-box*
-
-# Install tun2socks (like a user would)
-RUN ARCH=$(uname -m) && \
-    case "$ARCH" in \
-        x86_64) T2S_ARCH="amd64" ;; \
-        aarch64) T2S_ARCH="arm64" ;; \
-        armv7l) T2S_ARCH="armv7" ;; \
-        *) T2S_ARCH="amd64" ;; \
-    esac && \
-    wget -qO /tmp/tun2socks.zip "https://github.com/xjasonlyu/tun2socks/releases/download/v2.5.2/tun2socks-linux-${T2S_ARCH}.zip" && \
-    unzip -o /tmp/tun2socks.zip -d /tmp/tun2socks && \
-    mv /tmp/tun2socks/tun2socks-linux-${T2S_ARCH} /usr/local/bin/tun2socks && \
-    chmod +x /usr/local/bin/tun2socks && \
-    rm -rf /tmp/tun2socks*
-
-# Drop in the bypath binaries (simulates user downloading release)
-COPY --from=build-lite /bypath-lite /usr/local/bin/bypath-lite
-COPY --from=build-full /bypath-full /usr/local/bin/bypath-full
-
-# Copy test script
+RUN apk add --no-cache bash ca-certificates
+COPY --from=build /out/bypath-lite /opt/bypath/bypath
+COPY --from=build /out/bypath-full /opt/bypath/bypath-full
 COPY test/integration/run-tests.sh /run-tests.sh
+COPY test/integration/installer-tests.sh /installer-tests.sh
+COPY install.sh /install.sh
 RUN chmod +x /run-tests.sh
 
-# No pre-existing config or data — clean slate
+# No configuration, no profiles, no geo data: a genuinely clean host.
 WORKDIR /tmp
-
 ENTRYPOINT ["/run-tests.sh"]

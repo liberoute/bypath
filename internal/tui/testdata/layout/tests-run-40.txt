@@ -1,0 +1,17 @@
+BYPATH [FULL]  CONNECTED  pid 4242      
+ 3/12 Tests                             
+                                        
+ Tests ·  Run  Results  Compare    t cyc
+ Kind   relay and latency   K to switch 
+ Scope  all   s cycles · g group · l lin
+ Hidden no   i toggles                  
+                                        
+ No job yet. Enter starts a measurement;
+ relay results carry L1+L2 evidence, and
+ a measured (not necessarily verified)  
+ HTTPS result is enough for a bounded   
+ speed run.                             
+ t run/results/compare  K kind  s scope 
+ g group  l link  i hidden              
+ enter start/evidence  c cancel         
+ r reload  ↑/↓ move                     

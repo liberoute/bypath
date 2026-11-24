@@ -16,6 +16,9 @@ import (
 	"github.com/sagernet/sing-box/option"
 	singJSON "github.com/sagernet/sing/common/json"
 
+	"github.com/liberoute/bypath/internal/geo"
+	"github.com/liberoute/bypath/internal/paths"
+
 	xray "github.com/xtls/xray-core/core"
 	_ "github.com/xtls/xray-core/main/distro/all"
 )
@@ -52,6 +55,23 @@ func GetEmbedded(name string) (EmbeddedFactory, bool) {
 
 // --- Embedded sing-box ---
 
+// singBoxContext builds a cancellable context carrying the sing-box registries.
+// include.Context writes package-level hooks (for example the naive HTTP/3
+// listener) on every call, so two concurrent Starts race; benchmark rows start
+// embedded engines in parallel. The registries are immutable once built, so
+// initialize them exactly once and derive each instance from that base.
+var (
+	singBoxBaseOnce sync.Once
+	singBoxBaseCtx  context.Context
+)
+
+func singBoxContext() (context.Context, context.CancelFunc) {
+	singBoxBaseOnce.Do(func() {
+		singBoxBaseCtx = include.Context(context.Background())
+	})
+	return context.WithCancel(singBoxBaseCtx)
+}
+
 type embeddedSingBox struct {
 	configFile string
 	instance   *box.Box
@@ -78,8 +98,7 @@ func (e *embeddedSingBox) Start() error {
 	// registry and populate the Options field. Using encoding/json.Unmarshal
 	// without context leaves Options=nil (it has json:"-"), causing
 	// "initialize DNS server[0]: invalid server address: :53".
-	ctx, cancel := context.WithCancel(context.Background())
-	ctx = include.Context(ctx)
+	ctx, cancel := singBoxContext()
 
 	var opts option.Options
 	if err := singJSON.UnmarshalContext(ctx, data, &opts); err != nil {
@@ -144,6 +163,14 @@ func (e *embeddedXray) Start() error {
 	data, err := os.ReadFile(e.configFile)
 	if err != nil {
 		return err
+	}
+	// Embedded xray would otherwise look for geoip.dat/geosite.dat next to the
+	// bypath executable. Point it at the provisioned directory so geoip: rules
+	// resolve instead of failing instance startup. An operator-set value wins.
+	if os.Getenv("xray.location.asset") == "" {
+		if dir := geo.FindXrayAssetDir(paths.Get().EngineDir, paths.Get().GeoDir); dir != "" {
+			_ = os.Setenv("xray.location.asset", dir)
+		}
 	}
 	instance, err := xray.StartInstance("json", data)
 	if err != nil {

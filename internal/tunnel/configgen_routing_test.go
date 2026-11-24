@@ -126,6 +126,9 @@ func TestSingbox_NoWhitelist_NoGeoipRules(t *testing.T) {
 // country gets a geoip-{country} rule that routes to "direct".
 func TestSingbox_WhitelistCountry_GeoipRuleRoutesDirect(t *testing.T) {
 	countries := []string{"aa", "bb", "cc"} // arbitrary country codes
+	for _, c := range countries {
+		writeValidGeoRuleSet(t, "geoip", c)
+	}
 
 	tmpDir := t.TempDir()
 	cg := NewConfigGenerator(tmpDir)
@@ -167,6 +170,7 @@ func TestSingbox_BypassDomains_GoToDirectBeforeGeoip(t *testing.T) {
 	cg := NewConfigGenerator(tmpDir)
 	cg.WhitelistCountries = []string{"xx"}
 	cg.BypassDomains = []string{"bypass-me.example.com", "also-bypass.example.org"}
+	writeValidGeoRuleSet(t, "geoip", "xx")
 
 	configFile, err := cg.generateSingBox(testVlessLink())
 	if err != nil {
@@ -286,8 +290,8 @@ func TestXray_IPIfNonMatch_domainStrategy(t *testing.T) {
 	}
 
 	routing := loadJSON(t, configFile)["routing"].(map[string]interface{})
-	// IPIfNonMatch: xray resolves domains via dns2socks (tunnel) so geoip:ir fires
-	// for Iranian domains in proxy mode (socks5h://) — samandehi.ir goes direct. ✓
+	// IPIfNonMatch: xray resolves domains via dns2socks (tunnel) so geoip:de fires
+	// for Iranian domains in proxy mode (socks5h://) — example.net goes direct. ✓
 	if routing["domainStrategy"] != "IPIfNonMatch" {
 		t.Errorf("domainStrategy = %v, want IPIfNonMatch", routing["domainStrategy"])
 	}
@@ -297,6 +301,7 @@ func TestXray_IPIfNonMatch_domainStrategy(t *testing.T) {
 // get geoip:{country} rules that route to "direct".
 func TestXray_WhitelistCountry_GeoipRuleRoutesDirect(t *testing.T) {
 	countries := []string{"aa", "bb"}
+	writeXrayGeoDat(t, "geoip.dat", []string{"AA", "BB"})
 
 	tmpDir := t.TempDir()
 	cg := NewConfigGenerator(tmpDir)
@@ -385,7 +390,9 @@ func TestXray_BypassDomains_RoutedDirect(t *testing.T) {
 				continue
 			}
 			for _, d := range domains {
-				if d == want {
+				// A bare xray entry is a keyword substring, so a look-alike
+				// host would match; the generator emits the label boundary.
+				if d == "domain:"+want {
 					found = true
 					if r["outboundTag"] != "direct" {
 						t.Errorf("bypass domain %q outboundTag = %v, want direct", want, r["outboundTag"])
@@ -405,6 +412,7 @@ func TestXray_BypassBeforeGeoip(t *testing.T) {
 	cg := NewConfigGenerator(tmpDir)
 	cg.WhitelistCountries = []string{"xx"}
 	cg.BypassDomains = []string{"bypass.example.com"}
+	writeXrayGeoDat(t, "geoip.dat", []string{"XX"})
 
 	eng := &engine.Engine{Name: "xray"}
 	configFile, err := cg.Generate(eng, testVlessLink())
@@ -417,7 +425,7 @@ func TestXray_BypassBeforeGeoip(t *testing.T) {
 	for i, r := range rules {
 		if domains, ok := r["domain"].([]interface{}); ok && r["outboundTag"] == "direct" {
 			for _, d := range domains {
-				if d == "bypass.example.com" {
+				if d == "domain:bypass.example.com" {
 					bypassIdx = i
 				}
 			}

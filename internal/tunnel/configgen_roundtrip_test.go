@@ -204,20 +204,16 @@ func TestRoundTrip_GatewayMode_AllProtocols(t *testing.T) {
 				t.Error("expected a DNS server with tag \"dns-direct\"")
 			}
 
-			// Verify DNS inbound exists (Req 2.5) - sing-box 1.12+ uses separate inbound
-			hasDNSInbound := false
+			// bypath's own resolver owns port 53 for every engine, so the
+			// engine config must contain no DNS inbound.
 			for _, ibRaw := range inboundsArr {
 				ib, ok := ibRaw.(map[string]interface{})
 				if !ok {
 					continue
 				}
-				if ib["tag"] == "dns-in" {
-					hasDNSInbound = true
-					break
+				if ib["tag"] == "dns-in" || ib["type"] == "direct" {
+					t.Error("engine config must not bind a DNS inbound: bypath owns port 53")
 				}
-			}
-			if !hasDNSInbound {
-				t.Error("expected dns-in inbound in gateway mode")
 			}
 
 			// --- Verify outbound has correct protocol type ---

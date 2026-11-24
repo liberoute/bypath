@@ -1,51 +1,29 @@
 package tunnel
 
 import (
-	"fmt"
 	"testing"
 
 	"github.com/liberoute/bypath/internal/profile"
 )
 
-// buildSSHArgs replicates the SSH command argument construction logic from startSSHTunnel
-// for testability. This mirrors the logic in tunnel.go without starting a process.
-func buildSSHArgs(link *profile.Link, listenPort int) (binary string, args []string) {
-	sshPort := link.Port
-	if sshPort == 0 {
-		sshPort = 22
+// sshFor builds the production SSH child command with test defaults.
+func sshFor(t *testing.T, link *profile.Link, tune func(*SSHOptions)) SSHCommand {
+	t.Helper()
+	opts := SSHOptions{
+		SSHPath:     "/usr/bin/ssh",
+		SSHPassPath: "/usr/bin/sshpass",
+		ListenAddr:  "127.0.0.1",
+		ListenPort:  10800,
+		KnownHosts:  "/etc/bypath/ssh_known_hosts",
 	}
-
-	sshUser := link.SSHUser
-	if sshUser == "" {
-		sshUser = "root"
+	if tune != nil {
+		tune(&opts)
 	}
-
-	baseArgs := []string{
-		fmt.Sprintf("-D 0.0.0.0:%d", listenPort),
-		"-N",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "ServerAliveInterval=30",
-		"-o", "ServerAliveCountMax=3",
+	cmd, err := BuildSSHCommand(link, opts)
+	if err != nil {
+		t.Fatalf("BuildSSHCommand: %v", err)
 	}
-
-	if link.SSHKeyPath != "" {
-		baseArgs = append(baseArgs, "-i", link.SSHKeyPath)
-	}
-
-	baseArgs = append(baseArgs, "-p", fmt.Sprintf("%d", sshPort))
-	baseArgs = append(baseArgs, fmt.Sprintf("%s@%s", sshUser, link.Address))
-
-	// Password-based auth: prepend sshpass args
-	if link.SSHKeyPath == "" && link.SSHPassword != "" {
-		binary = "sshpass"
-		args = append([]string{"-p", link.SSHPassword, "ssh"}, baseArgs...)
-	} else {
-		binary = "ssh"
-		args = baseArgs
-	}
-
-	return binary, args
+	return cmd
 }
 
 func TestSSHCommandConstruction_KeyBased(t *testing.T) {
@@ -57,24 +35,25 @@ func TestSSHCommandConstruction_KeyBased(t *testing.T) {
 		SSHKeyPath: "/etc/bypath/keys/id_rsa",
 	}
 
-	listenPort := 10800
-	binary, args := buildSSHArgs(link, listenPort)
+	cmd := sshFor(t, link, nil)
 
-	// Binary should be ssh (not sshpass) for key-based auth
-	if binary != "ssh" {
-		t.Errorf("binary: got %q, want %q", binary, "ssh")
+	if cmd.Binary != "/usr/bin/ssh" {
+		t.Errorf("binary: got %q, want %q", cmd.Binary, "/usr/bin/ssh")
 	}
 
-	// Verify expected args are present
-	assertContains(t, args, "-D 0.0.0.0:10800")
-	assertContains(t, args, "-N")
-	assertContainsSequence(t, args, "-o", "StrictHostKeyChecking=no")
-	assertContainsSequence(t, args, "-o", "UserKnownHostsFile=/dev/null")
-	assertContainsSequence(t, args, "-o", "ServerAliveInterval=30")
-	assertContainsSequence(t, args, "-o", "ServerAliveCountMax=3")
-	assertContainsSequence(t, args, "-i", "/etc/bypath/keys/id_rsa")
-	assertContainsSequence(t, args, "-p", "2222")
-	assertContains(t, args, "deploy@relay.example.com")
+	assertContainsSequence(t, cmd.Args, "-D", "127.0.0.1:10800")
+	assertContains(t, cmd.Args, "-N")
+	assertContainsSequence(t, cmd.Args, "-o", "StrictHostKeyChecking=accept-new")
+	assertContainsSequence(t, cmd.Args, "-o", "UserKnownHostsFile=/etc/bypath/ssh_known_hosts")
+	assertContainsSequence(t, cmd.Args, "-o", "ServerAliveInterval=30")
+	assertContainsSequence(t, cmd.Args, "-o", "ServerAliveCountMax=3")
+	assertContainsSequence(t, cmd.Args, "-o", "ForwardAgent=no")
+	assertContainsSequence(t, cmd.Args, "-i", "/etc/bypath/keys/id_rsa")
+	assertContainsSequence(t, cmd.Args, "-o", "IdentitiesOnly=yes")
+	assertContainsSequence(t, cmd.Args, "-p", "2222")
+	assertContains(t, cmd.Args, "deploy@relay.example.com")
+	assertNotContains(t, cmd.Args, "IdentityFile=none")
+	assertNotContains(t, cmd.Args, "PubkeyAuthentication=no")
 }
 
 func TestSSHCommandConstruction_PasswordBased(t *testing.T) {
@@ -86,64 +65,111 @@ func TestSSHCommandConstruction_PasswordBased(t *testing.T) {
 		SSHPassword: "hunter2",
 	}
 
-	listenPort := 10801
-	binary, args := buildSSHArgs(link, listenPort)
+	cmd := sshFor(t, link, func(o *SSHOptions) { o.ListenPort = 10801 })
 
-	// Binary should be sshpass for password-based auth
-	if binary != "sshpass" {
-		t.Errorf("binary: got %q, want %q", binary, "sshpass")
+	if cmd.Binary != "/usr/bin/sshpass" {
+		t.Errorf("binary: got %q, want %q", cmd.Binary, "/usr/bin/sshpass")
 	}
 
-	// sshpass args come first: -p <password> ssh ...
-	if len(args) < 3 {
-		t.Fatalf("expected at least 3 args, got %d", len(args))
+	// sshpass reads the secret from the environment so it does not appear in
+	// argv (visible to every local user through ps).
+	if len(cmd.Args) < 3 {
+		t.Fatalf("expected at least 3 args, got %d", len(cmd.Args))
 	}
-	if args[0] != "-p" {
-		t.Errorf("args[0]: got %q, want %q", args[0], "-p")
+	if cmd.Args[0] != "-e" || cmd.Args[1] != "/usr/bin/ssh" {
+		t.Fatalf("sshpass prefix = %v, want [-e /usr/bin/ssh ...]", cmd.Args[:2])
 	}
-	if args[1] != "hunter2" {
-		t.Errorf("args[1]: got %q, want %q", args[1], "hunter2")
+	if len(cmd.Env) != 1 || cmd.Env[0] != "SSHPASS=hunter2" {
+		t.Fatalf("sshpass env = %v, want [SSHPASS=hunter2]", cmd.Env)
 	}
-	if args[2] != "ssh" {
-		t.Errorf("args[2]: got %q, want %q", args[2], "ssh")
+	for _, a := range cmd.Args {
+		if a == "hunter2" {
+			t.Fatal("password leaked into argv")
+		}
 	}
 
-	// Verify SSH-specific args are present after sshpass prefix
-	assertContains(t, args, "-D 0.0.0.0:10801")
-	assertContains(t, args, "-N")
-	assertContainsSequence(t, args, "-o", "StrictHostKeyChecking=no")
-	assertContainsSequence(t, args, "-o", "UserKnownHostsFile=/dev/null")
-	assertContainsSequence(t, args, "-p", "22")
-	assertContains(t, args, "admin@10.0.0.1")
+	assertContainsSequence(t, cmd.Args, "-D", "127.0.0.1:10801")
+	assertContains(t, cmd.Args, "-N")
+	assertContainsSequence(t, cmd.Args, "-o", "StrictHostKeyChecking=accept-new")
+	assertContainsSequence(t, cmd.Args, "-o", "UserKnownHostsFile=/etc/bypath/ssh_known_hosts")
+	assertContainsSequence(t, cmd.Args, "-p", "22")
+	assertContains(t, cmd.Args, "admin@10.0.0.1")
 
-	// Key flag should NOT be present for password-based auth
-	assertNotContains(t, args, "-i")
+	// A password link must not offer root's keys or agent identities.
+	assertContainsSequence(t, cmd.Args, "-o", "IdentitiesOnly=yes")
+	assertContainsSequence(t, cmd.Args, "-o", "IdentityFile=none")
+	assertContainsSequence(t, cmd.Args, "-o", "IdentityAgent=none")
+	assertContainsSequence(t, cmd.Args, "-o", "PubkeyAuthentication=no")
+	assertContainsSequence(t, cmd.Args, "-o", "PreferredAuthentications=password,keyboard-interactive")
+	assertNotContains(t, cmd.Args, "-i")
 }
 
 func TestSSHCommandConstruction_DefaultPortAndUser(t *testing.T) {
 	link := &profile.Link{
 		Protocol:   "ssh",
 		Address:    "host.example.com",
-		Port:       0, // should default to 22
+		Port:       0,  // should default to 22
 		SSHUser:    "", // should default to "root"
 		SSHKeyPath: "/keys/default_key",
 	}
 
-	listenPort := 2801
-	binary, args := buildSSHArgs(link, listenPort)
+	cmd := sshFor(t, link, func(o *SSHOptions) { o.ListenPort = 2801 })
 
-	if binary != "ssh" {
-		t.Errorf("binary: got %q, want %q", binary, "ssh")
+	if cmd.Binary != "/usr/bin/ssh" {
+		t.Errorf("binary: got %q, want %q", cmd.Binary, "/usr/bin/ssh")
 	}
+	assertContainsSequence(t, cmd.Args, "-p", "22")
+	assertContains(t, cmd.Args, "root@host.example.com")
+	assertContainsSequence(t, cmd.Args, "-D", "127.0.0.1:2801")
+}
 
-	// Port defaults to 22
-	assertContainsSequence(t, args, "-p", "22")
+// TestSSHCommandHostKeyPolicy proves that only an explicit "off" disables
+// verification; the default pins the key and "strict" rejects unknown hosts.
+func TestSSHCommandHostKeyPolicy(t *testing.T) {
+	link := &profile.Link{Protocol: "ssh", Address: "h", SSHKeyPath: "/k"}
+	cases := map[string]string{
+		"":           "accept-new",
+		"accept-new": "accept-new",
+		"strict":     "yes",
+		"off":        "no",
+	}
+	for policy, want := range cases {
+		cmd := sshFor(t, link, func(o *SSHOptions) { o.HostKey = policy })
+		assertContainsSequence(t, cmd.Args, "-o", "StrictHostKeyChecking="+want)
+	}
+}
 
-	// User defaults to root
-	assertContains(t, args, "root@host.example.com")
+// TestSSHCommandLANListener covers the explicit LAN opt-in: the same builder
+// must emit the configured bind address instead of silently forcing loopback.
+func TestSSHCommandLANListener(t *testing.T) {
+	link := &profile.Link{Protocol: "ssh", Address: "h", SSHKeyPath: "/k"}
+	cmd := sshFor(t, link, func(o *SSHOptions) { o.ListenAddr = "0.0.0.0" })
+	assertContainsSequence(t, cmd.Args, "-D", "0.0.0.0:10800")
+}
 
-	// Listen port is correct
-	assertContains(t, args, "-D 0.0.0.0:2801")
+// TestSSHCommandNoCredentials proves a link without a key or password is
+// refused: authenticating it would mean offering the daemon's own identities.
+func TestSSHCommandNoCredentials(t *testing.T) {
+	link := &profile.Link{Protocol: "ssh", Address: "h"}
+	if _, err := BuildSSHCommand(link, SSHOptions{SSHPath: "/usr/bin/ssh", ListenPort: 10800}); err == nil {
+		t.Fatal("a credential-less SSH link was accepted")
+	}
+}
+
+func TestSSHCommandRejectsBadInput(t *testing.T) {
+	link := &profile.Link{Protocol: "ssh", Address: "h", SSHPassword: "x"}
+	if _, err := BuildSSHCommand(link, SSHOptions{SSHPath: "/usr/bin/ssh", ListenPort: 10800}); err == nil {
+		t.Fatal("password link without sshpass was accepted")
+	}
+	if _, err := BuildSSHCommand(link, SSHOptions{SSHPath: "/usr/bin/ssh", SSHPassPath: "/usr/bin/sshpass", ListenAddr: "relay.example.com", ListenPort: 10800}); err == nil {
+		t.Fatal("hostname listen address was accepted")
+	}
+	if _, err := BuildSSHCommand(link, SSHOptions{SSHPath: "/usr/bin/ssh", SSHPassPath: "/usr/bin/sshpass", ListenPort: 0}); err == nil {
+		t.Fatal("port 0 was accepted")
+	}
+	if _, err := BuildSSHCommand(nil, SSHOptions{SSHPath: "/usr/bin/ssh"}); err == nil {
+		t.Fatal("nil link was accepted")
+	}
 }
 
 // --- Test helpers ---

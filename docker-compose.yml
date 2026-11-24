@@ -4,7 +4,7 @@ services:
       context: .
       args:
         VARIANT: lite
-        VERSION: "2.1.0"
+        VERSION: "3.0.0"
     container_name: bypath
     restart: unless-stopped
     cap_add:
@@ -16,7 +16,11 @@ services:
       - ./data:/app/data
       - ./engines:/app/engines
       - ./logs:/app/logs
+      # The proxy guard record must be the same for every process that manages
+      # this host firewall; without it a second host-network container cannot
+      # prove whose BYPATH_PROXY_IN chain it sees.
+      - /var/lib/bypath:/var/lib/bypath
     environment:
-      - TZ=Asia/Tehran
+      - TZ=UTC
     sysctls:
       - net.ipv4.ip_forward=1

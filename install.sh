@@ -1,837 +1,756 @@
 #!/usr/bin/env bash
 # ============================================================
-# Bypath Installer
-# Interactive installer for Bypath network gateway.
+# Bypath installer
 #
-# Usage:
-#   ./install.sh                                    # Interactive (latest, lite)
-#   ./install.sh v2.3.0                             # Specific version, lite
-#   ./install.sh v2.3.0 full                        # Specific version, full
-#   ./install.sh latest full                        # Latest version, full
-#   ./install.sh latest lite socks5://1.2.3.4:1080  # Use proxy for downloads
+# Installs one version-pinned Bypath release, verifies its checksum, creates
+# the systemd unit, and hands over to the interactive first-run wizard.
 #
-# Environment variables:
-#   BYPATH_INSTALL_DIR   Override install directory (default: /opt/bypath)
-#   BYPATH_NO_SYSTEMD    Set to 1 to skip systemd service creation
+# The installer never changes routes, DNS, DHCP, firewall rules or any other
+# network setting. It never stops systemd-resolved, dnsmasq, NetworkManager or
+# a VPN that is already running. Configuration is written only by `bypath
+# setup`, and only when no configuration exists yet.
+#
+# Usage (download and verify the pinned installer first; see INSTALL.md):
+#   sudo ./install.sh --version v3.0.0                 # full build
+#   sudo ./install.sh --version v3.0.0 --variant lite  # explicit lite build
+#   sudo ./install.sh --dry-run
+#   sudo ./install.sh --version v3.0.0 --non-interactive --mode proxy
+#   sudo ./install.sh --version v3.0.0 --non-interactive --mode gateway \
+#        --interface eth0 --install-packages   # approve apt for gateway packages
+#   sudo ./install.sh --uninstall            # keep configuration and data
+#   sudo ./install.sh --uninstall --purge    # also remove configuration and data
+#   sudo ./install.sh --rollback             # restore the previous binary
+#
+# Exit codes: 0 success, 1 refused/failed, 2 usage error.
 # ============================================================
 
-set -euo pipefail
-
-# ─── Interactive mode detection ──────────────────────────────
-# Reliable check: stdin is a real TTY, OR /dev/tty is usable.
-# Avoid [ -e /dev/tty ] alone — the file may exist but be inaccessible
-# (e.g. inside containers or when piped from curl over SSH).
-IS_INTERACTIVE=0
-if [ -t 0 ]; then
-    IS_INTERACTIVE=1
-elif (exec 0</dev/tty) 2>/dev/null; then
-    IS_INTERACTIVE=1
-fi
+set -Eeuo pipefail
 
 # ─── Constants ───────────────────────────────────────────────
 REPO="liberoute/bypath"
-GITHUB_API="https://api.github.com/repos/${REPO}/releases"
-GITHUB_DL="https://github.com/${REPO}/releases/download"
-INSTALL_DIR="${BYPATH_INSTALL_DIR:-/opt/bypath}"
-BINARY_NAME="bypath"
-GEOIP_URL="https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geoip-ir.srs"
-PROXY_ENV=""  # Will be set if --proxy argument is provided
+DEFAULT_VERSION="v3.0.0"
+# Release assets are named bypath-<variant>-linux-<arch> and listed in SHA256SUMS
+# (the release workflow produces exactly these names; see release-assets there).
+# The full build is the default. Architectures without a published full build
+# (LITE_ONLY_ARCHES) are refused unless --variant lite is passed explicitly.
+FULL_ARCHES="amd64 arm64"
+LITE_ONLY_ARCHES=""
+# Built for this release but not installed by this script (download and verify by
+# hand from SHA256SUMS): linux arm (armv7) full and lite, linux mipsle lite.
+MANUAL_ONLY_ARCHES="arm mipsle"
+INSTALL_DIR="/opt/bypath"
+BIN_LINK="/usr/local/bin/bypath"
+CONFIG_DIR="/etc/bypath"
+CONFIG_FILE="${CONFIG_DIR}/config.yaml"
+LOG_DIR="/var/log/bypath"
+RUN_DIR="/run/bypath"
+CONTROL_DIR="/run/bypath-control"
+UNIT_FILE="/etc/systemd/system/bypath.service"
+MIN_DISK_MB=100
+MIN_MEM_MB=128
 
-# ─── Colors ──────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+VERSION="$DEFAULT_VERSION"
+VARIANT="full"
+DRY_RUN=0
+NONINTERACTIVE=0
+ALLOW_UNSUPPORTED=0
+NO_SYSTEMD=0
+NO_SETUP=0
+ASSUME_YES=0
+INSTALL_PACKAGES=0
+LOCAL_BINARY=""
+LOCAL_SHA256=""
+PROXY_URL=""
+ACTION="install"
+PURGE=0
+SETUP_ARGS=()
+
+TMP_DIR=""
+WORK_DIR=""
+STAGED_BIN=""
+
+# ─── Output ──────────────────────────────────────────────────
+if [ -t 1 ]; then
+    RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
+    BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; NC=$'\033[0m'
+else
+    RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; BOLD=""; NC=""
+fi
+info() { printf '%s\n' "${BLUE}i${NC} $*"; }
+ok()   { printf '%s\n' "${GREEN}ok${NC} $*"; }
+warn() { printf '%s\n' "${YELLOW}!${NC} $*" >&2; }
+err()  { printf '%s\n' "${RED}x${NC} $*" >&2; }
+die()  { err "$*"; exit 1; }
+usage_die() { err "$*"; exit 2; }
+section() { printf '\n%s\n' "${BOLD}$*${NC}"; }
+
+cleanup() {
+    local status=$?
+    if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then rm -rf "$TMP_DIR"; fi
+    if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then rm -rf "$WORK_DIR"; fi
+    if [ -n "$STAGED_BIN" ] && [ -e "$STAGED_BIN" ]; then rm -f "$STAGED_BIN"; fi
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'err "interrupted; the binary is installed atomically, but configuration may be incomplete. Re-run the installer or \"sudo bypath setup\" to finish."; exit 130' INT TERM
+
+# ─── Arguments ───────────────────────────────────────────────
+usage() {
+    cat <<'EOF'
+Bypath installer — one pinned release, verified, no network changes.
+
+  --version VERSION        Release tag to install (default v3.0.0)
+  --variant full|lite      Build to install (default full; lite is explicit)
+  --dry-run                Report the host and the plan; change nothing
+  --non-interactive        Never prompt; pass answers as flags
+  --allow-unsupported      Continue on a platform outside the tested matrix
+  --no-systemd             Install the binary only, no service unit
+  --no-setup               Skip the first-run wizard
+  --local-binary PATH      Use an already-downloaded binary
+  --local-sha256 HEX       Expected SHA-256 for --local-binary
+  --proxy URL              Use this proxy for downloads
+  --yes                    Do not ask for confirmation on uninstall/purge
+  --uninstall              Remove the binary and unit; keep config and data
+  --purge                  With --uninstall: also remove config, data, logs
+  --rollback               Restore the binary saved by the previous install
+  -h, --help               Show this help
+
+First-run answers (passed to `bypath setup`):
+  --mode proxy|gateway     --interface NAME      --trusted-cidr CIDR
+  --socks-port N           --listen localhost|lan|all
+  --listen-ip ADDR         --dns-port N          --dns-upstream ADDR
+  --web off|loopback|lan   --web-port N          --uri URI
+  --subscription URL       --group NAME          --select NAME
+  --start-service          start now and verify the first connection
+  --enable-service         also enable the unit at boot (verified start first)
+  --enable-gateway         carry the LAN after a verified start
+  --install-packages       let the wizard apt-get install missing gateway
+                           packages (iproute2, iptables); never implied
+
+  Starting, enabling and gateway mode are three different things:
+    --start-service   runs the service until the next reboot
+    --enable-service  also starts it automatically at boot
+    --enable-gateway  routes the LAN through the tunnel (after verification)
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --version)          [ $# -ge 2 ] || usage_die "--version needs a value"; VERSION="$2"; shift 2 ;;
+        --variant)          [ $# -ge 2 ] || usage_die "--variant needs full or lite"; VARIANT="$2"; shift 2 ;;
+        --dry-run)          DRY_RUN=1; shift ;;
+        --non-interactive)  NONINTERACTIVE=1; shift ;;
+        --allow-unsupported) ALLOW_UNSUPPORTED=1; shift ;;
+        --no-systemd)       NO_SYSTEMD=1; shift ;;
+        --no-setup)         NO_SETUP=1; shift ;;
+        --local-binary)     [ $# -ge 2 ] || usage_die "--local-binary needs a path"; LOCAL_BINARY="$2"; shift 2 ;;
+        --local-sha256)     [ $# -ge 2 ] || usage_die "--local-sha256 needs a value"; LOCAL_SHA256="$2"; shift 2 ;;
+        --proxy)            [ $# -ge 2 ] || usage_die "--proxy needs a URL"; PROXY_URL="$2"; shift 2 ;;
+        --yes|-y)           ASSUME_YES=1; shift ;;
+        --uninstall)        ACTION="uninstall"; shift ;;
+        --purge)            PURGE=1; ACTION="uninstall"; shift ;;
+        --rollback)         ACTION="rollback"; shift ;;
+        -h|--help)          usage; exit 0 ;;
+        --mode|--interface|--socks-port|--listen|--listen-ip|--dns-port|--web|--web-port|--group|--select)
+                            [ $# -ge 2 ] || usage_die "$1 needs a value"
+                            SETUP_ARGS+=("$1" "$2"); shift 2 ;;
+        --trusted-cidr|--dns-upstream|--uri|--subscription)
+                            [ $# -ge 2 ] || usage_die "$1 needs a value"
+                            SETUP_ARGS+=("$1" "$2"); shift 2 ;;
+        --start-service|--enable-service|--enable-gateway)
+                            SETUP_ARGS+=("$1"); shift ;;
+        --install-packages) INSTALL_PACKAGES=1; SETUP_ARGS+=("$1"); shift ;;
+        *)                  usage_die "unknown option: $1 (see --help)" ;;
+    esac
+done
+
+if [ "$INSTALL_PACKAGES" -eq 1 ] && [ "$NO_SETUP" -eq 1 ]; then
+    usage_die "--install-packages approves package installation inside the first-run wizard; it has no effect with --no-setup"
+fi
+
+case "$VARIANT" in full|lite) ;; *) usage_die "--variant must be full or lite" ;; esac
+if [ "$VERSION" = "latest" ]; then
+    usage_die "this installer is pinned to one release; pass an exact tag such as v3.0.0"
+fi
+if ! printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+    usage_die "--version '$VERSION' is not a release tag"
+fi
+if [ -n "$LOCAL_SHA256" ] && [ -z "$LOCAL_BINARY" ]; then
+    usage_die "--local-sha256 is only valid together with --local-binary"
+fi
+if [ -n "$LOCAL_BINARY" ] && [ -z "$LOCAL_SHA256" ]; then
+    usage_die "--local-binary must be paired with --local-sha256 (builds are never installed unverified)"
+fi
 
 # ─── Helpers ─────────────────────────────────────────────────
-info()  { echo -e "${BLUE}ℹ${NC}  $*"; }
-ok()    { echo -e "${GREEN}✅${NC} $*"; }
-warn()  { echo -e "${YELLOW}⚠️${NC}  $*"; }
-err()   { echo -e "${RED}❌${NC} $*" >&2; }
-die()   { err "$*"; exit 1; }
-
-need_cmd() {
-    if ! command -v "$1" &>/dev/null; then
-        die "Required command not found: $1. Please install it first."
+need_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        die "this step needs root. Re-run with sudo, or use --dry-run."
     fi
 }
 
-# ─── Detect OS & Arch ────────────────────────────────────────
-detect_platform() {
-    local os arch
+have() { command -v "$1" >/dev/null 2>&1; }
 
-    os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-    case "$os" in
-        linux)  OS="linux" ;;
-        darwin) OS="darwin" ;;
-        *)      die "Unsupported OS: $os. Bypath only supports Linux and macOS." ;;
-    esac
-
-    arch="$(uname -m)"
-    case "$arch" in
-        x86_64|amd64)       ARCH="amd64" ;;
-        aarch64|arm64)      ARCH="arm64" ;;
-        armv7l|armv7|armhf) ARCH="arm" ;;
-        mips|mipsel|mipsle) ARCH="mipsle" ;;
-        *)                  die "Unsupported architecture: $arch" ;;
-    esac
-}
-
-# ─── Get latest version from GitHub ─────────────────────────
-get_latest_version() {
-    local url="${GITHUB_API}/latest"
-    local tag
-
-    if command -v curl &>/dev/null; then
-        tag=$(curl -fsSL "$url" 2>/dev/null | grep '"tag_name"' | head -1 | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')
-    elif command -v wget &>/dev/null; then
-        tag=$(wget -qO- "$url" 2>/dev/null | grep '"tag_name"' | head -1 | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')
-    else
-        die "Neither curl nor wget found. Please install one of them."
-    fi
-
-    # If no stable release, try dev
-    if [ -z "$tag" ]; then
-        if command -v curl &>/dev/null; then
-            tag=$(curl -fsSL "${GITHUB_API}" 2>/dev/null | grep '"tag_name"' | head -1 | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')
-        else
-            tag=$(wget -qO- "${GITHUB_API}" 2>/dev/null | grep '"tag_name"' | head -1 | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')
-        fi
-    fi
-
-    [ -z "$tag" ] && die "Could not determine latest version. Check your internet connection."
-    echo "$tag"
-}
-
-# ─── Download file ───────────────────────────────────────────
-download() {
+download_stdout() {
     local url="$1" dest="$2"
-    info "Downloading: $url"
-    if command -v curl &>/dev/null; then
-        if [ -n "$PROXY_ENV" ]; then
-            curl -fSL --progress-bar ${PROXY_ENV:+-x "$PROXY_ENV"} -o "$dest" "$url" || return 1
+    if have curl; then
+        local -a args=(--fail --silent --show-error --location --proto '=https' --tlsv1.2 --output "$dest")
+        if [ -n "$PROXY_URL" ]; then args+=(--proxy "$PROXY_URL"); fi
+        curl "${args[@]}" "$url"
+    elif have wget; then
+        local -a args=(--quiet --https-only --output-document="$dest")
+        if [ -n "$PROXY_URL" ]; then
+            https_proxy="$PROXY_URL" wget "${args[@]}" "$url"
         else
-            curl -fSL --progress-bar -o "$dest" "$url" || return 1
+            wget "${args[@]}" "$url"
         fi
-    elif command -v wget &>/dev/null; then
-        if [ -n "$PROXY_ENV" ]; then
-            https_proxy="$PROXY_ENV" http_proxy="$PROXY_ENV" wget --show-progress -qO "$dest" "$url" || return 1
-        else
-            wget --show-progress -qO "$dest" "$url" || return 1
-        fi
-    fi
-}
-
-# ─── Detect package manager ──────────────────────────────────
-detect_pkg_manager() {
-    if command -v apt-get &>/dev/null; then
-        PKG_MGR="apt"
-    elif command -v yum &>/dev/null; then
-        PKG_MGR="yum"
-    elif command -v dnf &>/dev/null; then
-        PKG_MGR="dnf"
-    elif command -v pacman &>/dev/null; then
-        PKG_MGR="pacman"
-    elif command -v apk &>/dev/null; then
-        PKG_MGR="apk"
     else
-        PKG_MGR=""
+        die "neither curl nor wget is installed; install one of them first"
     fi
 }
 
-pkg_install() {
-    local pkg="$1"
-    info "Installing ${pkg}..."
-    case "$PKG_MGR" in
-        apt)    apt-get install -y -qq "$pkg" >/dev/null 2>&1 ;;
-        yum)    yum install -y -q "$pkg" >/dev/null 2>&1 ;;
-        dnf)    dnf install -y -q "$pkg" >/dev/null 2>&1 ;;
-        pacman) pacman -S --noconfirm "$pkg" >/dev/null 2>&1 ;;
-        apk)    apk add --quiet "$pkg" >/dev/null 2>&1 ;;
-        *)      return 1 ;;
-    esac
-}
-
-# ─── Install sing-box ────────────────────────────────────────
-install_sing_box() {
-    # Use latest stable sing-box (1.14+)
-    local sb_version
-    sb_version=$(curl -fsSL ${PROXY_ENV:+-x "$PROXY_ENV"} "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
-        | grep '"tag_name"' | head -1 | sed -E 's/.*"v([^"]+)".*/\1/') || true
-    [ -z "$sb_version" ] && sb_version="1.14.5"
-
-    local sb_arch="$ARCH"
-    [ "$sb_arch" = "arm" ] && sb_arch="armv7"
-
-    local sb_url="https://github.com/SagerNet/sing-box/releases/download/v${sb_version}/sing-box-${sb_version}-linux-${sb_arch}.tar.gz"
-    local tmp_tar
-    tmp_tar=$(mktemp)
-
-    info "Downloading sing-box v${sb_version}..."
-    if download "$sb_url" "$tmp_tar"; then
-        tar xzf "$tmp_tar" -C /usr/local/bin/ --strip-components=1 --wildcards '*/sing-box' 2>/dev/null || \
-        tar xzf "$tmp_tar" -C /usr/local/bin/ --strip-components=1 "sing-box-${sb_version}-linux-${sb_arch}/sing-box" 2>/dev/null
-        chmod +x /usr/local/bin/sing-box
-        rm -f "$tmp_tar"
-        if command -v sing-box &>/dev/null; then
-            ok "sing-box v${sb_version} installed"
-            return 0
+port_in_use() { # $1 = port, $2 = t|u
+    local port="$1" proto="$2"
+    if have ss; then
+        if [ "$proto" = "t" ]; then
+            ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .
+        else
+            ss -H -lun "sport = :${port}" 2>/dev/null | grep -q .
         fi
+        return
     fi
-    rm -f "$tmp_tar"
-    warn "Failed to install sing-box automatically"
+    if have netstat; then
+        if [ "$proto" = "t" ]; then
+            netstat -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}\$"
+        else
+            netstat -lun 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}\$"
+        fi
+        return
+    fi
     return 1
 }
 
-# ─── Install tun2socks ───────────────────────────────────────
-install_tun2socks() {
-    local t2s_version="2.5.2"
-    local t2s_arch="$ARCH"
-    case "$t2s_arch" in
-        amd64)  t2s_arch="amd64" ;;
-        arm64)  t2s_arch="arm64" ;;
-        arm)    t2s_arch="armv7" ;;
-        *)      warn "No tun2socks binary for $t2s_arch"; return 1 ;;
+service_active() { have systemctl && systemctl is-active --quiet "$1" 2>/dev/null; }
+
+# Packages that gateway mode needs and apt can provide. TUN is a kernel module,
+# so it is reported but never part of the package list.
+gateway_missing_packages() {
+    local pkgs=""
+    have ip || pkgs="iproute2"
+    if ! have iptables || ! have ip6tables; then pkgs="${pkgs:+$pkgs }iptables"; fi
+    printf '%s' "$pkgs"
+}
+
+gateway_prereq_summary() {
+    local pkgs tun_note=""
+    pkgs="$(gateway_missing_packages)"
+    [ -c /dev/net/tun ] || tun_note="; TUN missing (sudo modprobe tun)"
+    if [ -z "$pkgs" ] && [ -z "$tun_note" ]; then
+        printf 'prerequisites present (ip, iptables, ip6tables, TUN)'
+    elif [ -z "$pkgs" ]; then
+        printf 'packages present%s' "$tun_note"
+    else
+        printf 'missing %s (sudo apt install %s, or --install-packages)%s' "$pkgs" "$pkgs" "$tun_note"
+    fi
+}
+
+# ─── Preflight ───────────────────────────────────────────────
+OS_ID=""; OS_LIKE=""; OS_NAME=""; OS_VERSION=""; ARCH=""; ARCH_RAW=""
+SYSTEMD=0; TUN_OK=0; IPTABLES=0; NFTABLES=0
+EXISTING=0; EXISTING_VERSION=""
+DNS_SERVICES=""; PORT_NOTES=""; PLATFORM_OK=0
+
+# Read one /etc/os-release field in a subshell: sourcing it directly would
+# clobber installer variables such as VERSION with the OS release version.
+os_release_field() {
+    local key="$1"
+    (
+        # shellcheck disable=SC1091
+        . /etc/os-release 2>/dev/null || exit 0
+        eval "printf '%s' \"\${${key}:-}\""
+    )
+}
+
+detect_platform() {
+    ARCH_RAW="$(uname -m)"
+    case "$ARCH_RAW" in
+        x86_64|amd64)   ARCH="amd64" ;;
+        aarch64|arm64)  ARCH="arm64" ;;
+        *)              ARCH="" ;;
     esac
 
-    local t2s_url="https://github.com/xjasonlyu/tun2socks/releases/download/v${t2s_version}/tun2socks-linux-${t2s_arch}.zip"
-    local tmp_zip tmp_dir
-    tmp_zip=$(mktemp)
-    tmp_dir=$(mktemp -d)
-
-    info "Downloading tun2socks v${t2s_version} (${t2s_arch})..."
-    if download "$t2s_url" "$tmp_zip"; then
-        # Ensure unzip is available
-        if ! command -v unzip &>/dev/null; then
-            pkg_install unzip >/dev/null 2>&1
-        fi
-        if command -v unzip &>/dev/null; then
-            unzip -o -q "$tmp_zip" -d "$tmp_dir" 2>/dev/null
-        elif command -v python3 &>/dev/null; then
-            python3 -c "import zipfile; zipfile.ZipFile('$tmp_zip').extractall('$tmp_dir')" 2>/dev/null
-        else
-            rm -f "$tmp_zip"; rm -rf "$tmp_dir"
-            warn "Cannot extract zip (no unzip or python3)"
-            return 1
-        fi
-
-        # Find the extracted binary (name varies by release)
-        local extracted
-        extracted=$(find "$tmp_dir" -type f -name 'tun2socks*' | head -1)
-        if [ -n "$extracted" ]; then
-            cp "$extracted" /usr/local/bin/tun2socks
-            chmod +x /usr/local/bin/tun2socks
-        fi
-
-        rm -f "$tmp_zip"; rm -rf "$tmp_dir"
-
-        # Validate arch
-        if command -v tun2socks &>/dev/null; then
-            if tun2socks --version >/dev/null 2>&1 || tun2socks -version >/dev/null 2>&1; then
-                ok "tun2socks v${t2s_version} installed (${t2s_arch})"
-                return 0
-            else
-                warn "tun2socks installed but may have arch issues (verify with: tun2socks --version)"
-                ok "tun2socks v${t2s_version} installed (${t2s_arch})"
-                return 0
-            fi
-        fi
-    fi
-    rm -f "$tmp_zip"; rm -rf "$tmp_dir"
-    warn "Failed to install tun2socks automatically"
-    return 1
-}
-
-# ─── Install xray geo data ──────────────────────────────────
-install_xray_geo_dir() {
-    # Download geoip.dat and geosite.dat for xray routing rules into the given directory
-    local xray_geo_dir="${1:-/usr/local/share/xray}"
-    mkdir -p "$xray_geo_dir"
-
-    local geoip_url="https://github.com/v2fly/geoip/releases/latest/download/geoip.dat"
-    local geosite_url="https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat"
-
-    if [ ! -f "${xray_geo_dir}/geoip.dat" ]; then
-        info "Downloading xray geoip.dat to ${xray_geo_dir}..."
-        if download "$geoip_url" "${xray_geo_dir}/geoip.dat"; then
-            local size
-            size=$(stat -c%s "${xray_geo_dir}/geoip.dat" 2>/dev/null || echo 0)
-            [ "$size" -gt 1000 ] && ok "xray geoip.dat downloaded" || { rm -f "${xray_geo_dir}/geoip.dat"; warn "xray geoip.dat: download failed"; }
-        else
-            warn "xray geoip.dat: download failed (routing rules may not work)"
-        fi
+    if [ -r /etc/os-release ]; then
+        OS_ID="$(os_release_field ID)"
+        OS_ID="${OS_ID:-unknown}"
+        OS_LIKE="$(os_release_field ID_LIKE)"
+        OS_NAME="$(os_release_field PRETTY_NAME)"
+        [ -n "$OS_NAME" ] || OS_NAME="$(os_release_field NAME)"
+        [ -n "$OS_NAME" ] || OS_NAME="$OS_ID"
+        OS_VERSION="$(os_release_field VERSION_ID)"
     else
-        ok "xray geoip.dat already exists (${xray_geo_dir})"
+        OS_ID="unknown"
+        OS_NAME="$(uname -s)"
     fi
 
-    if [ ! -f "${xray_geo_dir}/geosite.dat" ]; then
-        info "Downloading xray geosite.dat to ${xray_geo_dir}..."
-        if download "$geosite_url" "${xray_geo_dir}/geosite.dat"; then
-            local size
-            size=$(stat -c%s "${xray_geo_dir}/geosite.dat" 2>/dev/null || echo 0)
-            [ "$size" -gt 1000 ] && ok "xray geosite.dat downloaded" || { rm -f "${xray_geo_dir}/geosite.dat"; warn "xray geosite.dat: download failed"; }
-        else
-            warn "xray geosite.dat: download failed (domain routing may not work)"
-        fi
-    else
-        ok "xray geosite.dat already exists (${xray_geo_dir})"
+    case "$ARCH:$OS_ID" in
+        amd64:debian|amd64:ubuntu|arm64:debian|arm64:ubuntu|arm64:armbian)
+            PLATFORM_OK=1 ;;
+        *:debian|*:ubuntu|*:armbian)
+            # Debian-family derivatives are allowed only when the architecture
+            # has a tested release asset.
+            case "$ARCH" in amd64|arm64) PLATFORM_OK=1 ;; esac ;;
+    esac
+    if [ "$PLATFORM_OK" -eq 0 ] && printf '%s' "$OS_LIKE" | grep -qiw debian; then
+        case "$ARCH" in amd64|arm64) PLATFORM_OK=1 ;; esac
     fi
 }
 
-install_xray_geo() {
-    install_xray_geo_dir "/usr/local/share/xray"
+detect_environment() {
+    if [ -d /run/systemd/system ] && have systemctl; then SYSTEMD=1; fi
+    if [ -c /dev/net/tun ]; then TUN_OK=1; fi
+    if have iptables; then IPTABLES=1; fi
+    if have nft; then NFTABLES=1; fi
+
+    local svc
+    for svc in systemd-resolved dnsmasq unbound named; do
+        if service_active "$svc"; then
+            DNS_SERVICES+="${DNS_SERVICES:+, }${svc}"
+        fi
+    done
+
+    if [ -x "${INSTALL_DIR}/bypath" ]; then
+        EXISTING=1
+        EXISTING_VERSION="$("${INSTALL_DIR}/bypath" version 2>/dev/null | head -n 1 || true)"
+    elif [ -x "${BIN_LINK}" ]; then
+        EXISTING=1
+        EXISTING_VERSION="$("${BIN_LINK}" version 2>/dev/null | head -n 1 || true)"
+    fi
+
+    if port_in_use 53 u || port_in_use 53 t; then
+        PORT_NOTES+="  port 53 is in use: ${DNS_SERVICES:-another process holds it}. "
+    fi
+    if port_in_use 8080 t; then PORT_NOTES+="  port 8080 (management API) is in use. "; fi
+    if port_in_use 2801 t; then PORT_NOTES+="  port 2801 (proxy default) is in use. "; fi
 }
 
-# ─── Check and install runtime dependencies ──────────────────
-check_deps() {
-    echo ""
-    info "Checking and installing runtime dependencies..."
-    echo ""
-
-    detect_pkg_manager
-
-    # systemd-resolved conflicts with bypath's DNS on port 53
-    if [ "$OS" = "linux" ] && command -v systemctl &>/dev/null; then
-        if systemctl is-active systemd-resolved &>/dev/null; then
-            info "systemd-resolved is active (conflicts with port 53) — disabling..."
-            systemctl stop systemd-resolved 2>/dev/null
-            systemctl disable systemd-resolved 2>/dev/null
-            # Fix resolv.conf if it's a symlink to the stub
-            if [ -L /etc/resolv.conf ] && readlink /etc/resolv.conf | grep -q systemd; then
-                rm -f /etc/resolv.conf
-                printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
-            fi
-            ok "systemd-resolved disabled (port 53 freed for bypath)"
-        else
-            ok "systemd-resolved not active (no conflict)"
-        fi
+report_host() {
+    section "Host"
+    printf '  OS:        %s\n' "$OS_NAME"
+    printf '  Platform:  %s / %s\n' "$OS_ID" "$ARCH_RAW"
+    printf '  Release:   %s\n' "${OS_VERSION:-unknown}"
+    printf '  systemd:   %s\n' "$([ "$SYSTEMD" = 1 ] && echo present || echo absent)"
+    printf '  TUN:       %s\n' "$([ "$TUN_OK" = 1 ] && echo '/dev/net/tun present' || echo 'not available (proxy-only only)')"
+    local fw=""
+    if [ "$IPTABLES" -eq 1 ]; then fw="iptables "; fi
+    if [ "$NFTABLES" -eq 1 ]; then fw+="nft "; fi
+    printf '  Firewall:  %s\n' "${fw:-none detected}"
+    printf '  Gateway:   %s\n' "$(gateway_prereq_summary)"
+    printf '  DNS:       %s\n' "${DNS_SERVICES:-no known resolver service active}"
+    printf '  Existing:  %s\n' "$([ "$EXISTING" = 1 ] && echo "${EXISTING_VERSION:-installed}" || echo none)"
+    if [ -n "$PORT_NOTES" ]; then
+        printf '  Ports:     %s\n' "$PORT_NOTES"
     fi
 
-    # dnsmasq conflicts with bypath's DNS on port 53 (common on Armbian/Debian/Raspbian)
-    # Stop it now so first run works. Runtime restore is handled by Bypath from prior ACTIVE state, not systemd Conflicts=.
-    if [ "$OS" = "linux" ] && command -v systemctl &>/dev/null; then
-        if systemctl is-active dnsmasq &>/dev/null; then
-            info "dnsmasq is active (conflicts with port 53) — stopping temporarily..."
-            systemctl stop dnsmasq 2>/dev/null || true
-            ok "dnsmasq stopped (bypath restores it on exit only if it was active at startup)"
-        fi
+    local mem_mb disk_mb
+    mem_mb="$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)"
+    disk_mb="$(df -Pk /opt 2>/dev/null | awk 'NR==2 {print int($4/1024)}' || true)"
+    printf '  Memory:    %s MiB\n' "${mem_mb:-unknown}"
+    printf '  Disk:      %s MiB free on /opt\n' "${disk_mb:-unknown}"
+    if [ -n "${mem_mb:-}" ] && [ "${mem_mb:-0}" -gt 0 ] && [ "$mem_mb" -lt "$MIN_MEM_MB" ]; then
+        warn "less than ${MIN_MEM_MB} MiB of memory: the embedded engines may not fit"
+    fi
+    if [ -n "${disk_mb:-}" ] && [ "${disk_mb:-0}" -gt 0 ] && [ "$disk_mb" -lt "$MIN_DISK_MB" ]; then
+        warn "less than ${MIN_DISK_MB} MiB free on /opt"
     fi
 
-    # iptables (required for gateway mode on Linux)
-    if [ "$OS" = "linux" ]; then
-        if ! command -v iptables &>/dev/null; then
-            if [ -n "$PKG_MGR" ]; then
-                pkg_install iptables && ok "iptables installed" || warn "Could not install iptables"
-            else
-                warn "iptables NOT found — install manually"
-            fi
-        else
-            ok "iptables found"
-        fi
-
-        if ! command -v ip &>/dev/null; then
-            if [ -n "$PKG_MGR" ]; then
-                pkg_install iproute2 && ok "iproute2 installed" || warn "Could not install iproute2"
-            else
-                warn "iproute2 NOT found — install manually"
-            fi
-        else
-            ok "iproute2 (ip) found"
-        fi
-    fi
-
-    # curl (needed for health checks, bench)
-    if ! command -v curl &>/dev/null; then
-        if [ -n "$PKG_MGR" ]; then
-            pkg_install curl && ok "curl installed" || warn "Could not install curl"
-        else
-            warn "curl NOT found — install manually"
-        fi
+    section "Network (observed, never changed)"
+    if have ip; then
+        ip -o -4 addr show scope global 2>/dev/null | awk '{printf "  %s  %s\n", $2, $4}' || true
+        local def
+        def="$(ip route show default 2>/dev/null | head -n 1 || true)"
+        printf '  default route: %s\n' "${def:-none}"
     else
-        ok "curl found"
+        info "the 'ip' command is not installed; interface details are unavailable"
     fi
+    cat <<EOF
 
-    # sing-box (required)
-    if command -v sing-box &>/dev/null; then
-        local sb_ver
-        sb_ver=$(sing-box version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
-        ok "sing-box found (v${sb_ver})"
-    elif [ -x "${INSTALL_DIR}/engines/sing-box" ]; then
-        ok "sing-box found (${INSTALL_DIR}/engines/sing-box)"
-    else
-        install_sing_box || warn "sing-box not installed — bypath will try to download it on first run"
-    fi
-
-    # tun2socks (required for gateway mode in lite build)
-    if [ "$VARIANT" = "lite" ]; then
-        if command -v tun2socks &>/dev/null; then
-            # Validate arch
-            if tun2socks --version >/dev/null 2>&1 || tun2socks -version >/dev/null 2>&1; then
-                ok "tun2socks found"
-            else
-                warn "tun2socks found but wrong architecture — reinstalling..."
-                rm -f "$(command -v tun2socks)"
-                install_tun2socks || warn "tun2socks reinstall failed"
-            fi
-        else
-            install_tun2socks || warn "tun2socks not installed — gateway mode won't work without it"
-        fi
-    else
-        info "tun2socks: not needed for full build (skipped)"
-    fi
-
-    # dns2socks (recommended, not critical)
-    if command -v dns2socks &>/dev/null; then
-        ok "dns2socks found"
-    else
-        info "dns2socks not found (optional — DNS will use sing-box built-in)"
-    fi
-
-    # xray (optional but recommended as fallback engine)
-    local embedded_xray="${INSTALL_DIR}/engines/xray"
-    if command -v xray &>/dev/null; then
-        local xray_ver
-        xray_ver=$(xray version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9.]+' | head -1 || echo "unknown")
-        ok "xray found (v${xray_ver})"
-        # Check xray geo data in standard locations
-        local xray_geo_dir=""
-        for d in /usr/local/share/xray /usr/share/xray; do
-            if [ -f "${d}/geoip.dat" ]; then
-                xray_geo_dir="$d"
-                break
-            fi
-        done
-        if [ -n "$xray_geo_dir" ]; then
-            ok "xray geo data found (${xray_geo_dir})"
-        else
-            info "xray geo data not found — downloading..."
-            install_xray_geo
-        fi
-    elif [ -x "$embedded_xray" ]; then
-        local xray_ver
-        xray_ver=$("$embedded_xray" version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9.]+' | head -1 || echo "unknown")
-        ok "xray found (embedded, v${xray_ver})"
-    else
-        info "xray not found (optional — sing-box is the primary engine)"
-    fi
-
-    # For embedded xray, always ensure geo data exists next to the binary
-    # (xray looks for geoip.dat in its own directory when XRAY_LOCATION_ASSET is not set)
-    if [ -x "$embedded_xray" ] && [ ! -f "${INSTALL_DIR}/engines/geoip.dat" ]; then
-        info "Downloading xray geo data for embedded engine..."
-        install_xray_geo_dir "${INSTALL_DIR}/engines"
-    fi
-
-    echo ""
+  The installer does not alter interfaces, routes, DNS, DHCP or firewall
+  rules. ${DNS_SERVICES:+Active resolvers ($DNS_SERVICES) are left running. }
+  If port 53 is already served, the first-run wizard offers a free port or
+  asks you to free it yourself; it never stops another resolver.
+EOF
 }
 
-# ─── Create systemd service ─────────────────────────────────
-install_systemd() {
-    if [ "${BYPATH_NO_SYSTEMD:-0}" = "1" ]; then
-        info "Skipping systemd service (BYPATH_NO_SYSTEMD=1)"
+# manual_arch_refusal names architectures that have release builds this
+# installer does not install, so the user learns the asset exists and how to
+# verify it by hand.
+manual_arch_refusal() {
+    case "$ARCH_RAW" in
+        armv6l|armv7l|armhf|arm)
+            err "architecture ${ARCH_RAW} (linux arm) has release builds, but this installer does not install them. Download bypath-<variant>-linux-arm, verify it against SHA256SUMS by hand, and install it manually." ;;
+        mips*)
+            err "architecture ${ARCH_RAW} (linux mipsle) has a lite build only, and this installer does not install it. Download bypath-lite-linux-mipsle, verify it against SHA256SUMS by hand, and install it manually." ;;
+    esac
+    return 0
+}
+
+preflight() {
+    section "Preflight"
+    detect_platform
+    detect_environment
+
+    if [ "$PLATFORM_OK" -eq 0 ]; then
+        if [ "$ALLOW_UNSUPPORTED" -eq 0 ]; then
+            manual_arch_refusal
+            die "unsupported platform ${OS_ID}/${ARCH_RAW}. Tested: Debian/Ubuntu amd64, Debian/Ubuntu/Armbian arm64. Use --allow-unsupported to continue at your own risk."
+        fi
+        warn "platform ${OS_ID}/${ARCH_RAW} is outside the tested matrix; continuing because --allow-unsupported was given"
+    fi
+    if [ -z "$ARCH" ]; then
+        manual_arch_refusal
+        die "no release asset exists for architecture ${ARCH_RAW}"
+    fi
+    if [ "$SYSTEMD" -eq 0 ] && [ "$NO_SYSTEMD" -eq 0 ]; then
+        warn "systemd was not detected; the service unit will be skipped"
+        NO_SYSTEMD=1
+    fi
+
+    report_host
+}
+
+# ─── Install ─────────────────────────────────────────────────
+ASSET=""
+COMPUTED_SHA=""
+
+fetch_asset() {
+    case "$VARIANT" in
+        full|lite) ;;
+        *) die "unknown --variant '${VARIANT}' (use full or lite)" ;;
+    esac
+    case " ${LITE_ONLY_ARCHES} " in
+        *" ${ARCH} "*)
+            [ "$VARIANT" = "lite" ] || die "no full build is published for ${ARCH}; pass --variant lite to install the lite build" ;;
+    esac
+    case " ${FULL_ARCHES} " in
+        *" ${ARCH} "*) ;;
+        *) [ "$VARIANT" = "lite" ] || die "no full build is published for ${ARCH}; pass --variant lite to install the lite build" ;;
+    esac
+    ASSET="bypath-${VARIANT}-linux-${ARCH}"
+    local base="https://github.com/${REPO}/releases/download/${VERSION}"
+    WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bypath-fetch.XXXXXX")"
+    local binary="${WORK_DIR}/${ASSET}"
+    local sums="${WORK_DIR}/SHA256SUMS"
+
+    if [ -n "$LOCAL_BINARY" ]; then
+        [ -f "$LOCAL_BINARY" ] || die "local binary not found: $LOCAL_BINARY"
+        cp "$LOCAL_BINARY" "$binary"
+        COMPUTED_SHA="$(sha256sum "$binary" | awk '{print $1}')"
+        [ "$COMPUTED_SHA" = "$LOCAL_SHA256" ] || die "SHA-256 mismatch for $LOCAL_BINARY"
+        ok "local binary matches the supplied SHA-256"
         return
     fi
 
-    if [ "$OS" != "linux" ]; then
-        return
-    fi
+    info "downloading ${ASSET} from ${VERSION}"
+    download_stdout "${base}/${ASSET}" "$binary" || die "download failed; no file was installed"
+    download_stdout "${base}/SHA256SUMS" "$sums" || die "SHA256SUMS is not published for ${VERSION}; refusing to install unverified"
 
-    if ! command -v systemctl &>/dev/null; then
-        info "systemd not found, skipping service installation."
-        return
-    fi
+    local expected actual
+    expected="$(awk -v a="$ASSET" '$2 == a || $2 == ("*" a) {print $1; exit}' "$sums")"
+    [ -n "$expected" ] || die "SHA256SUMS does not list ${ASSET}; refusing to install unverified"
+    actual="$(sha256sum "$binary" | awk '{print $1}')"
+    [ "$actual" = "$expected" ] || die "checksum mismatch for ${ASSET}: expected ${expected}, got ${actual}"
+    COMPUTED_SHA="$actual"
+    ok "checksum verified (${actual:0:12}…)"
+}
 
-    # In non-interactive mode, create service automatically unless explicitly disabled
-    if [ "$IS_INTERACTIVE" = "0" ]; then
-        info "No TTY detected — creating systemd service automatically."
+chmod_bin() { chmod 0755 "$1"; }
+
+# clear_stale_staging removes staging files left by a killed installer. A
+# staging file whose process is gone holds a complete or partial copy of the
+# release binary and must not be left behind.
+clear_stale_staging() {
+    local dir="$1" f pid
+    for f in "${dir}"/.bypath-staging-*; do
+        [ -e "$f" ] || continue
+        pid="${f##*/.bypath-staging-}"
+        case "$pid" in ''|*[!0-9]*) continue ;; esac
+        if kill -0 "$pid" 2>/dev/null; then continue; fi
+        rm -f "$f" && info "removed a staging file left by an interrupted install: ${f}"
+    done
+}
+
+install_binary() {
+    fetch_asset
+
+    # Stage next to the install directory and smoke-test there: /tmp is
+    # commonly mounted noexec, and a rename across filesystems is not atomic,
+    # so the binary must be verified on the filesystem that will hold it.
+    local parent
+    parent="$(dirname "$INSTALL_DIR")"
+    clear_stale_staging "$parent"
+    STAGED_BIN="${parent}/.bypath-staging-$$"
+    rm -f "$STAGED_BIN"
+    cp "${WORK_DIR}/${ASSET}" "$STAGED_BIN"
+    chmod_bin "$STAGED_BIN"
+    if ! "$STAGED_BIN" version >/dev/null 2>&1; then
+        die "the downloaded binary failed its version check when executed from ${parent}; nothing was installed"
+    fi
+    local staged="$STAGED_BIN"
+
+    mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR" \
+             "${CONFIG_DIR}/profiles" "${CONFIG_DIR}/geo" \
+             "${INSTALL_DIR}/engines"
+
+    if [ -x "${INSTALL_DIR}/bypath" ] && cmp -s "$staged" "${INSTALL_DIR}/bypath"; then
+        ok "${VERSION} is already installed; configuration left untouched"
     else
-        echo ""
-        local answer
-        read -rp "$(echo -e "${CYAN}?${NC}  Create systemd service? [Y/n] ")" answer </dev/tty 2>/dev/null || answer="y"
-        answer="${answer:-y}"
-        if [[ ! "$answer" =~ ^[Yy]$ ]]; then
-            info "Skipping systemd service."
-            return
+        if [ -x "${INSTALL_DIR}/bypath" ]; then
+            cp -f "${INSTALL_DIR}/bypath" "${INSTALL_DIR}/bypath.previous"
+            chmod 0755 "${INSTALL_DIR}/bypath.previous"
+            info "previous binary saved as ${INSTALL_DIR}/bypath.previous"
+        fi
+        chmod 0755 "$staged"
+        mv -f "$staged" "${INSTALL_DIR}/bypath"
+        ok "installed ${INSTALL_DIR}/bypath (${COMPUTED_SHA:0:12}…)"
+    fi
+    ln -sfn "${INSTALL_DIR}/bypath" "$BIN_LINK"
+    ok "linked ${BIN_LINK}"
+}
+
+install_unit() {
+    if [ "$NO_SYSTEMD" -eq 1 ]; then
+        info "systemd unit skipped (--no-systemd or no systemd)"
+        return
+    fi
+
+    if ! getent group bypath >/dev/null 2>&1; then
+        if groupadd --system bypath >/dev/null 2>&1; then
+            ok "created the 'bypath' group for control-socket access (root-equivalent; add only trusted admins)"
+        else
+            warn "could not create the 'bypath' group; the control socket stays root-only"
         fi
     fi
 
-    local service_file="/etc/systemd/system/bypath.service"
-
-    cat > "$service_file" <<EOF
+    local tmp="${UNIT_FILE}.new"
+    cat > "$tmp" <<EOF
 [Unit]
-Description=Bypath Network Gateway
+Description=Bypath network gateway
+Documentation=https://github.com/${REPO}
 After=network-online.target
 Wants=network-online.target
-# Disable start-attempt limit so systemd never enters "failed" state.
-# bypath itself handles retry with backoff when no server is reachable.
-StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# The resolver override lives under /run and these hooks sweep it on every exit
+# and before every start, so a crash, SIGKILL or failed start cannot leave the
+# host pointing at a dead local DNS listener. A non-zero exit is ignored: the
+# hook is a correction, not a condition for running.
+ExecStartPre=-${INSTALL_DIR}/bypath host-dns restore
 ExecStart=${INSTALL_DIR}/bypath run
+ExecStopPost=-${INSTALL_DIR}/bypath host-dns restore
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535
-
-# Logging
-StandardOutput=append:/var/log/bypath/access.log
-StandardError=append:/var/log/bypath/error.log
-
-# Security hardening
-NoNewPrivileges=no
-ProtectSystem=false
-PrivateTmp=false
+StandardOutput=append:${LOG_DIR}/access.log
+StandardError=append:${LOG_DIR}/error.log
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$UNIT_FILE"
     systemctl daemon-reload
-    ok "systemd service created: ${service_file}"
-    info "Enable with: systemctl enable bypath"
-    info "Start with:  systemctl start bypath"
+    ok "created ${UNIT_FILE} (not enabled or started)"
+
+    cat <<EOF
+
+  The unit exists but is deliberately not enabled or started: installation
+  must not take over this host. Starting, enabling and gateway mode differ:
+      start now:      sudo systemctl start bypath
+      start at boot:  sudo systemctl enable bypath
+      carry the LAN:  gateway mode, enabled only after a verified connection
+  The first-run wizard offers the boot enable after a verified start, or pass
+  --enable-service.
+
+EOF
 }
 
-# ─── Download geoip/geosite .srs files ──────────────────────
-install_geo() {
-    local geo_dir="/etc/bypath/geo"
-    mkdir -p "$geo_dir"
+run_setup() {
+    if [ "$NO_SETUP" -eq 1 ]; then
+        info "first-run wizard skipped (--no-setup)"
+        return 0
+    fi
+    if [ -f "$CONFIG_FILE" ] && [ "${#SETUP_ARGS[@]}" -eq 0 ]; then
+        info "configuration already exists at ${CONFIG_FILE}; leaving it untouched"
+        info "run 'sudo bypath setup' to change it"
+        return 0
+    fi
+    local -a cmd=("${INSTALL_DIR}/bypath" "setup")
+    cmd+=("${SETUP_ARGS[@]}")
 
-    # Countries to download (matches KnownCountries in branding.go)
-    local countries=("ir" "cn" "us" "ru" "tr" "de" "fr" "gb" "ae")
-    # geoip: Chocolate4U (raw GitHub, no redirect issues, covers all countries)
-    local geoip_url_tmpl="https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geoip-COUNTRY.srs"
-    # geosite: Chocolate4U for what they have, SagerNet as fallback
-    # SagerNet geosite uses a specific release tag format
-    local geosite_chocolate_tmpl="https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-COUNTRY.srs"
-    local geosite_sagernet_tmpl="https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-COUNTRY.srs"
-
-    # Check if we already have a valid ir file
-    local ir_size
-    ir_size=$(stat -c%s "${geo_dir}/geoip-ir.srs" 2>/dev/null || echo 0)
-    if [ "$ir_size" -gt 100 ]; then
-        info "Geo files already present, skipping download."
-        return
+    section "First-run setup"
+    if [ -f "$CONFIG_FILE" ]; then
+        info "an existing configuration was found; the wizard shows current answers"
     fi
 
-    # Prompt if TTY available
-    local answer="y"
-    if [ "$IS_INTERACTIVE" = "1" ]; then
-        echo ""
-        read -rp "$(echo -e "${CYAN}?${NC}  Download geo rule sets (geoip+geosite for IR + common countries)? [Y/n] ")" answer </dev/tty 2>/dev/null || answer="y"
+    local rc=0
+    if [ "$NONINTERACTIVE" -eq 0 ] && (exec 0</dev/tty) 2>/dev/null; then
+        # Piped installers have a script on stdin; the wizard needs the terminal.
+        "${cmd[@]}" </dev/tty || rc=$?
     else
-        info "No TTY — auto-downloading geo rule sets..."
+        # --non-interactive, or no terminal to prompt on: the wizard must not
+        # prompt either way.
+        cmd+=(--non-interactive)
+        "${cmd[@]}" || rc=$?
     fi
-    answer="${answer:-y}"
-    [[ ! "$answer" =~ ^[Yy]$ ]] && { info "Skipping geo download."; return; }
+    if [ "$rc" -ne 0 ]; then
+        warn "setup did not complete (exit ${rc}). Nothing was started; re-run 'sudo bypath setup'."
+        return 1
+    fi
+    ok "configuration written to ${CONFIG_FILE}"
+}
 
-    echo ""
-    info "Downloading geo rule sets for: ${countries[*]}"
-    local failed=0
-
-    for country in "${countries[@]}"; do
-        local geoip_file="${geo_dir}/geoip-${country}.srs"
-        local geosite_file="${geo_dir}/geosite-${country}.srs"
-        local url size
-
-        # geoip
-        url="${geoip_url_tmpl/COUNTRY/$country}"
-        if download "$url" "$geoip_file" 2>/dev/null; then
-            size=$(stat -c%s "$geoip_file" 2>/dev/null || echo 0)
-            if [ "$size" -gt 100 ]; then
-                ok "geoip-${country}.srs"
+do_install() {
+    preflight
+    if [ "$DRY_RUN" -eq 1 ]; then
+        section "Dry run"
+        local unit_note="would verify SHA256SUMS and create ${UNIT_FILE}"
+        if [ "$NO_SYSTEMD" -eq 1 ]; then unit_note="would verify SHA256SUMS and skip the service unit"; fi
+        info "would install ${VERSION} (${ASSET:-bypath-${VARIANT}-linux-${ARCH}}) to ${INSTALL_DIR}"
+        info "$unit_note"
+        info "would leave existing configuration at ${CONFIG_FILE} untouched"
+        if [ "$NO_SETUP" -eq 0 ] && [ "${#SETUP_ARGS[@]}" -gt 0 ]; then
+            # Connection URIs and subscription URLs can embed credentials.
+            local -a shown=()
+            local arg redact_next=0
+            for arg in "${SETUP_ARGS[@]}"; do
+                if [ "$redact_next" -eq 1 ]; then shown+=("<redacted>"); redact_next=0; continue; fi
+                case "$arg" in --uri|--subscription) redact_next=1 ;; esac
+                shown+=("$arg")
+            done
+            info "would run: ${INSTALL_DIR}/bypath setup ${shown[*]}"
+        fi
+        if [ "$INSTALL_PACKAGES" -eq 1 ]; then
+            local pkgs
+            pkgs="$(gateway_missing_packages)"
+            if [ -n "$pkgs" ]; then
+                info "--install-packages: the gateway wizard may run 'apt-get install -y ${pkgs}'; nothing is installed in a dry run"
             else
-                rm -f "$geoip_file"
-                warn "geoip-${country}.srs: empty response"
-                failed=$((failed+1))
+                info "--install-packages: no gateway package is missing; nothing would be installed"
             fi
+        fi
+        info "no file was written, no package was installed and no service was changed"
+        return 0
+    fi
+    need_root
+    if ! have sha256sum; then die "sha256sum is required to verify the release"; fi
+
+    install_binary
+    install_unit
+    if run_setup; then
+        section "Installed"
+        printf '  Binary:  %s -> %s\n' "$BIN_LINK" "${INSTALL_DIR}/bypath"
+        printf '  Config:  %s\n' "$CONFIG_FILE"
+        printf '  Logs:    %s\n' "$LOG_DIR"
+        printf '  Version: %s\n' "$VERSION"
+        cat <<EOF
+
+  Next steps
+    bypath doctor            read-only installation and safety report
+    bypath status            current gateway state
+    sudo bypath setup        change the first-run answers
+    sudo bypath geo status   optional geo databases (none are downloaded)
+
+  Starting, enabling and gateway mode are separate steps:
+    start    runs the service now (wizard --start-service)
+    enable   also starts it at boot (wizard --enable-service)
+    gateway  routes the LAN through the tunnel (wizard --enable-gateway)
+
+  This installer changed no interface, route, DNS resolver, DHCP lease or
+  global firewall rule.
+EOF
+    else
+        exit 1
+    fi
+}
+
+# ─── Uninstall / rollback ────────────────────────────────────
+confirm() {
+    if [ "$ASSUME_YES" -eq 1 ]; then return 0; fi
+    if [ "$NONINTERACTIVE" -eq 1 ]; then die "refusing to continue without --yes in non-interactive mode"; fi
+    local answer
+    read -r -p "$1 [y/N] " answer </dev/tty || return 1
+    case "$answer" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+do_uninstall() {
+    need_root
+    section "Uninstall"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "would stop and remove the bypath unit, ${INSTALL_DIR} and ${BIN_LINK}"
+        if [ "$PURGE" -eq 1 ]; then info "would also remove ${CONFIG_DIR}, ${LOG_DIR} and ${RUN_DIR}"; else info "would keep ${CONFIG_DIR} and ${LOG_DIR}"; fi
+        info "would remove the runtime directories ${RUN_DIR} and ${CONTROL_DIR} (control socket)"
+        info "no file was changed"
+        return 0
+    fi
+    if [ "$SYSTEMD" -eq 1 ] && [ -f "$UNIT_FILE" ]; then
+        if systemctl is-active --quiet bypath 2>/dev/null; then
+            confirm "Stop the running Bypath service?" || die "uninstall cancelled"
+            systemctl stop bypath || warn "could not stop bypath"
+        fi
+        systemctl disable bypath >/dev/null 2>&1 || true
+        rm -f "$UNIT_FILE"
+        systemctl daemon-reload || true
+        ok "removed ${UNIT_FILE}"
+    fi
+    rm -f "$BIN_LINK"
+    rm -rf "$INSTALL_DIR"
+    # Runtime state, including the control socket directory, must not outlive
+    # the binary even when the configuration is kept.
+    rm -rf "$RUN_DIR" "$CONTROL_DIR"
+    ok "removed ${INSTALL_DIR}, ${BIN_LINK} and the runtime directories ${RUN_DIR} ${CONTROL_DIR}"
+
+    if [ "$PURGE" -eq 1 ]; then
+        if confirm "Delete configuration, profiles, geo data and logs? This cannot be undone."; then
+            rm -rf "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR" "$CONTROL_DIR"
+            ok "removed ${CONFIG_DIR}, ${LOG_DIR}, ${RUN_DIR} and ${CONTROL_DIR}"
         else
-            warn "geoip-${country}.srs: download failed"
-            failed=$((failed+1))
+            info "configuration preserved"
         fi
+    else
+        info "configuration and data preserved in ${CONFIG_DIR}; logs in ${LOG_DIR}"
+        info "re-run with --purge --yes to remove them explicitly"
+    fi
+    info "no interface, route, DNS resolver, DHCP lease or firewall rule was changed"
+}
 
-        # geosite — try Chocolate4U first, fallback to SagerNet raw
-        url="${geosite_chocolate_tmpl/COUNTRY/$country}"
-        local geosite_ok=0
-        if download "$url" "$geosite_file" 2>/dev/null; then
-            size=$(stat -c%s "$geosite_file" 2>/dev/null || echo 0)
-            if [ "$size" -gt 100 ]; then
-                ok "geosite-${country}.srs"
-                geosite_ok=1
-            else
-                rm -f "$geosite_file"
-            fi
-        fi
-        # Fallback to SagerNet raw
-        if [ "$geosite_ok" -eq 0 ]; then
-            url="${geosite_sagernet_tmpl/COUNTRY/$country}"
-            if download "$url" "$geosite_file" 2>/dev/null; then
-                size=$(stat -c%s "$geosite_file" 2>/dev/null || echo 0)
-                if [ "$size" -gt 100 ]; then
-                    ok "geosite-${country}.srs"
-                    geosite_ok=1
-                else
-                    rm -f "$geosite_file"
-                fi
-            fi
-        fi
-        [ "$geosite_ok" -eq 0 ] && warn "geosite-${country}.srs: not available (geoip only)"
-    done
-
-    [ "$failed" -gt 0 ] && warn "${failed} geo files failed — run 'bypath geo update' later to retry"
-    echo ""
+do_rollback() {
+    section "Rollback"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "would restore ${INSTALL_DIR}/bypath.previous over ${INSTALL_DIR}/bypath"
+        return 0
+    fi
+    need_root
+    if [ ! -x "${INSTALL_DIR}/bypath.previous" ]; then
+        die "no previous binary is recorded at ${INSTALL_DIR}/bypath.previous"
+    fi
+    local was_active=0
+    if [ "$SYSTEMD" -eq 1 ] && systemctl is-active --quiet bypath 2>/dev/null; then
+        was_active=1
+        systemctl stop bypath
+    fi
+    cp -f "${INSTALL_DIR}/bypath" "${INSTALL_DIR}/bypath.failed"
+    cp -f "${INSTALL_DIR}/bypath.previous" "${INSTALL_DIR}/bypath"
+    chmod 0755 "${INSTALL_DIR}/bypath"
+    ok "restored the previous binary; the failed one is at ${INSTALL_DIR}/bypath.failed"
+    if [ "$was_active" -eq 1 ]; then
+        systemctl start bypath || warn "the previous binary was restored but the service did not start"
+    fi
 }
 
 # ─── Main ────────────────────────────────────────────────────
-main() {
-    echo ""
-    echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║       Bypath Installer               ║${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
-    echo ""
-
-    # Auto-escalate to root if needed — non-technical users shouldn't have to know about sudo
-    if [ "$(id -u)" -ne 0 ]; then
-        if command -v sudo &>/dev/null; then
-            echo -e "${YELLOW}⚠️${NC}  Root required — re-running with sudo (you may be asked for your password)..."
-            exec sudo "$0" "$@"
-        else
-            die "Root required and sudo not found. Run as root or install sudo."
-        fi
-    fi
-
-    # Ensure curl is available — it may be absent on Debian/Ubuntu minimal installs.
-    # wget is used to bootstrap the installer itself on such systems, but curl is
-    # needed for progress bars and some operations below. Auto-install it if missing.
-    if ! command -v curl &>/dev/null; then
-        detect_pkg_manager
-        if [ -n "$PKG_MGR" ]; then
-            info "curl not found — installing..."
-            pkg_install curl && ok "curl installed" || warn "Could not install curl — will use wget for downloads"
-        else
-            warn "curl not found and no supported package manager detected — will use wget for downloads"
-        fi
-    fi
-
-    # Parse arguments
-    local arg_version="${1:-}"
-    local arg_variant="${2:-}"
-    local arg_proxy="${3:-}"
-
-    # Check for --proxy flag anywhere in args
-    for arg in "$@"; do
-        if [[ "$arg" == --proxy=* ]]; then
-            arg_proxy="${arg#--proxy=}"
-        elif [[ "$arg" == "--proxy" ]]; then
-            : # handled by next arg, skip
-        fi
-    done
-    # Simple positional: install.sh [version] [variant] [proxy]
-    [ -n "$arg_proxy" ] && PROXY_ENV="$arg_proxy"
-
-    if [ -n "$PROXY_ENV" ]; then
-        ok "Using proxy: ${PROXY_ENV}"
-    fi
-
-    # Detect platform
-    detect_platform
-    ok "Detected platform: ${OS}/${ARCH}"
-
-    # Determine version
-    if [ -z "$arg_version" ] || [ "$arg_version" = "latest" ]; then
-        info "Fetching latest version..."
-        VERSION=$(get_latest_version)
-    else
-        VERSION="$arg_version"
-        # Ensure version starts with 'v'
-        [[ "$VERSION" != v* ]] && VERSION="v${VERSION}"
-    fi
-    ok "Version: ${VERSION}"
-
-    # Determine variant
-    if [ -n "$arg_variant" ]; then
-        VARIANT="$arg_variant"
-    elif [ "$IS_INTERACTIVE" = "0" ]; then
-        VARIANT="lite"
-        info "No TTY, defaulting to lite variant"
-    else
-        echo ""
-        echo -e "  ${CYAN}1)${NC} lite  — Lightweight, requires external sing-box/tun2socks"
-        echo -e "  ${CYAN}2)${NC} full  — Batteries included, embeds sing-box engine"
-        echo ""
-        local choice
-        read -rp "$(echo -e "${CYAN}?${NC}  Select variant [1/2] (default: 1): ")" choice </dev/tty 2>/dev/null || choice="1"
-        choice="${choice:-1}"
-        case "$choice" in
-            1|lite)  VARIANT="lite" ;;
-            2|full)  VARIANT="full" ;;
-            *)       VARIANT="lite" ;;
-        esac
-    fi
-    ok "Variant: ${VARIANT}"
-
-    # Build download URL
-    local filename="${BINARY_NAME}-${VARIANT}-${OS}-${ARCH}"
-    local url="${GITHUB_DL}/${VERSION}/${filename}"
-
-    echo ""
-    info "Download URL: ${url}"
-    echo ""
-
-    # Create install directory
-    mkdir -p "${INSTALL_DIR}"
-    mkdir -p "${INSTALL_DIR}/engines"
-
-    # Create standard Linux paths for installed mode
-    mkdir -p "/etc/bypath/profiles"
-    mkdir -p "/etc/bypath/geo"
-    mkdir -p "/var/log/bypath"
-
-    # Download or copy binary
-    if [ -n "${BYPATH_LOCAL_BINARY:-}" ]; then
-        # Use a pre-built local binary (for testing before GitHub release)
-        if [ ! -f "${BYPATH_LOCAL_BINARY}" ]; then
-            die "BYPATH_LOCAL_BINARY not found: ${BYPATH_LOCAL_BINARY}"
-        fi
-        cp "${BYPATH_LOCAL_BINARY}" "${INSTALL_DIR}/${BINARY_NAME}"
-        chmod 755 "${INSTALL_DIR}/${BINARY_NAME}"
-        ok "Binary installed from local path: ${BYPATH_LOCAL_BINARY}"
-    else
-        local tmp_file
-        tmp_file=$(mktemp)
-        if ! download "$url" "$tmp_file"; then
-            rm -f "$tmp_file"
-            die "Download failed. Check version/variant or your internet connection."
-        fi
-        mv "$tmp_file" "${INSTALL_DIR}/${BINARY_NAME}"
-        chmod 755 "${INSTALL_DIR}/${BINARY_NAME}"
-        ok "Binary installed to ${INSTALL_DIR}/${BINARY_NAME}"
-    fi
-
-    # Symlink to PATH
-    if [ -d "/usr/local/bin" ]; then
-        ln -sf "${INSTALL_DIR}/${BINARY_NAME}" "/usr/local/bin/${BINARY_NAME}"
-        ok "Symlinked to /usr/local/bin/${BINARY_NAME}"
-    fi
-
-    # Create default config if not exists
-    local config_file="/etc/bypath/config.yaml"
-    if [ ! -f "$config_file" ]; then
-        cat > "$config_file" <<'EOF'
-# Bypath Configuration
-
-server:
-  api_port: 8080
-  dns_port: 53
-  socks_port: 2801
-  api_token: ""
-
-gateway:
-  enabled: true
-  native_tun: true
-  interface: ""
-  dns_upstream:
-    - "1.1.1.1"
-    - "8.8.8.8"
-
-engines:
-  directory: "/opt/bypath/engines"
-  prefer_system: true
-  preferred: "sing-box"
-
-# Rule-based routing: traffic matching a rule goes to its outbound.
-# Rules are evaluated top-to-bottom; first match wins.
-# Outbound values: "direct" (bypass tunnel) or "proxy" (through tunnel).
-routing:
-  rules:
-    - match: "domain_suffix:ir"
-      outbound: "direct"
-    - match: "geoip:ir"
-      outbound: "direct"
-    - match: "geosite:ir"
-      outbound: "direct"
-    - match: "default"
-      outbound: "proxy"
-
-isolation:
-  enabled: true
-EOF
-        ok "Default config created: ${config_file}"
-    else
-        info "Config already exists, not overwriting: ${config_file}"
-    fi
-
-    # Create default profile if not exists
-    local profile_file="/etc/bypath/profiles/default.json"
-    if [ ! -f "$profile_file" ]; then
-        cat > "$profile_file" <<'EOF'
-{
-  "version": 1,
-  "groups": [
-    {
-      "name": "default",
-      "links": []
-    }
-  ],
-  "subscriptions": [],
-  "active_group": "default",
-  "active_index": 0
-}
-EOF
-        ok "Default profile created: ${profile_file}"
-    fi
-
-    # Add server link — from env var or interactive prompt
-    local init_link="${BYPATH_INIT_LINK:-}"
-    if [ -z "$init_link" ] && [ "$IS_INTERACTIVE" = "1" ]; then
-        echo ""
-        local link_answer
-        read -rp "$(echo -e "${CYAN}?${NC}  Paste a server link to add now (vless/vmess/ss/trojan), or press Enter to skip: ")" link_answer </dev/tty 2>/dev/null || link_answer=""
-        init_link="${link_answer:-}"
-    fi
-    if [ -n "$init_link" ]; then
-        echo ""
-        info "Adding server link..."
-        if "${INSTALL_DIR}/${BINARY_NAME}" add "${init_link}" 2>/dev/null; then
-            ok "Server link added"
-        else
-            warn "Could not add server link — run 'bypath add <link>' manually after install"
-        fi
-    fi
-
-    # Download geo rule sets
-    install_geo
-
-    # Check runtime deps
-    check_deps
-
-    # Install systemd service
-    install_systemd
-
-    # Done
-    echo ""
-    echo -e "${GREEN}══════════════════════════════════════════${NC}"
-    echo -e "${GREEN}  ✅ Bypath installed successfully!${NC}"
-    echo -e "${GREEN}══════════════════════════════════════════${NC}"
-    echo ""
-    info "Paths:"
-    echo "    Binary:   ${INSTALL_DIR}/${BINARY_NAME}"
-    echo "    Config:   /etc/bypath/config.yaml"
-    echo "    Profiles: /etc/bypath/profiles/"
-    echo "    Geo:      /etc/bypath/geo/"
-    echo "    Logs:     /var/log/bypath/"
-    echo "    Engines:  ${INSTALL_DIR}/engines/"
-    echo ""
-    info "Quick start:"
-    echo "    1. Add a server:  bypath add <link>"
-    echo "    2. Start gateway: bypath run"
-    echo "    3. Open TUI:      bypath"
-    echo ""
-    info "Or use systemd:"
-    echo "    systemctl enable --now bypath"
-    echo ""
-}
-
-main "$@"
+case "$ACTION" in
+    install)    do_install ;;
+    uninstall)  detect_platform; detect_environment; do_uninstall ;;
+    rollback)   detect_platform; detect_environment; do_rollback ;;
+esac

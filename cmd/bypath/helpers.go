@@ -5,30 +5,70 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"unicode"
 
+	"github.com/liberoute/bypath/internal/config"
 	"github.com/liberoute/bypath/internal/paths"
+	"github.com/liberoute/bypath/internal/profile"
 )
 
-func detectEngine(protocol, forceEngine string) string {
+func detectEngine(link *profile.Link, forceEngine string) string {
 	if forceEngine != "" {
 		return forceEngine
 	}
+	if link == nil {
+		return "unknown"
+	}
+	if link.EncryptedVLESS() {
+		return "xray (required)"
+	}
+	if link.Protocol == "openvpn" {
+		return "sing-box (1.14+)"
+	}
 
-	switch protocol {
+	switch link.Protocol {
 	case "vmess", "vless", "trojan", "shadowsocks", "hysteria2", "tuic":
+		if link.Network == "xhttp" || link.Network == "splithttp" {
+			return "xray (required)"
+		}
 		return "sing-box (auto)"
 	case "wireguard":
 		return "wireguard-go (auto)"
-	case "openvpn":
-		return "openvpn (auto)"
 	case "ssh":
 		return "ssh (native)"
 	default:
 		return "sing-box (fallback)"
 	}
+}
+
+// benchEngineFor selects the engine used by 'bypath bench' for a link.
+func benchEngineFor(link *profile.Link) string {
+	if link.EncryptedVLESS() {
+		return "xray"
+	}
+	if link.Protocol == "openvpn" {
+		return "sing-box"
+	}
+	if link.Network == "xhttp" || link.Network == "splithttp" {
+		return "xray"
+	}
+	return "sing-box"
+}
+
+// engineBinary resolves an engine binary from PATH or the managed engine directory.
+func engineBinary(name string) string {
+	bin := name
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
+	if path, err := exec.LookPath(bin); err == nil {
+		return path
+	}
+	return filepath.Join(engineDir(), bin)
 }
 
 func detectEngineFromFile(path, forceEngine string) string {
@@ -195,12 +235,13 @@ server:
   api_token: ""
 
 gateway:
-  enabled: true
+  enabled: false
   native_tun: true
   interface: ""
   dns_upstream:
     - "1.1.1.1"
     - "8.8.8.8"
+  dns_mode: "strict"
 
 engines:
   directory: "%s"
@@ -216,16 +257,10 @@ engines:
 
 profiles:
   directory: "%s"
-  active_group: "default"
+  active_group: ""
 
 routing:
   rules:
-    - match: "domain_suffix:ir"
-      outbound: "direct"
-    - match: "geoip:ir"
-      outbound: "direct"
-    - match: "geosite:ir"
-      outbound: "direct"
     - match: "default"
       outbound: "proxy"
 
@@ -234,7 +269,7 @@ isolation:
 
 sni_spoof:
   enabled: false
-  sni: "digikala.com"
+  sni: "example.com"
 `, p.EngineDir, p.ProfileDir)
 
 	return os.WriteFile(path, []byte(content), 0644)
@@ -268,4 +303,25 @@ func tmpDir() string {
 
 func engineDir() string {
 	return paths.Get().EngineDir
+}
+
+// diagnosticEngines resolves the engine settings for read-only commands that
+// do not run the daemon. It accepts -c/--config so the report describes the
+// configuration the operator actually uses, and falls back to the paths default
+// when the file cannot be loaded.
+func diagnosticEngines(args []string) (dir string, preferSystem bool) {
+	cfgPath := paths.Get().ConfigFile
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-c", "--config":
+			if i+1 < len(args) {
+				cfgPath = args[i+1]
+			}
+		}
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return engineDir(), true
+	}
+	return cfg.Engines.Directory, cfg.Engines.PreferSystem
 }

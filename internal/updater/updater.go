@@ -2,11 +2,14 @@
 package updater
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -23,11 +26,15 @@ type Release struct {
 	Assets  []Asset `json:"assets"`
 }
 
-// Asset represents a downloadable file in a release.
+// Asset represents a downloadable file in a release. Digest is the SHA-256
+// digest published by the hosting API ("sha256:<hex>"); it is the only accepted
+// proof that the bytes about to replace the running executable are the ones the
+// release published.
 type Asset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 	Size               int64  `json:"size"`
+	Digest             string `json:"digest"`
 }
 
 // CheckResult holds the result of an update check.
@@ -38,17 +45,25 @@ type CheckResult struct {
 	ReleaseNotes   string `json:"release_notes,omitempty"`
 	DownloadURL    string `json:"download_url,omitempty"`
 	AssetName      string `json:"asset_name,omitempty"`
+	DownloadDigest string `json:"download_digest,omitempty"`
 }
 
-// Check queries the update URL for a newer version.
+// Check queries the build's update URL for a newer version.
 func Check() (*CheckResult, error) {
-	if build.UpdateURL == "" {
+	return CheckURL(build.UpdateURL)
+}
+
+// CheckURL queries an explicit release feed. The feed must return the GitHub
+// releases JSON shape, including a sha256 digest per asset; an empty URL means
+// this build has no update channel.
+func CheckURL(feedURL string) (*CheckResult, error) {
+	if feedURL == "" {
 		return &CheckResult{Available: false, CurrentVersion: build.Version}, nil
 	}
 
 	transport := &http.Transport{Proxy: http.ProxyFromEnvironment}
 	client := &http.Client{Timeout: 15 * time.Second, Transport: transport}
-	req, err := http.NewRequest("GET", build.UpdateURL, nil)
+	req, err := http.NewRequest("GET", feedURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
@@ -94,6 +109,7 @@ func Check() (*CheckResult, error) {
 				if asset.Name == assetName {
 					result.DownloadURL = asset.BrowserDownloadURL
 					result.AssetName = asset.Name
+					result.DownloadDigest = asset.Digest
 					break
 				}
 			}
@@ -101,6 +117,45 @@ func Check() (*CheckResult, error) {
 	}
 
 	return result, nil
+}
+
+// ParseDigest accepts the "sha256:<hex>" form published by the release API and
+// returns the lowercase hex digest. Anything else is rejected.
+func ParseDigest(digest string) (string, error) {
+	d := strings.ToLower(strings.TrimSpace(digest))
+	if !strings.HasPrefix(d, "sha256:") {
+		return "", fmt.Errorf("unsupported digest %q (want sha256:<hex>)", digest)
+	}
+	d = strings.TrimPrefix(d, "sha256:")
+	if len(d) != sha256.Size*2 {
+		return "", fmt.Errorf("malformed sha256 digest %q", digest)
+	}
+	if _, err := hex.DecodeString(d); err != nil {
+		return "", fmt.Errorf("malformed sha256 digest %q", digest)
+	}
+	return d, nil
+}
+
+// VerifyFile checks that path matches the published digest byte for byte.
+func VerifyFile(path, digest string) error {
+	want, err := ParseDigest(digest)
+	if err != nil {
+		return err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	if got != want {
+		return fmt.Errorf("checksum mismatch: got sha256:%s, want sha256:%s", got, want)
+	}
+	return nil
 }
 
 // isNewer returns true if latest is a newer semver than current.
@@ -134,9 +189,9 @@ func isNewer(latest, current string) bool {
 	return false
 }
 
-// CheckAndLog performs an update check and logs the result.
-func CheckAndLog() {
-	result, err := Check()
+// CheckAndLog performs an update check against feedURL and logs the result.
+func CheckAndLog(feedURL string) {
+	result, err := CheckURL(feedURL)
 	if err != nil {
 		log.Printf("⚠️  Update check failed: %v", err)
 		return

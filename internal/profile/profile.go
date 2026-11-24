@@ -2,6 +2,7 @@ package profile
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,31 +10,66 @@ import (
 	"sync"
 )
 
+// ErrInvalidGroupName marks a group name that cannot be used as a file name.
+var ErrInvalidGroupName = errors.New("invalid group name")
+
+// ValidGroupName accepts names that map to one plain file inside the profile
+// directory: no separators, no dot segments, no leading dot (which would
+// collide with state files such as .active).
+func ValidGroupName(name string) bool {
+	if name == "" || len(name) > 64 || name == "." || name == ".." || strings.HasPrefix(name, ".") {
+		return false
+	}
+	if strings.ContainsAny(name, `/\:`+"\x00") {
+		return false
+	}
+	return filepath.Base(name) == name
+}
+
 // Link represents a single proxy/VPN link configuration.
 type Link struct {
-	Remark     string `json:"remark"`
-	Protocol   string `json:"protocol"` // vmess, vless, trojan, shadowsocks, wireguard, openvpn
-	RawURI     string `json:"raw_uri"`  // original URI (vmess://..., vless://..., etc.)
-	Group      string `json:"group"`
+	Remark   string `json:"remark"`
+	Protocol string `json:"protocol"` // vmess, vless, trojan, shadowsocks, wireguard, openvpn
+	RawURI   string `json:"raw_uri"`  // original URI (vmess://..., vless://..., etc.)
+	Group    string `json:"group"`
 
 	// Parsed fields (populated from RawURI)
-	Address    string `json:"address"`
-	Port       int    `json:"port"`
-	UUID       string `json:"uuid,omitempty"`
-	AlterId    int    `json:"alter_id,omitempty"`
-	Security   string `json:"security,omitempty"`
-	Network    string `json:"network,omitempty"` // tcp, ws, grpc, etc.
-	TLS        bool   `json:"tls,omitempty"`
-	Insecure   bool   `json:"insecure,omitempty"` // skip TLS certificate verification
-	SNI        string `json:"sni,omitempty"`
-	Path       string `json:"path,omitempty"`
-	Host       string `json:"host,omitempty"`
-	Flow       string `json:"flow,omitempty"`
+	Address           string   `json:"address"`
+	Port              int      `json:"port"`
+	UUID              string   `json:"uuid,omitempty"`
+	AlterId           int      `json:"alter_id,omitempty"`
+	Security          string   `json:"security,omitempty"`
+	Network           string   `json:"network,omitempty"` // tcp, ws, grpc, etc.
+	TLS               bool     `json:"tls,omitempty"`
+	Insecure          bool     `json:"insecure,omitempty"` // skip TLS certificate verification
+	SNI               string   `json:"sni,omitempty"`
+	Path              string   `json:"path,omitempty"`
+	Host              string   `json:"host,omitempty"`
+	Flow              string   `json:"flow,omitempty"`
+	ALPN              []string `json:"alpn,omitempty"`
+	GRPCServiceName   string   `json:"grpc_service_name,omitempty"`
+	GRPCMultiMode     bool     `json:"grpc_multi_mode,omitempty"`
+	RealitySpiderX    string   `json:"reality_spider_x,omitempty"`
+	WSMaxEarlyData    int      `json:"ws_max_early_data,omitempty"`
+	WSEarlyDataHeader string   `json:"ws_early_data_header,omitempty"`
+	// UnsupportedParams contains names only, never credential-bearing values.
+	// Engines must reject these rather than silently change a stored profile.
+	UnsupportedParams []string `json:"unsupported_params,omitempty"`
 
 	// Reality/UTLS fields (populated from VLESS Reality URIs)
-	RealityPublicKey string `json:"reality_pbk,omitempty"`  // pbk param
-	RealityShortID   string `json:"reality_sid,omitempty"`  // sid param
-	Fingerprint      string `json:"fingerprint,omitempty"`  // fp param (UTLS)
+	RealityPublicKey string `json:"reality_pbk,omitempty"` // pbk param
+	RealityShortID   string `json:"reality_sid,omitempty"` // sid param
+	Fingerprint      string `json:"fingerprint,omitempty"` // fp param (UTLS)
+
+	// VLESS Encryption (Xray 26.x). Secret-bearing: never log or echo this value.
+	Encryption string `json:"encryption,omitempty"`
+	// SupportX25519MLKEM768 is a REALITY compatibility hint from the URI. It is
+	// informational only and must never be injected as an Xray JSON property.
+	SupportX25519MLKEM768 bool `json:"support_x25519mlkem768,omitempty"`
+
+	// OpenVPN profile reference. Secrets stay in the 0600 .ovpn file, never in JSON.
+	OVPNPath             string `json:"ovpn_path,omitempty"`
+	OVPNAuthUserPassFile string `json:"ovpn_auth_user_pass_file,omitempty"`
 
 	// XHTTP / SplitHTTP transport fields
 	TransportMode string `json:"transport_mode,omitempty"` // mode=auto|packet-up|stream-up|stream-one
@@ -49,11 +85,20 @@ type Link struct {
 	SSHKeyPath  string `json:"ssh_key_path,omitempty"` // Path to SSH private key file
 	SSHPassword string `json:"ssh_password,omitempty"` // Password auth (if no key)
 
-	// HTTPSCapable indicates HTTPS relay capability:
+	// HTTPS capable probe result:
 	//   0 = untested (default zero value)
 	//   1 = passed HTTPS test
 	//  -1 = failed HTTPS test
 	HTTPSCapable int `json:"https_capable,omitempty"`
+
+	// RequiresAuth marks an OpenVPN profile that asks for a username/password.
+	// It is recorded at import so lists can prompt without re-parsing the file.
+	RequiresAuth bool `json:"requires_auth,omitempty"`
+
+	// SourceID identifies the subscription that produced this link
+	// (sha256 of the normalized URL, truncated). The URL itself is not copied
+	// into every link, so a subscription token is stored exactly once.
+	SourceID string `json:"source_id,omitempty"`
 
 	// CDNDetected indicates the static heuristic flagged this as a CDN link.
 	// This is computed, not persisted (use json:"-" or omitempty with recompute on load).
@@ -66,10 +111,21 @@ type Link struct {
 
 // Group represents a collection of links.
 type Group struct {
-	Name         string   `json:"name"`
-	Type         string   `json:"type"` // "basic" or "subscription"
-	Links        []*Link  `json:"links"`
+	Name          string   `json:"name"`
+	Type          string   `json:"type"` // "basic" or "subscription"
+	Links         []*Link  `json:"links"`
 	Subscriptions []string `json:"subscriptions,omitempty"`
+	// SubscriptionMeta records the last refresh outcome per URL. It is parallel
+	// to Subscriptions and never contains link credentials.
+	SubscriptionMeta []SubscriptionInfo `json:"subscription_meta,omitempty"`
+}
+
+// SubscriptionInfo is the persisted refresh state of one subscription URL.
+type SubscriptionInfo struct {
+	URL         string `json:"url"`
+	LastRefresh string `json:"last_refresh,omitempty"`
+	LastError   string `json:"last_error,omitempty"`
+	LinkCount   int    `json:"link_count,omitempty"`
 }
 
 // Manager handles profile/group/link operations.
@@ -193,6 +249,9 @@ func (m *Manager) CreateGroup(name, groupType string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if !ValidGroupName(name) {
+		return fmt.Errorf("%w: %q", ErrInvalidGroupName, name)
+	}
 	if _, exists := m.groups[name]; exists {
 		return fmt.Errorf("group '%s' already exists", name)
 	}
@@ -207,6 +266,9 @@ func (m *Manager) DeleteGroup(name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if !ValidGroupName(name) {
+		return fmt.Errorf("%w: %q", ErrInvalidGroupName, name)
+	}
 	if _, exists := m.groups[name]; !exists {
 		return fmt.Errorf("group '%s' not found", name)
 	}
@@ -222,7 +284,10 @@ func (m *Manager) RenameGroup(oldName, newName string) error {
 
 	oldName = strings.TrimSpace(oldName)
 	newName = strings.TrimSpace(newName)
-	if oldName == "" || newName == "" {
+	if !ValidGroupName(newName) {
+		return fmt.Errorf("%w: %q", ErrInvalidGroupName, newName)
+	}
+	if oldName == "" {
 		return fmt.Errorf("empty group name")
 	}
 	if oldName == newName {
@@ -323,6 +388,9 @@ func (m *Manager) GetActiveLink() *Link {
 	return nil
 }
 
+// Directory returns the profile storage directory.
+func (m *Manager) Directory() string { return m.directory }
+
 // loadAll loads all group files from the profiles directory.
 func (m *Manager) loadAll() error {
 	entries, err := os.ReadDir(m.directory)
@@ -376,6 +444,9 @@ func (m *Manager) SaveGroup(name string) error {
 
 // saveGroup persists a group to disk.
 func (m *Manager) saveGroup(g *Group) error {
+	if !ValidGroupName(g.Name) {
+		return fmt.Errorf("%w: %q", ErrInvalidGroupName, g.Name)
+	}
 	data, err := json.MarshalIndent(g, "", "  ")
 	if err != nil {
 		return err

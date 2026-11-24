@@ -18,8 +18,8 @@ func TestProperty4_CDNClassificationRequiresAllConditions(t *testing.T) {
 
 		// Generate a host that may or may not equal address
 		host := rapid.OneOf(
-			rapid.Just(""),                                                    // empty host
-			rapid.Just(address),                                               // host == address
+			rapid.Just(""),      // empty host
+			rapid.Just(address), // host == address
 			rapid.StringMatching(`[a-z0-9]{1,20}\.[a-z]{2,5}`).Filter(func(s string) bool { return s != "" && s != address }), // host != address
 		).Draw(t, "host")
 

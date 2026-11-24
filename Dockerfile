@@ -11,9 +11,9 @@ COPY . .
 
 ARG VARIANT=lite
 ARG BUILD_TAGS=""
-ARG VERSION=2.1.0-dev
+ARG VERSION=3.0.0
 
-RUN CGO_ENABLED=0 GOOS=linux go build \
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false \
     ${BUILD_TAGS:+-tags $BUILD_TAGS} \
     -ldflags="-s -w -X github.com/liberoute/bypath/internal/build.Version=${VERSION} -X github.com/liberoute/bypath/internal/build.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     -o /bypath ./cmd/bypath

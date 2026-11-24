@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -38,29 +39,67 @@ type Tunnel struct {
 
 // Manager manages all active tunnels and chains.
 type Manager struct {
-	engineMgr  *engine.Manager
-	config     *config.Config
-	configGen  *ConfigGenerator
-	tunnels    map[string]*Tunnel
-	chains     map[string]*Chain
-	mu         sync.RWMutex
+	engineMgr *engine.Manager
+	config    *config.Config
+	configGen *ConfigGenerator
+	tunnels   map[string]*Tunnel
+	chains    map[string]*Chain
+	mu        sync.RWMutex
 }
 
 // NewManager creates a new tunnel manager.
 func NewManager(cfg *config.Config, engineMgr *engine.Manager) *Manager {
+	return &Manager{
+		engineMgr: engineMgr,
+		config:    cfg,
+		configGen: newConfigGenerator(cfg),
+		tunnels:   make(map[string]*Tunnel),
+		chains:    make(map[string]*Chain),
+	}
+}
+
+// newConfigGenerator snapshots every policy input the generator reads. The
+// manager must never keep a partial copy: a missing field means a tunnel
+// started through the API quietly uses a different policy than the gateway.
+func newConfigGenerator(cfg *config.Config) *ConfigGenerator {
 	cg := NewConfigGenerator(paths.Get().TmpDir)
 	cg.WhitelistCountries = cfg.Whitelist.Countries
 	cg.GeositeCountries = cfg.Whitelist.GeositeCountries
 	cg.BypassDomains = cfg.Whitelist.BypassDomains
-	cg.SOCKSPort = cfg.Server.SOCKSPort
-
-	return &Manager{
-		engineMgr: engineMgr,
-		config:    cfg,
-		configGen: cg,
-		tunnels:   make(map[string]*Tunnel),
-		chains:    make(map[string]*Chain),
+	cg.ForceProxyDomains = cfg.Whitelist.ForceProxyDomains
+	cg.CountrySplit = cfg.Routing.CountrySplit
+	cg.RoutingRules = make([]RoutingRule, len(cfg.Routing.Rules))
+	for i, r := range cfg.Routing.Rules {
+		cg.RoutingRules[i] = RoutingRule{Match: r.Match, Outbound: r.Outbound}
 	}
+	if len(cfg.Routing.ExternalOutbounds) > 0 {
+		cg.ExternalOutbounds = make(map[string]string, len(cfg.Routing.ExternalOutbounds))
+		for name, url := range cfg.Routing.ExternalOutbounds {
+			cg.ExternalOutbounds[name] = url
+		}
+	}
+	for _, entry := range cfg.Gateway.LocalDNS {
+		if entry.Server != "" && len(entry.Domains) > 0 {
+			cg.LocalDNSRules = append(cg.LocalDNSRules, LocalDNSRule{Server: entry.Server, Domains: entry.Domains})
+		}
+	}
+	cg.SOCKSPort = cfg.Server.SOCKSPort
+	cg.SOCKSListen = cfg.Server.SOCKSListenAddress()
+	cg.SOCKSUsername = cfg.Server.SOCKSUsername
+	cg.SOCKSPassword = cfg.Server.SOCKSPassword
+	cg.SSHHostKey = cfg.Server.SSHHostKey
+	return cg
+}
+
+// Reload replaces the policy used by tunnels started after this call. Running
+// tunnels keep the configuration they were started with until they are
+// restarted by the caller; the generator itself must never change underneath
+// an in-flight start, hence the write lock.
+func (m *Manager) Reload(cfg *config.Config) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.config = cfg
+	m.configGen = newConfigGenerator(cfg)
 }
 
 // StartTunnel starts a single tunnel for the given profile link.
@@ -78,10 +117,10 @@ func (m *Manager) StartTunnel(ctx context.Context, name string, link *profile.Li
 		return fmt.Errorf("tunnel %s is already running", name)
 	}
 
-	// Determine which engine to use based on protocol
+	// Determine which engine to use based on protocol and profile capabilities.
 	engineName := opts.EngineName
 	if engineName == "" {
-		engineName = m.resolveEngine(link.Protocol)
+		engineName = m.resolveEngineForLink(link)
 	}
 
 	eng, err := m.engineMgr.Get(engineName)
@@ -92,6 +131,7 @@ func (m *Manager) StartTunnel(ctx context.Context, name string, link *profile.Li
 	// Generate config file for the engine
 	configFile, err := m.generateConfig(eng, link)
 	if err != nil {
+		m.configGen.DiscardGeneration()
 		return fmt.Errorf("generating config for tunnel %s: %w", name, err)
 	}
 
@@ -117,7 +157,29 @@ func (m *Manager) StartTunnel(ctx context.Context, name string, link *profile.Li
 	// Start the process
 	proc, err := engine.StartProcess(ctx, runOpts)
 	if err != nil {
+		m.configGen.DiscardConfig(configFile)
 		return fmt.Errorf("starting tunnel %s: %w", name, err)
+	}
+
+	// An open SOCKS port is not proof of a working tunnel. For OpenVPN require
+	// the handshake to complete and one HTTPS round trip to succeed.
+	if link.Protocol == "openvpn" {
+		listenPort := link.ListenPort
+		if listenPort == 0 {
+			listenPort = m.config.Server.SOCKSPort
+		}
+		m.mu.Unlock()
+		portErr := waitForPort(listenPort, 20*time.Second)
+		healthy := portErr == nil && profile.TestHTTPS(ctx, listenPort)
+		m.mu.Lock()
+		if !healthy {
+			proc.Stop()
+			m.configGen.DiscardConfig(configFile)
+			if portErr != nil {
+				return fmt.Errorf("OpenVPN tunnel %s: port %d not ready: %w", name, listenPort, portErr)
+			}
+			return fmt.Errorf("OpenVPN tunnel %s did not pass the HTTPS health check", name)
+		}
 	}
 
 	tunnel := &Tunnel{
@@ -157,58 +219,39 @@ func (m *Manager) startSSHTunnel(ctx context.Context, name string, link *profile
 		listenPort = m.config.Server.SOCKSPort
 	}
 
-	// Determine SSH port
-	sshPort := link.Port
-	if sshPort == 0 {
-		sshPort = 22
+	knownHosts := DefaultSSHKnownHosts()
+	if err := EnsureSSHKnownHosts(knownHosts); err != nil {
+		return err
 	}
-
-	// Determine SSH user
-	sshUser := link.SSHUser
-	if sshUser == "" {
-		sshUser = "root"
-	}
-
-	// Build SSH command args
-	args := []string{
-		fmt.Sprintf("-D 0.0.0.0:%d", listenPort),
-		"-N",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "ServerAliveInterval=30",
-		"-o", "ServerAliveCountMax=3",
-	}
-
-	// Add key-based auth if key path is set
-	if link.SSHKeyPath != "" {
-		args = append(args, "-i", link.SSHKeyPath)
-	}
-
-	// Add SSH port
-	args = append(args, "-p", fmt.Sprintf("%d", sshPort))
-
-	// Add user@host
-	args = append(args, fmt.Sprintf("%s@%s", sshUser, link.Address))
-
-	// Handle password-based auth: prepend sshpass if no key and password is set
-	var binary string
-	var finalArgs []string
+	sshPassPath := ""
 	if link.SSHKeyPath == "" && link.SSHPassword != "" {
-		// Password auth via sshpass
 		if !m.engineMgr.SSHPassAvailable {
 			return fmt.Errorf("sshpass not found: password auth requires sshpass (install it or use key-based auth)")
 		}
-		binary = "sshpass"
-		finalArgs = append([]string{"-p", link.SSHPassword, eng.Path}, args...)
-	} else {
-		binary = eng.Path
-		finalArgs = args
+		resolved, err := exec.LookPath("sshpass")
+		if err != nil {
+			return fmt.Errorf("sshpass not found: %w", err)
+		}
+		sshPassPath = resolved
+	}
+
+	cmd, err := BuildSSHCommand(link, SSHOptions{
+		SSHPath:     eng.Path,
+		SSHPassPath: sshPassPath,
+		ListenAddr:  m.config.Server.SOCKSListenAddress(),
+		ListenPort:  listenPort,
+		KnownHosts:  knownHosts,
+		HostKey:     m.config.Server.SSHHostKey,
+	})
+	if err != nil {
+		return err
 	}
 
 	// Build run options — use Args (not ConfigFile) since SSH doesn't use a config file
 	runOpts := engine.RunOptions{
-		Engine: &engine.Engine{Name: "ssh", Path: binary},
-		Args:   finalArgs,
+		Engine: &engine.Engine{Name: "ssh", Path: cmd.Binary},
+		Args:   cmd.Args,
+		Env:    cmd.Env,
 	}
 
 	// Start the process
@@ -242,6 +285,35 @@ func (m *Manager) startSSHTunnel(ctx context.Context, name string, link *profile
 	return nil
 }
 
+// StopAll stops every tunnel and chain this manager owns and waits briefly for
+// each engine to exit. Gateway shutdown calls it so no engine can survive the
+// daemon and keep a listener or a generated config alive.
+func (m *Manager) StopAll() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for name, t := range m.tunnels {
+		if t.Process != nil && t.Process.IsRunning() {
+			t.Process.Stop()
+			t.Process.WaitStopped(2 * time.Second)
+			log.Printf("🛑 Tunnel %s stopped", name)
+		}
+		t.Status = StatusStopped
+	}
+	for name, c := range m.chains {
+		for i := len(c.Hops) - 1; i >= 0; i-- {
+			hop := c.Hops[i]
+			if hop.Process != nil && hop.Process.IsRunning() {
+				hop.Process.Stop()
+				hop.Process.WaitStopped(2 * time.Second)
+			}
+			hop.Status = StatusStopped
+		}
+		c.Status = StatusStopped
+		log.Printf("🛑 Chain %s stopped", name)
+	}
+}
+
 // StopTunnel stops a running tunnel.
 func (m *Manager) StopTunnel(name string) error {
 	m.mu.Lock()
@@ -256,6 +328,14 @@ func (m *Manager) StopTunnel(name string) error {
 		if err := t.Process.Stop(); err != nil {
 			return fmt.Errorf("stopping tunnel %s: %w", name, err)
 		}
+	}
+
+	// Remove the whole generation directory: config plus any material
+	// extracted from .ovpn profiles. It is per-generation, so stopping one
+	// tunnel can never delete another tunnel's keys.
+	if t.ConfigFile != "" {
+		m.configGen.DiscardConfig(t.ConfigFile)
+		t.ConfigFile = ""
 	}
 
 	t.Status = StatusStopped
@@ -279,15 +359,20 @@ func (m *Manager) GetStatus() map[string]Status {
 	return status
 }
 
-// resolveEngine determines which engine to use for a given protocol.
-func (m *Manager) resolveEngine(protocol string) string {
-	switch protocol {
+// resolveEngineForLink picks the only engine that can faithfully run the link.
+// VLESS Encryption is xray-only; sing-box would silently drop it. OpenVPN
+// profiles run as sing-box 1.14+ endpoints, never through the native binary.
+func (m *Manager) resolveEngineForLink(link *profile.Link) string {
+	if link.EncryptedVLESS() {
+		return "xray"
+	}
+	switch link.Protocol {
 	case "vmess", "vless", "trojan", "shadowsocks", "hysteria2":
 		return "sing-box"
 	case "wireguard":
 		return "wireguard-go"
 	case "openvpn":
-		return "openvpn"
+		return "sing-box"
 	default:
 		return "sing-box" // default fallback
 	}

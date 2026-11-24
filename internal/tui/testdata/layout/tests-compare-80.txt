@@ -1,0 +1,17 @@
+BYPATH [FULL]  CONNECTED  pid 4242  ·  running Maple-IPv4                       
+ 3/12 Tests   tab/shift+tab: cycle · 1-9: jump                                  
+                                                                                
+ Tests ·  Run  Results  Compare    t cycles                                     
+ latency · 2 verified · 0 measured · 2 not measured                             
+                                                                                
+ Verified (ranked)                                                              
+  1. Maple-IPv4           VLESS     VERIFIED      delay 41 ms · https p90 88 ms 
+  2. 东京节点-非常长-的…  TROJAN    VERIFIED      delay 180 ms · https p90 260… 
+ Not measured                                                                   
+ No usable number was produced. This is not automatically a dead link; the      
+ reason column says what stopped it.                                            
+  1. eu-tcp               OPENVPN   FAILED        the DIRECT control failed, s… 
+  2. Example VPN Europe…  OPENVPN   INCONCLUSIVE  the exit address is shared w… 
+ ↑/↓ move · enter evidence · K kind · r reload                                  
+ t run/results/compare  K kind  s scope  g group  l link  i hidden              
+ enter start/evidence  c cancel  r reload  ↑/↓ move                             

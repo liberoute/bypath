@@ -1,0 +1,3 @@
+# Local build outputs and Git metadata are not inputs to any image.
+.git
+build

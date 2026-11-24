@@ -1,0 +1,20 @@
+BYPATH [FULL]  CONNECTED  pid 4242      
+ 3/12 Tests                             
+                                        
+ Tests ·  Run  Results  Compare    t cyc
+ latency · 2 verified · 0 measured · 2 n
+                                        
+ Verified (ranked)                      
+  1. Maple-IP…  VERIFIED      delay 41… 
+  2. 东京节点…  VERIFIED      delay 18… 
+ Not measured                           
+ No usable number was produced. This is 
+ not automatically a dead link; the     
+ reason column says what stopped it.    
+  1. eu-tcp     FAILED        the DIRE… 
+  2. Example …  INCONCLUSIVE  the exit… 
+ ↑/↓ move · enter evidence · K kind · r 
+ t run/results/compare  K kind  s scope 
+ g group  l link  i hidden              
+ enter start/evidence  c cancel         
+ r reload  ↑/↓ move                     

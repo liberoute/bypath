@@ -7,7 +7,7 @@ import (
 
 func TestParseVmess(t *testing.T) {
 	// Standard vmess base64 JSON
-	uri := "vmess://eyJ2IjoiMiIsInBzIjoidGVzdC1zZXJ2ZXIiLCJhZGQiOiIxLjIuMy40IiwicG9ydCI6NDQzLCJpZCI6IjEyMzQ1Njc4LTEyMzQtMTIzNC0xMjM0LTEyMzQ1Njc4OTBhYiIsImFpZCI6MCwic2N5IjoiYXV0byIsIm5ldCI6IndzIiwiaG9zdCI6ImV4YW1wbGUuY29tIiwicGF0aCI6Ii93cyIsInRscyI6InRscyIsInNuaSI6ImV4YW1wbGUuY29tIn0="
+	uri := "vmess://eyJ2IjoiMiIsInBzIjoidGVzdC1zZXJ2ZXIiLCJhZGQiOiIxOTIuMC4yLjQiLCJwb3J0Ijo0NDMsImlkIjoiMTIzNDU2NzgtMTIzNC0xMjM0LTEyMzQtMTIzNDU2Nzg5MGFiIiwiYWlkIjowLCJzY3kiOiJhdXRvIiwibmV0Ijoid3MiLCJob3N0IjoiZXhhbXBsZS5jb20iLCJwYXRoIjoiL3dzIiwidGxzIjoidGxzIiwic25pIjoiZXhhbXBsZS5jb20ifQ"
 
 	link, err := ParseURI(uri)
 	if err != nil {
@@ -17,7 +17,7 @@ func TestParseVmess(t *testing.T) {
 	if link.Protocol != "vmess" {
 		t.Errorf("protocol: got %s", link.Protocol)
 	}
-	if link.Address != "1.2.3.4" {
+	if link.Address != "192.0.2.4" {
 		t.Errorf("address: got %s", link.Address)
 	}
 	if link.Port != 443 {
@@ -157,7 +157,7 @@ func TestParseTrojan(t *testing.T) {
 
 func TestParseShadowsocks(t *testing.T) {
 	// ss://base64(method:password)@host:port#remark
-	uri := "ss://YWVzLTI1Ni1nY206bXlwYXNz@1.2.3.4:8388#ss-test"
+	uri := "ss://YWVzLTI1Ni1nY206bXlwYXNz@192.0.2.4:8388#ss-test"
 
 	link, err := ParseURI(uri)
 	if err != nil {
@@ -167,7 +167,7 @@ func TestParseShadowsocks(t *testing.T) {
 	if link.Protocol != "shadowsocks" {
 		t.Errorf("protocol: got %s", link.Protocol)
 	}
-	if link.Address != "1.2.3.4" {
+	if link.Address != "192.0.2.4" {
 		t.Errorf("address: got %s", link.Address)
 	}
 	if link.Port != 8388 {
@@ -267,7 +267,7 @@ func TestParseSSH(t *testing.T) {
 	})
 
 	t.Run("minimal-defaults-port", func(t *testing.T) {
-		uri := "ssh://admin@192.168.1.1#home-router"
+		uri := "ssh://admin@192.0.2.53#home-router"
 
 		link, err := ParseURI(uri)
 		if err != nil {
@@ -277,8 +277,8 @@ func TestParseSSH(t *testing.T) {
 		if link.Protocol != "ssh" {
 			t.Errorf("protocol: got %s, want ssh", link.Protocol)
 		}
-		if link.Address != "192.168.1.1" {
-			t.Errorf("address: got %s, want 192.168.1.1", link.Address)
+		if link.Address != "192.0.2.53" {
+			t.Errorf("address: got %s, want 192.0.2.53", link.Address)
 		}
 		if link.Port != 22 {
 			t.Errorf("port: got %d, want 22 (default)", link.Port)

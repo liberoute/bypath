@@ -1,285 +1,281 @@
 # Bypath
 
-Network gateway that transparently routes LAN traffic through encrypted tunnels. Set your device's DNS and Gateway to the Bypath machine — done.
+Bypath is a self-hosted network gateway for Linux. It routes traffic from your
+own devices through a proxy server you control, either transparently (devices
+use the Bypath machine as their gateway and DNS server) or as a SOCKS5/HTTP
+proxy for individual applications.
 
-End-user docs: see the project wiki (GitHub Wiki / `.wiki` checkout).
+Bypath is provider-neutral. It ships with no account, no subscription, no
+server, no credentials and no routing policy based on where you live. You add
+your own connection (a proxy URI or a subscription URL you are entitled to use)
+during first-run setup.
 
-Iranian IPs go direct (no tunnel). Everything else goes through your proxy server.
+> **Release:** `v3.0.0`, promoted from the reviewed `v3.0.0-rc.4` baseline. Read
+> [RELEASE_NOTES.md](RELEASE_NOTES.md) and [SECURITY.md](SECURITY.md) before
+> exposing it to a network.
 
-## Features
+## Modes
 
-- **Zero-config for clients** — just change DNS/Gateway
-- **Country whitelist** — IR traffic bypasses tunnel automatically (sing-box geoip)
-- **Multi-protocol** — VMess, VLESS (Reality + **XHTTP**), Trojan, Shadowsocks, WireGuard, SSH, SOCKS5, HTTP proxy
-- **Subscription support** — add URL, auto-fetch (SOCKS/env/direct), `#remark` → group name, dedupe, offline `sub import`
-- **Parallel speed test** — test all servers simultaneously, auto-select best
-- **Interactive TUI** — tab-based terminal UI (Home / Servers / Subscriptions)
-- **Dual engine** — sing-box (default, embedded in full build) + xray as automatic fallback; **xray auto-preferred for XHTTP**
-- **Rule-based routing** — geoip/geosite/domain rules map traffic to direct or proxy outbounds
-- **Home DNS / private TLD support** — route `.home`, `.lan`, `.internal` (or any private TLD) to your local DNS server via `gateway.local_dns`
-- **Auto-fallback** — if a link or engine fails, tries the next one automatically
-- **Mixed proxy** — SOCKS5 + HTTP on configurable port (default: 2801)
-- **API authentication** — token-based auth for REST API
-- **PID management** — clean start/stop without orphan processes
-- **Auto-install** — installer handles all dependencies automatically
-
-## Installation
-
-One-liner install (recommended):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/liberoute/bypath/main/install.sh | sudo bash
-```
-
-Or with a specific version and variant:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/liberoute/bypath/main/install.sh | sudo bash -s -- v2.6.2 full
-```
-
-Or download and run manually (no `sudo` needed — the installer escalates automatically):
-
-```bash
-curl -fsSL -o install.sh https://raw.githubusercontent.com/liberoute/bypath/main/install.sh
-chmod +x install.sh
-./install.sh
-```
-
-The installer will:
-- **Auto-escalate to root** via sudo if needed (v2.6.3+) — no manual `sudo` required
-- Detect your OS and architecture automatically
-- Download the correct binary from GitHub releases (or use `BYPATH_LOCAL_BINARY` for a local binary)
-- **Auto-install dependencies** (sing-box, iptables, iproute2, curl — tun2socks only needed in legacy mode)
-- **Free port 53** — stops `systemd-resolved` (Debian/Ubuntu) and `dnsmasq` (Armbian/Raspbian) if active
-- Install to `/opt/bypath/` with proper directory structure
-- Download geo rule sets (`geoip-ir.srs`, `geosite-ir.srs`) for Iran IP/domain whitelist
-- **`bypath run` auto-downloads** any missing geoip files at startup (clean-machine safe)
-- **Prompt for a server link** to add right after install (in interactive mode)
-- Create a systemd service. Bypath stops `dnsmasq` at runtime only if it was already active, and restores that same runtime state on exit (no `Conflicts=` — starting dnsmasq must not stop bypath)
-
-### Installer options
-
-| Usage | Description |
-|-------|-------------|
-| `./install.sh` | Interactive — latest version, asks for variant |
-| `./install.sh v2.3.0` | Specific version, lite |
-| `./install.sh v2.3.0 full` | Specific version, full variant |
-| `./install.sh latest full` | Latest version, full variant |
-
-Environment variables:
-
-| Variable | Description |
-|----------|-------------|
-| `BYPATH_INSTALL_DIR` | Override install path (default: `/opt/bypath`) |
-| `BYPATH_NO_SYSTEMD=1` | Skip systemd service creation |
-| `BYPATH_INIT_LINK=<uri>` | Server link to add during install (vmess/vless/ss/trojan) |
-| `BYPATH_LOCAL_BINARY=<path>` | Use a local binary instead of downloading from GitHub |
-
-In interactive mode (TTY), the installer will prompt for a server link even without `BYPATH_INIT_LINK`.
-
-## Quick Start
-
-```bash
-# After installation:
-bypath sub add "https://your-subscription-url#my-sub-name"   # group = my-sub-name
-bypath sub update
-# If panel blocked on device: scp dump then → bypath sub import -g my-sub-name dump.txt
-bypath bench --auto
-bypath run
-```
-
-Then on your phone/laptop: set Gateway and DNS to the Bypath machine's IP.
-
-## Usage
-
-### Interactive TUI
-```bash
-bypath
-```
-
-Tab-based interface:
-- **Home** — Start/Stop gateway, speed test, add subscription, change port, status
-- **Servers** — Browse groups (0-9), select server, ping, bench
-- **Subscriptions** — Update, rename, delete subscriptions
-
-### CLI
-```bash
-# Gateway
-bypath run                        # Start gateway
-bypath run -c /path/to/config     # Custom config path
-bypath stop                       # Stop gateway
-
-# Servers
-bypath add <uri>                  # Add link (vmess/vless/ss/trojan/ssh/socks5/http)
-bypath list                       # Show all groups and servers
-bypath list -g <group>            # Show specific group
-bypath select <name|number>       # Select active server
-bypath select <number> -g <group> # Select from specific group
-
-# Speed test
-bypath bench                      # Test all groups, show per-group results
-bypath bench -g <group> --auto    # Test specific group + auto-select best
-
-# Subscriptions
-bypath sub add <url>              # Add subscription (auto-creates group)
-bypath sub add -g <name> <url>    # Add to specific group
-bypath sub update                 # Update ALL subscriptions
-bypath sub update -g <group>      # Update specific group
-bypath sub list                   # Show subscription URLs
-bypath sub remove <index>         # Remove subscription by index
-
-# Other
-bypath engines                    # Show available engines
-bypath update                     # Check for updates
-bypath version                    # Show version info
-```
-
-### Supported Protocols
-
-| Protocol | URI Format | Example |
-|----------|-----------|---------|
-| VMess | `vmess://base64...` | Standard v2ray format |
-| VLESS | `vless://uuid@host:port?params#name` | With Reality/TLS support |
-| Trojan | `trojan://pass@host:port?params#name` | Always TLS |
-| Shadowsocks | `ss://base64@host:port#name` | All methods |
-| WireGuard | `wireguard://key@host:port?publickey=x#name` | Native support |
-| SSH | `ssh://[user[:pass]]@host[:port][?key=path]#name` | Dynamic SOCKS5 forwarding |
-| SOCKS5 | `socks5://[user:pass@]host:port#name` | Upstream SOCKS5 proxy |
-| HTTP | `http://[user:pass@]host:port#name` | Upstream HTTP proxy |
-
-## How It Works
-
-```
-Your Phone/Laptop
-    │ Gateway = Bypath IP
-    │ DNS = Bypath IP
-    ▼
-Bypath (iptables → tun0 → sing-box native TUN)
-    │
-    ├── geoip:ir  → DIRECT (Iran IPs)
-    ├── geosite:ir → DIRECT (Iran domains)
-    ├── domain_suffix:.ir → DIRECT
-    └── default   → tunnel → exit IP of your proxy server
-```
-
-Proxy port available for manual configuration:
-- **SOCKS5 + HTTP (mixed)**: `<bypath-ip>:2801` (configurable)
-
-## File Paths
-
-Bypath auto-detects its installation mode:
-
-| | Local (./bypath) | Installed (system) |
+| Mode | What Bypath changes | Who uses it |
 |---|---|---|
-| Config | `configs/default.yaml` | `/etc/bypath/config.yaml` |
-| Profiles | `./data/profiles/` | `/etc/bypath/profiles/` |
-| Temp | `./data/tmp/` | `/tmp/bypath-<pid>/` |
-| Geo data | `./data/geo/` | `/etc/bypath/geo/` |
-| Engines | `./engines/` | `/opt/bypath/engines/` |
-| Logs | stdout | `/var/log/bypath/` |
+| **Proxy-only** | Opens a mixed SOCKS5/HTTP listener on localhost. No routes, DNS, firewall or interface changes. | Applications configured to use a proxy. |
+| **Transparent gateway** | Clients set their gateway and DNS to the Bypath host. Bypath creates a TUN device, redirects DNS and installs its own scoped firewall chains. | Devices that cannot use a proxy directly. |
 
-Detection: if binary is in `/opt/bypath/`, `/usr/local/bin/`, or `/usr/bin/`, or `/etc/bypath/config.yaml` exists → installed mode.
+A fresh installation is proxy-only with the gateway disabled. Bypath never
+starts an empty full-tunnel gateway: the gateway is only enabled after a
+connection has been imported, selected and verified.
 
-## Configuration
+This release is tested natively on **Linux amd64**; **Linux arm64** is built and was exercised in an emulated environment plus an external proxy-mode acceptance report (see Limitations). Debian, Ubuntu
+and Debian-derived distributions are the intended targets. Other platforms and
+architectures are unbuilt or unverified; the installer refuses them unless you
+pass `--allow-unsupported`, and no support is claimed for them. Windows and
+macOS builds are not part of this release.
 
-Config file (auto-created on first run if missing):
+## Install
+
+The release is version-pinned. Download the installer and the checksum list
+from the release you intend to install, verify them, then run the installer.
+Do not use a `/releases/latest` URL.
+
+```bash
+VERSION=v3.0.0
+curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/install.sh"
+curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+sudo bash install.sh --version "$VERSION"
+```
+
+The installer:
+
+- detects the distribution, architecture, systemd, TUN, iptables/nftables,
+  existing DNS services, port conflicts, memory, disk and any existing install;
+- downloads the matching `bypath-linux-<arch>` binary and verifies its SHA-256
+  against the release `SHA256SUMS` before installing;
+- installs to `/opt/bypath/bypath`, links `/usr/local/bin/bypath`, creates the
+  `bypath` system group and writes a systemd unit **without enabling or
+  starting it**;
+- hands off to the interactive first-run wizard, which reviews the
+  configuration and starts nothing that was not confirmed.
+
+It never stops `systemd-resolved`, `dnsmasq`, NetworkManager or another VPN,
+never rewrites `/etc/resolv.conf`, never changes routes, DHCP or the default
+gateway, and never opens a listener on the LAN without an explicit answer.
+
+Useful installer options:
+
+| Option | Effect |
+|---|---|
+| `--dry-run` | Report the host and the plan; change nothing. Works unprivileged. |
+| `--non-interactive` | Take every first-run answer from flags. |
+| `--mode proxy\|gateway` | First-run mode. |
+| `--interface NAME`, `--trusted-cidr CIDR` | Gateway/LAN specifics. Never assumed. |
+| `--socks-port`, `--listen localhost\|lan\|all`, `--listen-ip` | Proxy listener. |
+| `--dns-port`, `--dns-upstream` | Gateway DNS. |
+| `--web off\|loopback\|lan`, `--web-port` | Management panel listener. |
+| `--uri`, `--subscription`, `--group`, `--select` | Import and select a connection during setup. |
+| `--start-service`, `--enable-gateway` | Explicitly start the unit / enable gateway mode after review. |
+| `--install-packages` | Let the wizard `apt-get install` missing gateway packages (iproute2, iptables). Never implied; nothing is installed without it or an explicit yes. |
+| `--uninstall`, `--purge`, `--rollback` | Remove (keep data), remove everything, or restore the previous binary. |
+
+See [INSTALL.md](INSTALL.md) for the full procedure, the non-interactive form
+and recovery steps.
+
+## First run
+
+`bypath setup` walks through ten steps. Every answer is printed back in a
+review block before anything is written:
+
+1. LAN interface (only detected interfaces are offered; nothing is assumed).
+2. Trusted client subnets (required before the proxy can listen on the LAN).
+3. Mode: transparent gateway or proxy-only.
+4. Proxy port (default `2801`).
+5. Proxy listener: localhost, the detected LAN address, or all IPv4 interfaces.
+6. DNS: gateway port and upstreams. A busy port 53 is reported, never stolen.
+7. A proxy URI, a subscription URL, or skip.
+8. The action to take for the first connection: select and verify it.
+9. Management panel: off, loopback, or LAN with authentication.
+10. Review, then activation. Gateway mode stays staged and disabled until you
+    verify a connection.
+
+Then check the result:
+
+```bash
+bypath doctor            # read-only report
+bypath doctor -v         # include per-check detail
+bypath doctor --json     # machine-readable report
+bypath doctor --egress   # measure tunnel and direct exit addresses
+```
+
+`bypath doctor` reports configuration validity, engine compatibility, TUN and
+native-TUN availability, routing and fail-closed DNS rules, DNS service
+conflicts, trusted-LAN and firewall state, management API and panel exposure,
+proxy listener reachability, connection configuration and, when the gateway is
+running, verified tunnel egress. It changes nothing on its own. With the
+exception of `--egress`, which sends network requests to measure exit
+addresses, it is read-only. It never prints credentials, raw subscription URLs
+or unredacted link URIs.
+
+## Daily use
+
+```bash
+bypath status                   # gateway state and tunnel health
+bypath run                      # start the gateway in the foreground
+bypath stop                     # stop the daemon and its listeners
+bypath list                     # connections and groups
+bypath select <name|number>     # choose the active connection
+bypath sub add <url>            # register a subscription (creates its group)
+bypath sub update               # refresh subscriptions
+bypath bench --auto             # bounded speed test, select the best link
+bypath engines                  # engine availability
+bypath version                  # version, commit, build variant
+bypath                          # interactive terminal UI
+```
+
+The browser panel is disabled by default. When enabled it listens on loopback
+and the first local visit creates the administrator account. It is a separate
+surface from the SOCKS/HTTP proxy and from the internal management API.
+
+## Access model
+
+The daemon runs as root and exposes one management surface through the CLI,
+the TUI and the web panel. They share one application contract and the same
+authority.
+
+- **The `bypath` system group is privileged administration.** Membership is
+  equivalent to membership in `sudo` or `docker`: a member can redirect the
+  tunnel, read stored credentials and change the listeners. Add only trusted
+  administrators.
+- **The management API needs a credential.** The API binds `127.0.0.1:8080` by
+  default. A root daemon refuses tokenless TCP access; the CLI and TUI use the
+  control socket. A panel session or `server.api_token` is required over TCP.
+- **The SOCKS/HTTP proxy is unauthenticated.** It binds loopback unless you
+  explicitly configure a LAN bind. A LAN bind requires the trusted-CIDR
+  allow-list, which is validated against the host's interfaces; Bypath installs
+  its own firewall rules that reject other sources.
+- **The control socket is a filesystem boundary**, `root:bypath`, mode `0660`.
+  It protects the API token and the configuration file from disclosure; it does
+  not limit what a member can make the daemon do.
+
+## How routing works
+
+Rules map traffic to the `direct` outbound, the `proxy` outbound, or a named
+external outbound. They are evaluated in order and private IP ranges always go
+direct. A fresh installation ships one rule — `default → proxy` — and no
+country or personal exception. Country rules are opt-in, for example:
 
 ```yaml
-server:
-  api_port: 8080
-  dns_port: 53
-  socks_port: 2801        # SOCKS5/HTTP mixed proxy port
-  api_token: ""           # API auth token (empty = no auth)
-
-gateway:
-  enabled: true
-  native_tun: true        # sing-box native TUN (no tun2socks needed)
-  interface: ""           # auto-detect
-  local_dns:              # optional: home DNS for private TLDs
-    - server: "192.168.1.1"
-      domains: ["home", "lan"]
-
-engines:
-  prefer_system: true
-  preferred: ""           # "sing-box" or "xray" (empty = auto)
-  fallback:
-    enabled: true         # try xray if sing-box fails (and vice versa)
-    timeout: "10s"
-    order: [sing-box, xray]
-
 routing:
   rules:
-    - match: domain_suffix:cloudflare.com
+    - match: geoip:<cc>          # country code you choose
       outbound: direct
-    - match: geoip:ir
-      outbound: direct
-    - match: geosite:ir
+    - match: geosite:<cc>
       outbound: direct
     - match: default
       outbound: proxy
-
-isolation:
-  enabled: true
-
-sni_spoof:
-  enabled: false
-  sni: "digikala.com"
 ```
 
-See [Configuration](https://github.com/liberoute/bypath/wiki/Configuration) for full reference.
+Bypath warns when an edit sends traffic direct while another rule tunnels an
+overlapping domain, because that changes where traffic exits. It does not assume
+where you are or which sites should stay local.
 
-## Build from Source
+For a single-country split there is one opt-in switch instead of two rules:
+
+```yaml
+routing:
+  country_split: <cc>   # empty (the default) keeps the universal proxy-only policy
+```
+
+That country's published domain list and IP ranges go direct; everything else
+keeps the default outbound, and explicit rules still win. The panel and the API
+show the engine-aware asset coverage, provision the required geo files before
+enabling it, and refuse the change if the assets are unusable. The split runs on
+the sing-box engine; selecting it with xray is refused, because xray cannot
+route its DNS resolver through the tunnel. Set `gateway.direct_dns` to a trusted
+resolver if domestic names must keep resolving while the tunnel is down. See
+[CONFIGURATION.md](CONFIGURATION.md#one-country-split-opt-in).
+
+## Engines and protocols
+
+Bypath supports VMess, VLESS (including Reality, XHTTP and VLESS Encryption),
+Trojan, Shadowsocks, WireGuard, SSH, SOCKS5 and HTTP URI links, plus OpenVPN
+profile files. Which links an engine can serve depends on the engine. This
+release is built with both engines embedded:
+
+| Engine | Notes |
+|---|---|
+| sing-box 1.14.4 | Embedded. Native TUN for transparent gateway mode. Required for OpenVPN endpoint support. |
+| Xray-core 26.3.27 (`v1.260327.0`) | Embedded library. Required for XHTTP and VLESS Encryption links. A managed external Xray binary, when downloaded, is pinned to 26.10.31 by version and SHA-256. Country rules need `geoip.dat`/`geosite.dat`, downloaded at runtime from pinned v2fly release tags and verified against the published SHA-256 with a size cap. The country split is not available on Xray. |
+
+Tun2socks is used only when a selected engine cannot provide a native TUN
+datapath. In a `full` build it is embedded; otherwise Bypath uses a
+checksum-pinned download or an existing binary on `PATH`. Bypath never silently
+switches a native-TUN gateway to a legacy datapath; if native TUN fails, the
+startup fails and the reason is reported.
+
+OpenVPN profiles are validated at import and stored self-contained (external
+certificate, key and TLS files are inlined). Directives that execute code or
+change host state (`up`, `down`, `plugin`, `script-security`, `route-up`,
+`management`, ...) are rejected. The profile directory is confined: absolute
+paths, UNC/drive-letter paths and traversal outside it are refused. OpenVPN
+profiles are run through an external sing-box binary of version 1.14 or newer,
+because the endpoint runner is only validated there.
+
+## Requirements (gateway mode)
+
+- Root, `iptables`, `iproute2`, TUN support (`/dev/net/tun`).
+- systemd is recommended for supervision. Without it the gateway must be
+  supervised by another service manager.
+- Port 53 must be free for gateway DNS. Bypath will not take it from an existing
+  resolver; you must resolve the conflict yourself or choose proxy-only mode.
+
+Proxy-only mode needs only the binary and a reachable proxy endpoint.
+
+## Building from source
 
 ```bash
 git clone https://github.com/liberoute/bypath.git
 cd bypath
-
-# For Orange Pi / RPi (32-bit ARM)
-GOOS=linux GOARCH=arm GOARM=7 go build -o bypath ./cmd/bypath/
-
-# For RPi 4 / modern ARM (64-bit)
-GOOS=linux GOARCH=arm64 go build -o bypath ./cmd/bypath/
-
-# For x86_64 server
-GOOS=linux GOARCH=amd64 go build -o bypath ./cmd/bypath/
+git checkout v3.0.0
+make build          # host build, no embedded engines
+make build-full     # embedded sing-box + xray (matches release binaries)
 ```
 
-## Docs
+Release binaries: full builds (`-tags full`) for linux amd64, arm64 and arm, and
+for Windows and macOS; lite builds for the same targets plus linux mipsle. The
+installer installs linux amd64 and arm64 only. Cross-compilation alone is not a
+support claim.
 
-- [Architecture](https://github.com/liberoute/bypath/wiki/Architecture)
-- [Configuration](https://github.com/liberoute/bypath/wiki/Configuration)
-- [Deployment Guide](https://github.com/liberoute/bypath/wiki/Deployment)
-- [API Reference](https://github.com/liberoute/bypath/wiki/API-Reference)
-- [Supported Protocols](https://github.com/liberoute/bypath/wiki/Supported-Protocols)
-- [Troubleshooting](https://github.com/liberoute/bypath/wiki/Troubleshooting)
-- [Build from Source](https://github.com/liberoute/bypath/wiki/Build-from-Source)
+## Documentation
 
-## Requirements
+- [QUICKSTART.md](QUICKSTART.md) — install to first working connection.
+- [INSTALL.md](INSTALL.md) — installer options, non-interactive install,
+  upgrade, rollback, uninstall.
+- [CONFIGURATION.md](CONFIGURATION.md) — configuration reference.
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — diagnosis and common failures.
+- [SECURITY.md](SECURITY.md) — threat model, exposure rules and reporting.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — bug reports, development and pull requests.
+- [RELEASE_NOTES.md](RELEASE_NOTES.md) — what this release contains and
+  what it does not.
+- [CHANGELOG.md](CHANGELOG.md) — changes in this release.
+- [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) — embedded components and
+  their licenses.
 
-All dependencies are auto-installed by `install.sh`. For manual setup:
+## Limitations
 
-### Lite build
-
-| | Required | Why |
-|---|---|---|
-| Linux (arm/arm64/amd64) | ✅ | OS |
-| Root | ✅ | iptables, TUN, port 53 |
-| sing-box ≥1.12 | ✅ | Primary tunnel engine |
-| iptables + iproute2 | ✅ | Routing (gateway mode) |
-| curl | recommended | Bench + health check |
-| xray | optional | Fallback engine |
-| tun2socks | legacy mode only | Not needed with `native_tun: true` (default) |
-
-### Full build (embedded engines)
-
-| | Required | Why |
-|---|---|---|
-| Linux (arm/arm64/amd64) | ✅ | OS |
-| Root | ✅ | iptables, TUN, port 53 |
-| iptables + iproute2 | ✅ | Routing (gateway mode) |
-
-sing-box runs in-process — no external binary needed. xray embedded requires `geoip.dat`/`geosite.dat` (download separately if using xray engine).
+- IPv6 gateway egress is not validated. Gateway mode drops forwarded IPv6
+  instead of leaking it; IPv4 is the supported gateway path.
+- Only Linux amd64 and arm64 are built and tested for this release. arm64 was
+  exercised in an emulated environment; see [RELEASE_NOTES.md](RELEASE_NOTES.md).
+- Country routing depends on external geo data. Missing geo files fail the rule
+  rather than silently matching everything.
+- The proxy listener itself has no client authentication. Access control is the
+  bind address, the trusted-CIDR allow-list and Bypath's firewall rules.
+- A proxy URI or profile you import is your responsibility to use lawfully and
+  within the provider's terms.
 
 ## License
 
-MIT
+Bypath is distributed under the **GNU General Public License, version 3 or
+later**. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+The full release build embeds GPL-3.0 sing-box code, which is why the combined
+work is distributed under GPL-3.0-or-later.

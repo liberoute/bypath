@@ -1,0 +1,328 @@
+# Installing Bypath v3.0.0
+
+This document covers the supported installation procedure for the
+`v3.0.0` release, the non-interactive form, upgrades, rollback and
+uninstall.
+
+## Supported targets
+
+| | Supported and tested | Notes |
+|---|---|---|
+| Debian/Ubuntu amd64 | Yes | Native installation tested. |
+| Debian/Ubuntu/Armbian arm64 | Yes (emulated validation) | No native arm64 board was used for this release. |
+| Other Linux amd64/arm64 distributions | Best effort | systemd assumed for service supervision. |
+| linux arm (armv7), linux mipsle | No (manual) | Built for this release (`bypath-<variant>-linux-arm`, `bypath-lite-linux-mipsle`). The installer refuses them; install by hand after verifying `SHA256SUMS`. |
+| Windows, macOS (amd64, arm64) | No (manual) | Built for this release (full and lite). No installer and no support claim. |
+| 386, riscv64 | No | Not built for this release. |
+
+The installer requires Bash and `sha256sum`, and downloads with `curl` or, if
+curl is absent, `wget`. On Debian/Ubuntu these are present in the base system;
+the installer reports a missing tool instead of installing one.
+
+## 1. Download and verify
+
+```bash
+VERSION=v3.0.0
+mkdir bypath-install && cd bypath-install
+
+curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/install.sh"
+curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+`SHA256SUMS` lists the installer, every `bypath-<variant>-<os>-<arch>` binary and
+`THIRD_PARTY_NOTICES.md`.
+The `--ignore-missing` flag lets you verify only the files you downloaded.
+A mismatch, a missing file, or a failed download is a stop condition.
+
+Use an exact version tag rather than a `/releases/latest` URL: the installer
+is version-pinned by design.
+
+## 2. Preflight
+
+```bash
+sudo ./install.sh --dry-run
+```
+
+`--dry-run` performs no writes, removes nothing, starts nothing and can run
+without root. It reports:
+
+- distribution, kernel and architecture, and whether the target is supported;
+- systemd availability and any existing `bypath` unit state;
+- TUN support (`/dev/net/tun`);
+- iptables and nftables availability;
+- active DNS services (`systemd-resolved`, `dnsmasq`, `unbound`, `named`);
+- listeners already holding ports 53, 8080 or 2801;
+- memory and free disk;
+- an existing installation and configuration;
+- private IPv4 interfaces with their address and subnet, plus the default route.
+
+Nothing in the preflight changes the host.
+
+## 3. Install
+
+```bash
+sudo ./install.sh --version "$VERSION"
+```
+
+The installer verifies the pinned release again, downloads the full build
+(`bypath-full-linux-amd64` or `bypath-full-linux-arm64`), checks its SHA-256
+against `SHA256SUMS`, and stages it before moving it into place. Pass
+`--variant lite` to install `bypath-lite-linux-<arch>` instead; the lite build is
+never chosen silently. An architecture without a published full build is refused
+with that instruction. It then:
+
+1. creates `/opt/bypath` and saves any existing binary as
+   `/opt/bypath/bypath.previous`;
+2. installs `/opt/bypath/bypath` and links `/usr/local/bin/bypath`;
+3. creates the `bypath` system group (it never adds accounts to it);
+4. writes `/etc/systemd/system/bypath.service` via a temporary file and
+   `mv`, then runs `systemctl daemon-reload`. **The unit is not enabled and not
+   started.**
+5. runs `bypath setup` for the first-run wizard.
+
+Existing configuration at `/etc/bypath/config.yaml` is never overwritten by the
+installer. The wizard is told an existing configuration was found and shows its
+current answers.
+
+### What the installer never does
+
+- It does not stop, disable or reconfigure `systemd-resolved`, `dnsmasq`,
+  `unbound`, `named`, NetworkManager or another VPN.
+- It does not rewrite `/etc/resolv.conf`, `/etc/hosts`, routes, the default
+  gateway, DHCP settings or global firewall policy.
+- It does not open a listener on a LAN address unless the wizard was told to.
+- It does not start an empty gateway.
+
+## 4. Non-interactive installation
+
+```bash
+sudo ./install.sh --version "$VERSION" --non-interactive \
+  --mode proxy \
+  --listen localhost \
+  --socks-port 2801 \
+  --web off
+```
+
+`--non-interactive` requires `--mode`. Every other answer has a safe default:
+
+| Flag | Default when omitted |
+|---|---|
+| `--interface NAME` | Not assumed; required for gateway mode if more than one LAN interface exists. |
+| `--trusted-cidr CIDR` | Derived from the chosen interface, shown in the review. Required before a LAN bind. |
+| `--listen localhost\|lan\|all` | `localhost`. |
+| `--dns-port N` | `53`. |
+| `--dns-upstream ADDR` | Only used in gateway mode; pass one or more explicitly. |
+| `--web off\|loopback\|lan` | `loopback`: the panel listens on this host only and is never reachable from the LAN. Pass `--web off` to disable it. |
+| `--uri` / `--subscription` | Nothing is imported. |
+| `--start-service` | Absent: the unit is left stopped. |
+| `--enable-service` | Absent: the unit is not enabled at boot, even after a verified start. |
+| `--enable-gateway` | Absent: gateway mode stays staged and disabled. |
+| `--install-packages` | Absent: missing gateway packages (iproute2, iptables) are reported with the `sudo apt install` command and setup stops; nothing is installed. Never applied by `--dry-run`. |
+
+The wizard still prints the review block. In non-interactive mode it does not
+wait for confirmation.
+
+A gateway-mode non-interactive install that should not activate the network
+looks like this:
+
+```bash
+sudo ./install.sh --version "$VERSION" --non-interactive \
+  --mode gateway \
+  --interface eth0 \
+  --trusted-cidr 192.168.1.0/24 \
+  --listen localhost \
+  --dns-upstream 1.1.1.1 --dns-upstream 8.8.8.8 \
+  --web loopback \
+  --subscription "https://subscription.example.net/list" \
+  --start-service
+```
+
+The example assumes `eth0` carries the `192.168.1.0/24` LAN. A trusted CIDR
+must be a private IPv4 subnet of the interface named by `--interface`;
+documentation ranges such as `192.0.2.0/24` are rejected.
+
+`--start-service` starts the unit only after the wizard has written a
+configuration; the gateway itself is enabled only if `--enable-gateway` was
+also passed, or later from the panel after verifying a connection.
+
+## 5. Verify
+
+```bash
+sudo bypath doctor
+sudo bypath doctor --egress
+sudo systemctl status bypath
+```
+
+A healthy proxy-only installation reports a passing configuration, a reachable
+proxy listener and, once the gateway runs, tunnel egress through an address
+different from the direct one. `doctor` exits non-zero when a check fails.
+
+## 6. Start, enable and gateway mode
+
+These are three separate decisions:
+
+| Action | Command | Effect |
+|---|---|---|
+| Start now | `sudo systemctl start bypath` (or wizard `--start-service`) | Runs until the next reboot or stop. |
+| Enable at boot | `sudo systemctl enable bypath` (or wizard `--enable-service`) | Adds the unit to the boot path; it starts automatically. |
+| Enable gateway mode | wizard `--enable-gateway`, or the panel after verification | Makes the host the LAN gateway and DNS server. Only applied after a verified connection. |
+
+The first-run wizard offers the boot enable only after a start that reached
+`CONNECTED` and passed the exit-identity check; answering no leaves the unit
+running but not enabled. Installation alone never enables the unit. To remove
+boot persistence later: `sudo systemctl disable bypath`.
+
+### DNS port note
+
+The gateway DNS listener defaults to port 53. If another resolver already holds
+port 53, the wizard can use 5335 instead. Clients still use the gateway's
+address on the ordinary port 53: DHCP and client DNS settings cannot express a
+port, and they do not need to. While gateway mode runs, Bypath redirects DNS on
+port 53 that arrives from the LAN subnet on the gateway interface to its own
+listener, so a client never has to know about 5335. The wizard explains this
+whenever a nonstandard port is chosen.
+
+## Upgrade
+
+An upgrade is the same command with a newer exact tag. The running binary is
+preserved as `/opt/bypath/bypath.previous` before replacement, and the unit
+file is rewritten.
+
+### Stop, verify, swap, start
+
+Every change of the installed binary — upgrade or rollback — follows the same
+order when a proxy guard may be installed: stop with the installed build,
+verify the firewall is clean, swap the binary, start. An install or upgrade
+never stops, starts or restarts the service; `--rollback` is the one exception:
+it stops a running service before restoring the previous binary and starts it
+again only if it was running.
+
+```bash
+sudo bypath stop
+sudo iptables -S BYPATH_PROXY_IN        # must report no chain
+sudo ./install.sh --version v3.0.0
+sudo systemctl start bypath
+```
+
+`bypath stop` removes the guard of the run it stopped, including a guard left
+by a crash or SIGKILL, when the ownership record and the installed rules prove
+that the guard is that run's; it refuses to remove a guard owned by a process
+that is still running. A chain with no record, or whose rules no longer match
+it, is kept and can block startup until an operator resolves it. Keep
+`/var/lib/bypath` mounted and do not delete
+`/var/lib/bypath/proxy-guard.lock` or `BYPATH_PROXY_IN` by hand. Builds older
+than every lock (`d175a19`, `bb11c37`) cannot be excluded while they run; if one
+takes over a live guard, the current daemon detects the ownership change and
+stops instead of serving unguarded. See
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#changing-the-binary-while-a-guard-is-installed).
+
+## Rollback
+
+```bash
+sudo ./install.sh --rollback
+```
+
+Restores `/opt/bypath/bypath.previous` over `/opt/bypath/bypath`, keeps the
+failed binary as `/opt/bypath/bypath.failed`, and restarts the service only if
+it is currently active. If no previous binary is recorded, the installer
+refuses and changes nothing.
+
+Before rolling back from 3.0.0-rc.4 or later, run `sudo bypath stop` once with
+the installed build and confirm the firewall is clean
+(`sudo iptables -S BYPATH_PROXY_IN` reports no chain). That stop removes the
+proxy guard, including one left by a crash, once ownership is proven from the
+record and the installed rules, so the older binary starts from a clean
+firewall instead of refusing the stale `BYPATH_PROXY_IN` chain. A chain the
+record cannot attribute is kept and may continue to block startup. Keep
+`/var/lib/bypath` mounted and do not delete `/var/lib/bypath/proxy-guard.lock`:
+a current build holds that lock so a lock-aware older daemon is excluded in
+both directions. An older build that predates every lock (`d175a19`,
+`bb11c37`) cannot be excluded while it runs; if one takes over a live guard,
+the current daemon detects the ownership change and stops instead of serving
+unguarded. That is why the stop above is required, not optional.
+See `TROUBLESHOOTING.md`.
+
+Rollback does not revert configuration changes. Keep a copy of
+`/etc/bypath/config.yaml` before you upgrade if you expect to need it.
+
+## Uninstall
+
+```bash
+sudo ./install.sh --uninstall
+```
+
+Stops and disables `bypath.service`, removes the unit and
+`/opt/bypath/bypath`, and removes the `/usr/local/bin/bypath` link. It keeps
+`/etc/bypath` (configuration, profiles, geo data, panel state) and
+`/var/log/bypath` so a reinstall keeps your setup and so you can inspect the
+logs.
+
+```bash
+sudo ./install.sh --uninstall --purge
+```
+
+Also removes `/etc/bypath`, `/run/bypath` and `/var/log/bypath`. This deletes
+your configuration, imported connections and any stored credentials. The
+installer asks for confirmation unless `--yes` is passed. The `bypath` group is
+left in place; remove it manually only if no account still belongs to it.
+
+## Installing from a local binary
+
+On a host without outbound access, fetch the release asset elsewhere and pass
+it with the checksum from the published `SHA256SUMS`:
+
+```bash
+sudo ./install.sh --version "$VERSION" \
+  --local-binary ./bypath-full-linux-amd64 \
+  --local-sha256 <sha256 from SHA256SUMS>
+```
+
+`--local-sha256` is mandatory with `--local-binary`: the file is verified with
+the same check as a download, and the installer refuses without it.
+
+## Interrupted installation
+
+The installer stages the binary beside `/opt/bypath`, runs the staged copy
+once (`bypath version`) to prove it executes on this host, and only then renames
+it into place on the same filesystem. If it is interrupted:
+
+- no partial binary replaces the working one;
+- a partial staging file at `/opt/.bypath-staging-<pid>` and a download
+  directory under `/tmp/bypath-fetch.*` may remain; the next run detects and
+  removes a staging file whose installer process is gone;
+- rerun the same command. Installation is idempotent: the current binary is
+  preserved as `bypath.previous` only when it differs.
+
+Because the smoke test runs from `/opt`, a host whose `/tmp` is mounted
+`noexec` (common on hardened Debian/Ubuntu images) installs normally. If
+`/opt` itself is `noexec`, the installer refuses instead of installing a
+binary that cannot run.
+
+If the wizard fails after a successful binary install, the message points you
+at `sudo bypath setup`. Nothing was started.
+
+## Dependency and platform notes
+
+- A missing `sha256sum` stops the installation; the installer never installs
+  an unverified binary. A host with neither `curl` nor `wget` cannot download
+  the release; install one of them first.
+- A missing TUN device does not block a proxy-only install, but gateway mode
+  will not work and the wizard says so before it asks you to proceed.
+- Gateway mode additionally requires root, `iproute2`, `iptables` and
+  `ip6tables`. The wizard checks them before writing anything and refuses a
+  gateway configuration while one is missing, because it will not start a
+  gateway whose routing and fail-closed rules it cannot enforce. On
+  Debian/DietPi it offers `apt-get install` only after an explicit yes (or
+  `--install-packages`); a normal account using `sudo` is supported.
+- Gateway mode manages `/etc/resolv.conf` and refuses if that file is a bind
+  mount (the usual case inside a container). Install Bypath on the LAN host
+  itself, or use proxy-only mode in a container.
+- If port 53 is busy, the wizard reports which service holds it and refuses to
+  take it. Choose a free port, resolve the conflict yourself, or use proxy-only
+  mode. Bypath never stops another resolver.
+- systemd is optional with `--no-systemd`; without it, supervise
+  `/opt/bypath/bypath run` yourself.
+- Files installed: `/opt/bypath/bypath`, `/usr/local/bin/bypath` (link),
+  `/etc/systemd/system/bypath.service`. Configuration is written by the wizard
+  to `/etc/bypath/config.yaml`.

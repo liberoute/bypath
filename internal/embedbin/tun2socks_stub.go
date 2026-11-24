@@ -11,3 +11,6 @@ func ExtractTun2socks() (string, error) {
 
 // HasEmbedded reports whether a tun2socks binary is embedded.
 func HasEmbedded() bool { return false }
+
+// EmbeddedTun2socksInfo reports that no asset is compiled in.
+func EmbeddedTun2socksInfo() (Asset, bool) { return Asset{}, false }

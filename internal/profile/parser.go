@@ -1,7 +1,6 @@
 package profile
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -13,6 +12,21 @@ import (
 // and returns a Link struct.
 func ParseURI(uri string) (*Link, error) {
 	uri = strings.TrimSpace(uri)
+	if u, err := url.Parse(uri); err == nil && u.Port() == "0" {
+		return nil, parseFailure("invalid server port (expected 1-65535)")
+	}
+	link, err := parseURI(uri)
+	if err != nil {
+		// url.Parse errors can contain userinfo and query credentials.
+		return nil, safeParseError(err)
+	}
+	if err := ValidateParsedLink(link); err != nil {
+		return nil, err
+	}
+	return link, nil
+}
+
+func parseURI(uri string) (*Link, error) {
 
 	switch {
 	case strings.HasPrefix(uri, "vmess://"):
@@ -34,44 +48,60 @@ func ParseURI(uri string) (*Link, error) {
 		if strings.Contains(uri, "@") || isProxyURI(uri) {
 			return parseHTTPProxy(uri)
 		}
-		return nil, fmt.Errorf("unsupported URI (looks like a URL, not a proxy): %s", truncate(uri, 30))
+		return nil, fmt.Errorf("unsupported URI (looks like a URL, not a proxy): %s", RedactURI(uri))
 	default:
-		return nil, fmt.Errorf("unsupported protocol URI: %s", truncate(uri, 30))
+		return nil, unsupported("unsupported protocol URI")
 	}
 }
 
 // parseVmess parses a vmess:// URI (base64 JSON format).
 func parseVmess(uri string) (*Link, error) {
 	raw := strings.TrimPrefix(uri, "vmess://")
+	if strings.Contains(raw, "@") {
+		u, err := url.Parse(uri)
+		if err != nil {
+			return nil, err
+		}
+		port, _ := strconv.Atoi(u.Port())
+		link := &Link{Protocol: "vmess", RawURI: uri, Address: u.Hostname(), Port: port, Remark: u.Fragment, UUID: u.User.Username(), Security: "auto"}
+		if password, ok := u.User.Password(); ok {
+			link.Security, link.UUID = u.User.Username(), password
+		}
+		applyURIParams(link, u.Query())
+		if link.Remark == "" {
+			link.Remark = fmt.Sprintf("%s:%d", link.Address, link.Port)
+		}
+		return link, nil
+	}
 
 	// Decode base64
-	decoded, err := base64.StdEncoding.DecodeString(raw)
+	decoded, err := decodeProxyBase64(raw)
 	if err != nil {
-		// Try URL-safe base64
-		decoded, err = base64.URLEncoding.DecodeString(raw)
-		if err != nil {
-			// Try raw (no padding)
-			decoded, err = base64.RawStdEncoding.DecodeString(raw)
-			if err != nil {
-				return nil, fmt.Errorf("vmess: invalid base64: %w", err)
-			}
-		}
+		return nil, err
 	}
 
 	var vmess struct {
-		V    interface{} `json:"v"`
-		PS   string      `json:"ps"`
-		Add  string      `json:"add"`
-		Port interface{} `json:"port"`
-		ID   string      `json:"id"`
-		Aid  interface{} `json:"aid"`
-		Scy  string      `json:"scy"`
-		Net  string      `json:"net"`
-		Type string      `json:"type"`
-		Host string      `json:"host"`
-		Path string      `json:"path"`
-		TLS  string      `json:"tls"`
-		SNI  string      `json:"sni"`
+		V             interface{}     `json:"v"`
+		PS            string          `json:"ps"`
+		Add           string          `json:"add"`
+		Port          interface{}     `json:"port"`
+		ID            string          `json:"id"`
+		Aid           interface{}     `json:"aid"`
+		Scy           string          `json:"scy"`
+		Net           string          `json:"net"`
+		Type          string          `json:"type"`
+		Host          string          `json:"host"`
+		Path          string          `json:"path"`
+		TLS           string          `json:"tls"`
+		SNI           string          `json:"sni"`
+		Peer          string          `json:"peer"`
+		Network       string          `json:"network"`
+		FP            string          `json:"fp"`
+		Fingerprint   string          `json:"fingerprint"`
+		ALPN          json.RawMessage `json:"alpn"`
+		Insecure      interface{}     `json:"insecure"`
+		AllowInsecure interface{}     `json:"allowInsecure"`
+		ServiceName   string          `json:"serviceName"`
 	}
 
 	if err := json.Unmarshal(decoded, &vmess); err != nil {
@@ -97,6 +127,22 @@ func parseVmess(uri string) (*Link, error) {
 		Host:     vmess.Host,
 	}
 
+	link.Network = firstValue(vmess.Net, vmess.Network)
+	link.SNI = firstValue(vmess.SNI, vmess.Peer)
+	link.Fingerprint = firstValue(vmess.FP, vmess.Fingerprint)
+	link.Insecure = parseBoolParam(fmt.Sprint(vmess.Insecure)) || parseBoolParam(fmt.Sprint(vmess.AllowInsecure))
+	link.GRPCServiceName = vmess.ServiceName
+	if len(vmess.ALPN) > 0 {
+		var text string
+		if json.Unmarshal(vmess.ALPN, &text) == nil {
+			link.ALPN = splitALPN(text)
+		} else if json.Unmarshal(vmess.ALPN, &link.ALPN) != nil {
+			return nil, fmt.Errorf("vmess: invalid ALPN")
+		}
+	}
+	if vmess.Type != "" && vmess.Type != "none" {
+		link.UnsupportedParams = append(link.UnsupportedParams, "headerType")
+	}
 	if link.Security == "" {
 		link.Security = "auto"
 	}
@@ -118,8 +164,12 @@ func normalizeNetwork(net string) string {
 		return "xhttp"
 	case "h2", "http2":
 		return "h2"
+	case "http":
+		return "h2"
+	case "websocket":
+		return "ws"
 	default:
-		return net
+		return strings.ToLower(strings.TrimSpace(net))
 	}
 }
 
@@ -159,22 +209,15 @@ func parseVless(uri string) (*Link, error) {
 	}
 
 	params := u.Query()
-	link.Network = normalizeNetwork(params.Get("type"))
-	if link.Network == "" {
-		link.Network = "tcp"
-	}
-	link.Security = params.Get("security")
-	link.TLS = params.Get("security") == "tls" || params.Get("security") == "reality"
-	link.Insecure = params.Get("insecure") == "1" || params.Get("allowInsecure") == "1"
-	link.SNI = params.Get("sni")
-	link.Path = params.Get("path")
-	link.Host = params.Get("host")
-	link.Flow = params.Get("flow")
+	applyURIParams(link, params)
 
-	// Reality/UTLS fields
-	link.RealityPublicKey = params.Get("pbk")
-	link.RealityShortID = params.Get("sid")
-	link.Fingerprint = params.Get("fp")
+	// VLESS Encryption (Xray 26.x) and the REALITY ML-KEM compatibility hint.
+	// The value is preserved verbatim; it is a credential and must not be logged.
+	link.Encryption = strings.TrimSpace(params.Get("encryption"))
+	link.SupportX25519MLKEM768 = parseBoolParam(params.Get("support-x25519mlkem768"))
+	if err := validateVLESSEncryption(link.Encryption); err != nil {
+		return nil, fmt.Errorf("vless: %v (%s)", err, RedactURI(uri))
+	}
 
 	// XHTTP / SplitHTTP
 	applyXHTTPParams(link, params)
@@ -207,15 +250,7 @@ func parseTrojan(uri string) (*Link, error) {
 	}
 
 	params := u.Query()
-	link.Network = normalizeNetwork(params.Get("type"))
-	if link.Network == "" {
-		link.Network = "tcp"
-	}
-	link.SNI = params.Get("sni")
-	link.Path = params.Get("path")
-	link.Host = params.Get("host")
-	link.Fingerprint = params.Get("fp")
-	applyXHTTPParams(link, params)
+	applyURIParams(link, params)
 
 	if link.Remark == "" {
 		link.Remark = fmt.Sprintf("%s:%d", link.Address, link.Port)
@@ -238,6 +273,15 @@ func parseShadowsocks(uri string) (*Link, error) {
 	}
 	remark, _ = url.QueryUnescape(remark)
 
+	params := url.Values{}
+	if i := strings.IndexByte(raw, '?'); i >= 0 {
+		var err error
+		params, err = url.ParseQuery(raw[i+1:])
+		if err != nil {
+			return nil, fmt.Errorf("ss: invalid query")
+		}
+		raw = strings.TrimSuffix(raw[:i], "/")
+	}
 	var method, password, host string
 	var port int
 
@@ -247,12 +291,17 @@ func parseShadowsocks(uri string) (*Link, error) {
 		serverInfo := raw[atIdx+1:]
 
 		// Decode userinfo
-		decoded, err := base64.RawURLEncoding.DecodeString(userInfo)
-		if err != nil {
-			decoded, err = base64.StdEncoding.DecodeString(userInfo)
-			if err != nil {
-				return nil, fmt.Errorf("ss: invalid base64 userinfo: %w", err)
+		decoded, err := decodeProxyBase64(userInfo)
+		if strings.Contains(userInfo, ":") {
+			u, perr := url.Parse("ss://" + userInfo + "@" + serverInfo)
+			if perr != nil {
+				return nil, perr
 			}
+			pwd, _ := u.User.Password()
+			decoded, err = []byte(u.User.Username()+":"+pwd), nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("ss: invalid base64 userinfo")
 		}
 
 		parts := strings.SplitN(string(decoded), ":", 2)
@@ -271,7 +320,7 @@ func parseShadowsocks(uri string) (*Link, error) {
 		port, _ = strconv.Atoi(u.Port())
 	} else {
 		// Try fully encoded format
-		decoded, err := base64.RawURLEncoding.DecodeString(raw)
+		decoded, err := decodeProxyBase64(raw)
 		if err != nil {
 			return nil, fmt.Errorf("ss: cannot decode: %w", err)
 		}
@@ -295,6 +344,7 @@ func parseShadowsocks(uri string) (*Link, error) {
 		Security: method,
 		UUID:     password, // reusing UUID field for password
 	}
+	applyURIParams(link, params)
 
 	if link.Remark == "" {
 		link.Remark = fmt.Sprintf("%s:%d", link.Address, link.Port)
@@ -397,11 +447,125 @@ func toInt(v interface{}) int {
 	}
 }
 
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
+// RedactURI returns a log-safe form of a proxy URI: scheme and host:port only.
+// Userinfo (UUID/password) and every query value are dropped, because VLESS
+// encryption keys, REALITY keys and subscription tokens can appear there.
+func RedactURI(raw string) string {
+	raw = strings.TrimSpace(raw)
+	scheme := ""
+	if i := strings.Index(raw, "://"); i > 0 {
+		scheme = strings.ToLower(raw[:i])
 	}
-	return s[:maxLen] + "..."
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		if scheme != "" {
+			return scheme + "://<redacted>"
+		}
+		return "<redacted>"
+	}
+	return scheme + "://<redacted>@" + u.Host
+}
+
+// parseBoolParam accepts the boolean spellings used by subscription panels.
+func parseBoolParam(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// validateVLESSEncryption validates the structure of a VLESS Encryption value
+// without ever including the credential segment in an error message.
+// Format: handshake.appearance.resumption[.padding][.padding].auth
+func validateVLESSEncryption(enc string) error {
+	enc = strings.TrimSpace(enc)
+	if enc == "" || enc == "none" {
+		return nil
+	}
+	parts := strings.Split(enc, ".")
+	if len(parts) < 4 || len(parts) > 6 {
+		return fmt.Errorf("unsupported VLESS encryption format: expected 4-6 segments, got %d", len(parts))
+	}
+	switch parts[0] {
+	case "mlkem768x25519plus":
+	default:
+		return fmt.Errorf("unsupported VLESS encryption handshake %q", parts[0])
+	}
+	switch parts[1] {
+	case "native", "xorpub", "random":
+	default:
+		return fmt.Errorf("unsupported VLESS encryption appearance %q", parts[1])
+	}
+	switch parts[2] {
+	case "0rtt", "1rtt":
+	default:
+		return fmt.Errorf("unsupported VLESS encryption resumption %q", parts[2])
+	}
+	for _, padding := range parts[3 : len(parts)-1] {
+		if !validEncryptionPadding(padding) {
+			return fmt.Errorf("unsupported VLESS encryption padding block")
+		}
+	}
+	if parts[len(parts)-1] == "" {
+		return fmt.Errorf("VLESS encryption is missing the authentication parameter")
+	}
+	return nil
+}
+
+// validEncryptionPadding matches the probability-min-max blocks (e.g. 100-111-1111).
+func validEncryptionPadding(s string) bool {
+	fields := strings.Split(s, "-")
+	if len(fields) != 3 {
+		return false
+	}
+	for _, f := range fields {
+		if f == "" {
+			return false
+		}
+		for _, ch := range f {
+			if ch < '0' || ch > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// EncryptedVLESS reports whether the link needs Xray's VLESS Encryption support.
+func (l *Link) EncryptedVLESS() bool {
+	return l != nil && l.Protocol == "vless" &&
+		l.Encryption != "" && l.Encryption != "none"
+}
+
+// EncryptionScheme returns only the non-secret scheme prefix (e.g.
+// "mlkem768x25519plus.native.0rtt") for diagnostics.
+func (l *Link) EncryptionScheme() string {
+	if !l.EncryptedVLESS() {
+		return ""
+	}
+	parts := strings.Split(l.Encryption, ".")
+	if len(parts) > 3 {
+		parts = parts[:3]
+	}
+	return strings.Join(parts, ".")
+}
+
+// EncryptionParameters returns the full non-secret policy of a VLESS Encryption
+// value: handshake, appearance, resumption and padding, without the per-link
+// authentication segment. Links are interchangeable only when this value is
+// identical, so a fallback can never downgrade 0-RTT, the appearance mode or
+// the padding profile.
+func (l *Link) EncryptionParameters() string {
+	if !l.EncryptedVLESS() {
+		return ""
+	}
+	parts := strings.Split(l.Encryption, ".")
+	if len(parts) < 4 {
+		return l.Encryption
+	}
+	return strings.Join(parts[:len(parts)-1], ".")
 }
 
 // parseSocks5 parses a socks5://[user:pass@]host:port[#remark] URI.
@@ -434,6 +598,7 @@ func parseSocks5(uri string) (*Link, error) {
 		link.UUID = u.User.Username()
 		link.Security, _ = u.User.Password()
 	}
+	applyURIParams(link, u.Query())
 
 	if link.Remark == "" {
 		link.Remark = fmt.Sprintf("socks5-%s:%d", link.Address, link.Port)
@@ -471,6 +636,7 @@ func parseHTTPProxy(uri string) (*Link, error) {
 		link.UUID = u.User.Username()
 		link.Security, _ = u.User.Password()
 	}
+	applyURIParams(link, u.Query())
 
 	if link.Remark == "" {
 		link.Remark = fmt.Sprintf("http-%s:%d", link.Address, link.Port)

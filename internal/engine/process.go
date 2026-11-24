@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 )
 
 // Process represents a running engine process.
@@ -25,6 +26,7 @@ type Process struct {
 type RunOptions struct {
 	Engine     *Engine
 	Args       []string
+	Env        []string // extra KEY=VALUE entries appended to the inherited environment
 	ConfigFile string
 	LogFile    string
 	Firejail   *FirejailOptions
@@ -57,7 +59,7 @@ func StartProcess(ctx context.Context, opts RunOptions) (*Process, error) {
 	}
 
 	cmd := exec.CommandContext(ctx, binary, args...)
-	cmd.Env = os.Environ()
+	cmd.Env = append(os.Environ(), opts.Env...)
 
 	// Setup logging
 	var stdout, stderr io.ReadCloser
@@ -88,6 +90,9 @@ func StartProcess(ctx context.Context, opts RunOptions) (*Process, error) {
 		cancel()
 		return nil, fmt.Errorf("starting %s: %w", opts.Engine.Name, err)
 	}
+	// Bind the engine to the daemon's lifetime where the OS supports it, so a
+	// forced daemon stop cannot leave an orphan holding its listener.
+	trackChildProcess(cmd.Process.Pid)
 
 	proc := &Process{
 		Name:    opts.Engine.Name,
@@ -132,6 +137,20 @@ func (p *Process) IsRunning() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.running
+}
+
+// WaitStopped waits until the process has exited or the timeout elapses. It is
+// used by gateway shutdown before generated files are deleted, so a live engine
+// never keeps a handle on a config bypath is removing.
+func (p *Process) WaitStopped(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !p.IsRunning() {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return !p.IsRunning()
 }
 
 // buildFirejailArgs constructs the firejail command arguments.

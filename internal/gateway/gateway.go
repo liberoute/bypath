@@ -3,19 +3,22 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/liberoute/bypath/internal/build"
 	"github.com/liberoute/bypath/internal/config"
 	"github.com/liberoute/bypath/internal/embedbin"
 	"github.com/liberoute/bypath/internal/engine"
@@ -39,29 +42,76 @@ type Gateway struct {
 
 	// Running processes / in-process runners
 	engineProc     *exec.Cmd
+	engineWaiter   *engine.ExitWaiter
 	embeddedEngine engine.EmbeddedRunner // non-nil when engine runs in-process (full build)
 	dnsProc        *exec.Cmd
 	tunProc        *exec.Cmd
-	dnsBuiltin     []*dns.Server // built-in DNS servers (fallback when dns2socks/dnsmasq absent)
+	tunWaiter      *engine.ExitWaiter // single reaper for tunProc
+	dnsBuiltin     []*dns.Server      // built-in DNS servers (fallback when dns2socks/dnsmasq absent)
+	dnsSplit       splitDNS           // direct resolver + plan classifier for DIRECT-class names
+
+	// Runtime supervision state (D4). Guarded by rtMu, never by mu; the watchdog
+	// must be able to report state while the lifecycle mutex is held.
+	rtMu          sync.Mutex
+	runtime       RuntimeStatus
+	health        HealthEvidence
+	activeLinkRef *profile.Link
+	embeddedRef   engine.EmbeddedRunner
+	watchStop     chan struct{}
+	stopping      bool
+	recoverCtx    context.Context
+	recoverCancel context.CancelFunc
+	lastStartErr  string
 
 	// Native TUN state
 	nativeTUN    bool   // whether sing-box native TUN is active
 	activeEngine string // name of the currently running engine (e.g. "sing-box", "xray")
 
+	// Runtime artifacts that may contain credentials (removed on Stop).
+	configFile string
+
 	// Network info (auto-detected)
-	iface      string // e.g., "eth0", "end0"
-	localIP    string // e.g., "172.16.11.15"
-	realGW     string // e.g., "172.16.11.1"
-	subnet     string // e.g., "172.16.11.0/24"
-	socksPort  int
-	dnsPort    int
+	iface     string // e.g., "eth0", "lan0"
+	localIP   string // e.g., "192.168.1.15"
+	realGW    string // e.g., "192.168.1.1"
+	subnet    string // e.g., "192.168.1.0/24"
+	socksPort int
+	probePort int // loopback inbound reserved for the gateway's own health probes
+	dnsPort   int
 
 	ctx    context.Context
 	cancel context.CancelFunc
-	mu     sync.Mutex
+	// ctx and cancel are guarded by rtMu so shutdown can read them while the
+	// lifecycle mutex is held by an in-flight Start.
+	abortPending bool // set by AbortStartup while a start is in flight
+	// starting counts Start requests that have not returned yet, including ones
+	// still waiting for mu. AbortStartup only records a pending abort while this
+	// is non-zero, so an abort that arrives after a start completed cannot
+	// poison the next connection.
+	starting int
+	// operatorStop records an explicit tunnel disconnect so the daemon's
+	// automatic retry loop does not immediately reconnect against the operator.
+	operatorStop bool
+	// shutdown records that the process is exiting. It is sticky, unlike
+	// abortPending: a signal that arrives before Start reaches the lifecycle
+	// lock must still stop the tunnel from coming up.
+	shutdown bool
+	mu       sync.Mutex
 
 	// Prior dnsmasq.service runtime state for this Gateway instance.
 	dnsmasq dnsmasqPriorState
+
+	// Host-network state actually applied by this instance. Proxy-only runs
+	// leave these false so Stop never touches unrelated host configuration.
+	networkMutated      bool
+	legacyRoutingActive bool
+	resolvedStopped     bool
+	tunCreated          bool
+	run                 *gatewayRunState
+	// startupDeadline is the end of the single fallback budget for this Start.
+	// The native-TUN replay through tun2socks must not open a second full
+	// budget, or a hanging engine could double the documented startup bound.
+	startupDeadline time.Time
 }
 
 // New creates a new Gateway instance.
@@ -90,110 +140,286 @@ func New(cfg *config.Config, engineMgr *engine.Manager) (*Gateway, error) {
 	return gw, nil
 }
 
+// startupHooks lets tests drive the real Start/Stop lifecycle with an injected
+// engine and detection path. Production passes nil and uses the host
+// implementations. Host command execution is stubbed separately through the
+// package-level run/status/output hooks.
+type startupHooks struct {
+	detectNetwork func() error
+	activeLink    func() *profile.Link
+	startEngine   func(*profile.Link) error
+}
+
 // Start brings up the full gateway stack.
 func (gw *Gateway) Start() error {
+	return gw.StartWithContext(context.Background())
+}
+
+// StartWithContext brings up the full stack on behalf of a caller that may
+// cancel. A caller that is already gone must never start the tunnel: aborting
+// such a start through AbortStartup is not enough, because an abort that lands
+// before the start registers is ignored and the start then runs behind a
+// disconnect.
+func (gw *Gateway) StartWithContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	gw.beginStart()
+	defer gw.endStart()
+	err := gw.startWithContext(ctx, nil)
+	if err != nil {
+		// "No connection selected" is a waiting state, not a failure: the
+		// daemon is healthy and the operator can still add one.
+		state := StateFailed
+		if errors.Is(err, ErrNoActiveLink) {
+			state = StateDisconnected
+		}
+		gw.setRuntimeState(state, err.Error())
+	}
+	return err
+}
+
+// beginStart/endStart bracket every Start request. endStart clears a pending
+// abort once the last request returns: an abort that lost the race with a
+// completed Start belongs to that start, not to the next connection.
+func (gw *Gateway) beginStart() {
+	gw.rtMu.Lock()
+	gw.starting++
+	gw.rtMu.Unlock()
+}
+
+func (gw *Gateway) endStart() {
+	gw.rtMu.Lock()
+	if gw.starting > 0 {
+		gw.starting--
+	}
+	if gw.starting == 0 {
+		gw.abortPending = false
+	}
+	gw.rtMu.Unlock()
+}
+
+// AbortStartup interrupts an in-flight Start (engine attempts, readiness waits,
+// TUN setup) so shutdown does not wait for engine timeouts. It is safe to call
+// from a signal handler while Start is running: the next Start recreates the
+// context in initRuntimeLocked. A late abort after the last Start returned is
+// ignored so it cannot poison the next connection.
+func (gw *Gateway) AbortStartup() {
+	gw.rtMu.Lock()
+	if gw.starting == 0 {
+		gw.rtMu.Unlock()
+		return
+	}
+	gw.abortPending = true
+	cancel := gw.signalStopLocked()
+	gw.rtMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// ShutdownStartup records that the process is exiting and interrupts any
+// in-flight or future Start. Unlike AbortStartup it never expires, so a signal
+// delivered before Start reaches the lifecycle lock still prevents the tunnel
+// from being reported as up.
+func (gw *Gateway) ShutdownStartup() {
+	gw.rtMu.Lock()
+	gw.shutdown = true
+	gw.abortPending = true
+	cancel := gw.signalStopLocked()
+	gw.rtMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (gw *Gateway) startWith(h *startupHooks) error {
+	return gw.startWithContext(context.Background(), h)
+}
+
+func (gw *Gateway) startWithContext(ctx context.Context, h *startupHooks) error {
+	gw.beginStart()
+	defer gw.endStart()
+
 	gw.mu.Lock()
 	defer gw.mu.Unlock()
 
-	// 0. Clean up any state left by a previous crashed/kill-9'd instance.
-	gw.cleanupPreviousRun()
+	// A caller that cancelled while this start waited for the lifecycle lock
+	// must not initialise or touch host state. AbortStartup cannot cover this
+	// window because it is ignored before a start is registered.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// An operator can bring the gateway up through the control socket while the
+	// daemon's retry loop is still waiting. Restarting it here would tear down
+	// the working connection; the operator's Start already did the work.
+	if gw.GetRuntimeStatus().State == StateConnected {
+		log.Println("ℹ️  Gateway is already connected; skipping this start request")
+		return nil
+	}
+
+	if gw.initRuntimeLocked() {
+		// AbortStartup arrived before this Start reached the lock. Honouring it
+		// here is the whole point: otherwise the recreated context would erase
+		// the shutdown request.
+		return context.Canceled
+	}
+
+	// Every failure after cleanup may have host state to undo; run the normal
+	// shutdown path instead of returning a half-configured host to the caller.
+	rollback := func(err error) error {
+		gw.stopLocked()
+		return err
+	}
+
+	detect := gw.detectNetwork
+	findLink := gw.getActiveLink
+	startEngine := gw.startEngineWithFallback
+	if h != nil {
+		if h.detectNetwork != nil {
+			detect = h.detectNetwork
+		}
+		if h.activeLink != nil {
+			findLink = h.activeLink
+		}
+		if h.startEngine != nil {
+			startEngine = h.startEngine
+		}
+	}
+
+	// 0. Get the active link first. A missing connection must not touch host
+	// state: the daemon stays up with its panel and API so one can be imported.
+	activeLink := findLink()
+	if activeLink == nil {
+		return permanent(fmt.Errorf("%w: add or select a connection first", ErrNoActiveLink))
+	}
+
+	// 0a. Clean up any state left by a previous crashed/kill-9'd instance. A
+	// failed recovery means bypath cannot prove the host is clean, so startup
+	// aborts instead of layering new changes on top of unknown state.
+	if err := gw.cleanupPreviousRun(); err != nil {
+		return permanent(fmt.Errorf("incomplete recovery from previous run: %w", err))
+	}
 
 	// 1. Detect network
-	if err := gw.detectNetwork(); err != nil {
+	if err := detect(); err != nil {
 		return fmt.Errorf("network detection: %w", err)
 	}
 
-	// 2. Get active link
-	activeLink := gw.getActiveLink()
-	if activeLink == nil {
-		return fmt.Errorf("no active link configured. Use 'bypath add <uri>' first")
+	// 2a. Native routing must be deterministic before the engine can create
+	// routes: reserve bypath's own table/rule index and persist ownership first.
+	if gw.config.Gateway.Enabled && gw.config.Gateway.NativeTUN {
+		if err := gw.prepareNativeOwnership(); err != nil {
+			return rollback(fmt.Errorf("preparing native TUN ownership: %w", err))
+		}
 	}
 
-	// 2b. In gateway mode, free port 53 before starting the engine.
-	// sing-box (native TUN) binds port 53 for its DNS inbound; if systemd-resolved
-	// or another stub resolver is already there, the DNS inbound silently fails while
-	// the SOCKS proxy keeps working — exactly the "proxy works, DNS/GW broken" symptom.
-	if gw.config.Gateway.Enabled {
-		disableSystemdResolved()
-	}
+	// 2b. Gateway startup no longer touches the host resolver before the engine
+	// is up. Port 53 is freed by startDNS once the data path exists, so a failed
+	// engine start leaves systemd-resolved and dnsmasq untouched.
 
-	// 3. Start tunnel engine (with auto-fallback)
-	if err := gw.startEngineWithFallback(activeLink); err != nil {
+	// 3. Start tunnel engine (with auto-fallback). Ownership may already be
+	// recorded, so a failed start is rolled back before returning instead of
+	// leaving host state pending.
+	gw.probePort = reserveProbePort(gw.socksPort)
+	if err := startEngine(activeLink); err != nil {
+		gw.stopLocked()
 		return fmt.Errorf("starting engine: %w", err)
 	}
 
-	// 4. Native TUN mode vs legacy mode
+	// 4. Bring up the transparent data path.
 	if gw.nativeTUN {
-		// sing-box handles TUN device and DNS natively — no tun2socks/dns2socks needed
-		log.Printf("🚀 Using sing-box native TUN mode (no tun2socks/dns2socks needed)")
+		// sing-box handles the TUN device natively — no tun2socks needed.
+		log.Printf("🚀 Using sing-box native TUN mode (no tun2socks needed)")
 
-		if err := waitForTUNDevice("tun0", 10*time.Second); err != nil {
-			// TUN device didn't appear within 10s — kernel/permission issue.
-			if build.Variant == "full" {
-				log.Printf("⚠️ sing-box TUN device did not appear (full build). Check kernel TUN support: modprobe tun")
-			} else {
-				log.Printf("⚠️ sing-box native TUN failed, falling back to legacy mode")
-			}
+		if err := waitForTUNDeviceContext(gw.ctx, "tun0", 10*time.Second); err != nil {
+			log.Printf("⚠️ sing-box TUN device did not appear: %v — retrying through tun2socks", err)
 			if err := gw.restartEngineAsLegacy(activeLink); err != nil {
-				return fmt.Errorf("fallback to legacy mode failed: %w", err)
+				gw.stopLocked()
+				return fmt.Errorf("fallback to tun2socks failed: %w", err)
 			}
-			// Continue to legacy mode setup below
 		}
 	}
 
 	if gw.nativeTUN {
-		// Native TUN succeeded — configure routing
-		if gw.config.Gateway.Enabled {
-			if len(gw.config.Whitelist.Countries) > 0 {
-				log.Printf("🌍 Whitelist countries %v → routed direct via sing-box geoip rules", gw.config.Whitelist.Countries)
-			}
-
-			if err := gw.setupRouting(); err != nil {
-				log.Printf("⚠️  Routing setup failed: %v", err)
-			}
+		if len(gw.config.Whitelist.Countries) > 0 {
+			log.Printf("🌍 Whitelist countries %v → routed direct via sing-box geoip rules", gw.config.Whitelist.Countries)
 		}
-	} else {
-		// Legacy mode: use tun2socks + dns2socks
-		// 4a. Start DNS proxy
+	} else if gw.config.Gateway.Enabled {
+		// tun2socks is the data path for xray, OpenVPN and native-TUN fallback.
+		// A gateway run without a working TUN is not a gateway: reporting success
+		// would tell clients to route through a host that cannot forward them.
+		if err := gw.startTun(); err != nil {
+			log.Printf("❌ Transparent gateway unavailable: %v", err)
+			gw.stopLocked()
+			return fmt.Errorf("transparent gateway unavailable: %w", err)
+		}
+		if len(gw.config.Whitelist.Countries) > 0 {
+			log.Printf("🌍 Whitelist countries %v → routed direct via sing-box geoip rules", gw.config.Whitelist.Countries)
+		}
+	}
+
+	// 5. DNS and host routing, only after the data path is proven to exist.
+	// The resolver is configured for both native TUN and tun2socks, so a client
+	// pointing at bypath never depends on engine-specific DNS behaviour.
+	if gw.config.Gateway.Enabled {
 		if err := gw.startDNS(); err != nil {
-			log.Printf("⚠️  DNS proxy failed: %v (continuing without DNS)", err)
+			log.Printf("❌ DNS proxy failed: %v", err)
+			gw.stopLocked()
+			return fmt.Errorf("starting DNS proxy: %w", err)
 		}
-
-		// 4b. Start tun2socks
-		if gw.config.Gateway.Enabled {
-			if err := gw.startTun(); err != nil {
-				log.Printf("⚠️  TUN setup failed: %v (proxy-only mode)", err)
-				log.Printf("ℹ️  Proxy available at socks5://%s:%d", gw.localIP, gw.socksPort)
-			} else {
-				// Whitelist is now handled inside sing-box via geoip route rules.
-				// No ipset/iptables needed. Just log it.
-				if len(gw.config.Whitelist.Countries) > 0 {
-					log.Printf("🌍 Whitelist countries %v → routed direct via sing-box geoip rules", gw.config.Whitelist.Countries)
-				}
-
-				// Setup iptables routing (simple: LAN → tun0, no fwmark whitelist)
-				if err := gw.setupRouting(); err != nil {
-					log.Printf("⚠️  Routing setup failed: %v", err)
-				}
-			}
+		if err := gw.verifyDNSReady(gw.dnsWarmup()); err != nil {
+			log.Printf("❌ DNS is not usable through the tunnel: %v", err)
+			gw.stopLocked()
+			return err
 		}
+		if err := gw.setupRouting(); err != nil {
+			log.Printf("❌ Routing setup failed: %v", err)
+			gw.stopLocked()
+			return fmt.Errorf("configuring host networking: %w", err)
+		}
+	}
+
+	// A stop that arrived while this Start held mu must not be published as a
+	// live tunnel: the setup above may have completed after the abort was
+	// recorded, and reporting CONNECTED here would leave a data path running
+	// without a watchdog. Tear it down the same way every other failure does.
+	if gw.isStopping() || gw.lifetimeContext().Err() != nil {
+		gw.stopLocked()
+		return context.Canceled
 	}
 
 	metrics.GatewayUp.Set(1)
 	metrics.SetActiveEngine(gw.activeEngine)
+	// The banner must describe the link that is actually carrying traffic, not
+	// the link originally requested before fallback ran (D5).
+	activeLink = gw.currentActiveLink()
+	if activeLink == nil {
+		activeLink = findLink()
+	}
 	log.Printf("✅ Gateway running:")
 	log.Printf("   Interface:  %s", gw.iface)
 	log.Printf("   Local IP:   %s", gw.localIP)
-	log.Printf("   SOCKS:      :%d", gw.socksPort)
-	log.Printf("   DNS:        :%d", gw.dnsPort)
-	log.Printf("   Tunnel:     %s → %s:%d", activeLink.Protocol, activeLink.Address, activeLink.Port)
+	socksAddr := gw.config.Server.SOCKSListenAddress()
+	log.Printf("   SOCKS:      %s:%d", socksAddr, gw.socksPort)
+	if gw.probePort > 0 {
+		log.Printf("   Probe:      127.0.0.1:%d (health checks only)", gw.probePort)
+	}
+	// DNS is only reported when this run actually owns a listener (D7).
+	if gw.dnsProc != nil || len(gw.dnsBuiltin) > 0 {
+		log.Printf("   DNS:        :%d", gw.dnsPort)
+	}
+	if activeLink != nil {
+		log.Printf("   Tunnel:     %s [%s] → %s:%d", activeLink.Protocol, activeLink.Remark, activeLink.Address, activeLink.Port)
+	}
 	gatewayActive := gw.nativeTUN || gw.tunProc != nil
 	if gatewayActive {
 		log.Printf("   Mode:       GATEWAY (set clients GW+DNS to %s)", gw.localIP)
 	} else if gw.config.Gateway.Enabled {
-		log.Printf("   Mode:       PROXY ONLY ⚠️  (gateway requested but TUN unavailable — use socks5://%s:%d)", gw.localIP, gw.socksPort)
+		log.Printf("   Mode:       PROXY ONLY ⚠️  (gateway requested but TUN unavailable — use socks5://%s:%d)", socksAddr, gw.socksPort)
 	} else {
-		log.Printf("   Mode:       PROXY ONLY (use socks5://%s:%d)", gw.localIP, gw.socksPort)
+		log.Printf("   Mode:       PROXY ONLY (use socks5://%s:%d)", socksAddr, gw.socksPort)
 	}
 
 	// CDN-based links only relay HTTP, not HTTPS. Test asynchronously so Start() returns fast.
@@ -213,31 +439,49 @@ func (gw *Gateway) Start() error {
 	// 8. Auto-start chains with auto_start: true
 	gw.startAutoChains()
 
+	gw.setRuntimeState(StateConnected, "")
+	gw.startWatchdog()
+
 	return nil
 }
 
 // Stop gracefully shuts down everything.
 func (gw *Gateway) Stop() {
+	// Interrupt supervision before taking mu: a recovery attempt may hold mu
+	// for the duration of an engine start, and shutdown must not wait for it.
+	gw.signalStop()
 	gw.mu.Lock()
 	defer gw.mu.Unlock()
+	gw.stopLocked()
+}
 
+// stopLocked is the shared shutdown path for Stop and startup rollback. The
+// caller must hold gw.mu.
+func (gw *Gateway) stopLocked() {
 	log.Println("🛑 Stopping gateway...")
+	gw.startupDeadline = time.Time{}
 
-	// Cleanup routing (mode-aware: skips TUN device/fwmark cleanup in native TUN mode)
-	gw.cleanupRouting()
-
-	// Stop tun2socks (only exists in legacy mode)
+	// Stop tun2socks first: it is the consumer of the TUN device the routing
+	// rollback removes.
 	if gw.tunProc != nil {
 		gw.tunProc.Process.Kill()
-		gw.tunProc.Wait()
+		if w := gw.tunWaiterRef(); w != nil {
+			w.Wait(5 * time.Second)
+		}
 		log.Println("  ✓ tun2socks stopped")
+		gw.tunProc = nil
+		gw.setTunWaiter(nil)
 	}
 
-	// Stop DNS (only exists in legacy mode)
+	// Stop DNS listeners before restoring systemd-resolved/dnsmasq. Releasing
+	// port 53 first lets the external service bind successfully on restart; a
+	// restore attempted while bypath still owns the port would leave the host
+	// without a working resolver.
 	if gw.dnsProc != nil {
 		gw.dnsProc.Process.Kill()
 		gw.dnsProc.Wait()
 		log.Println("  ✓ DNS proxy stopped")
+		gw.dnsProc = nil
 	}
 	for _, s := range gw.dnsBuiltin {
 		s.Shutdown()
@@ -245,20 +489,45 @@ func (gw *Gateway) Stop() {
 	gw.dnsBuiltin = nil
 
 	// Stop engine — in native TUN mode, sing-box removes its TUN device on exit
-	if gw.embeddedEngine != nil {
-		gw.embeddedEngine.Stop() //nolint:errcheck
-		gw.embeddedEngine = nil
-		log.Println("  ✓ Engine stopped (embedded)")
-	} else if gw.engineProc != nil {
-		gw.engineProc.Process.Kill()
-		gw.engineProc.Wait()
+	if gw.embeddedEngine != nil || gw.engineProc != nil {
+		gw.stopEngineLocked()
 		log.Println("  ✓ Engine stopped")
 	}
+	gw.activeEngine = ""
+
+	// The ownership record is the only authority for host-network rollback.
+	// Running it after every bypath-owned listener and process is gone means
+	// resolver/service restoration happens against a released port 53.
+	cleanupErr := gw.cleanupRouting()
 
 	metrics.GatewayUp.Set(0)
 	metrics.SetActiveEngine("")
 	gw.cancel()
+
+	// Chains and API-started tunnels own engine processes too. Stop them before
+	// deleting generation directories so no live engine is left behind (D4/D6).
+	if gw.tunnelMgr != nil {
+		gw.tunnelMgr.StopAll()
+	}
+
+	// Generated configs and extracted OpenVPN material can contain private keys.
+	if gw.configFile != "" {
+		tunnel.RemoveGenerationDir(paths.Get().TmpDir, gw.configFile)
+		gw.configFile = ""
+	}
+	// Any remaining gen-* directory belongs to an earlier run whose engine has
+	// already been stopped and reaped (D6).
+	if removed, err := tunnel.RemoveStaleGenerations(paths.Get().TmpDir, ""); err != nil {
+		log.Printf("⚠️  Could not remove stale generation directories: %v", err)
+	} else if removed > 0 {
+		log.Printf("🧹 Removed %d stale generation directorie(s)", removed)
+	}
 	os.Remove(paths.Get().ChildrenFile)
+	gw.setRuntimeState(StateDisconnected, "")
+	if cleanupErr != nil {
+		log.Printf("⚠️  Gateway stopped with unfinished host-state cleanup; the ownership record was kept for the next start: %v", cleanupErr)
+		return
+	}
 	log.Println("✅ Gateway stopped")
 }
 
@@ -275,6 +544,11 @@ func (gw *Gateway) Reload(newCfg *config.Config) []string {
 	if newCfg.Server.SOCKSPort != old.Server.SOCKSPort {
 		needRestart = append(needRestart, "server.socks_port")
 	}
+	if newCfg.Server.SOCKSListenAddress() != old.Server.SOCKSListenAddress() ||
+		newCfg.Server.SOCKSUsername != old.Server.SOCKSUsername ||
+		newCfg.Server.SOCKSPassword != old.Server.SOCKSPassword {
+		needRestart = append(needRestart, "server.socks_listen")
+	}
 	if newCfg.Server.APIPort != old.Server.APIPort {
 		needRestart = append(needRestart, "server.api_port")
 	}
@@ -284,15 +558,28 @@ func (gw *Gateway) Reload(newCfg *config.Config) []string {
 	if strings.Join(newCfg.Gateway.DNSUpstream, ",") != strings.Join(old.Gateway.DNSUpstream, ",") {
 		needRestart = append(needRestart, "gateway.dns_upstream")
 	}
+	if newCfg.Gateway.DNSMode != old.Gateway.DNSMode {
+		needRestart = append(needRestart, "gateway.dns_mode")
+	}
 	if localDNSChanged(old.Gateway.LocalDNS, newCfg.Gateway.LocalDNS) {
 		needRestart = append(needRestart, "gateway.local_dns")
 	}
 	if newCfg.Engines.PreferredEngine != old.Engines.PreferredEngine {
 		needRestart = append(needRestart, "engines.preferred")
 	}
+	// Routing inputs are compiled into the engine configuration, so a change to
+	// them is only live after the engine is restarted with a regenerated config.
+	if routingChanged(old, newCfg) {
+		needRestart = append(needRestart, "routing")
+	}
 
 	// Replace config contents so all code paths using gw.config pick up the new values.
 	*gw.config = *newCfg
+	// Tunnels and chains started later must compile the reloaded policy, not the
+	// daemon-start snapshot.
+	if gw.tunnelMgr != nil {
+		gw.tunnelMgr.Reload(newCfg)
+	}
 
 	if len(needRestart) > 0 {
 		log.Printf("♻️  Config reloaded — the following changes require engine restart: %s", strings.Join(needRestart, ", "))
@@ -442,28 +729,28 @@ func (gw *Gateway) startEngineWithFallback(link *profile.Link) error {
 		return gw.startEngineWithLinkFallback(link)
 	}
 
-	// Attempt native TUN mode
-	err := gw.startEngineWithLinkFallback(link)
-	if err != nil {
-		// On a full build tun2socks is not available, so falling back to legacy
-		// mode would also fail. Retry native TUN once with a short pause — the
-		// tunnel may simply need more time to warm up on the first start.
-		if build.Variant == "full" {
-			log.Printf("⚠️ Native TUN failed (full build — no tun2socks). Retrying native TUN once...")
-			select {
-			case <-gw.ctx.Done():
-				return gw.ctx.Err()
-			case <-time.After(4 * time.Second):
-			}
-			if retryErr := gw.startEngineWithLinkFallback(link); retryErr == nil {
-				return nil
-			}
-			log.Printf("⚠️ Native TUN retry also failed — running proxy-only (tun2socks unavailable on full build)")
-		} else {
-			log.Printf("⚠️ sing-box native TUN failed, falling back to legacy mode")
+	// Attempt native TUN mode. tun2socks is always available (embedded on the
+	// full build, pinned managed download on Lite), so a native failure is
+	// recoverable through the transparent legacy path — never a proxy-only run.
+	//
+	// The legacy retry shares this deadline. Giving it a fresh total budget
+	// would double the documented startup bound.
+	parent := gw.startContext()
+	total := gw.fallbackTotalTimeout()
+	gw.startupDeadline = time.Now().Add(total)
+	ctx, cancel := context.WithTimeout(parent, total)
+	defer cancel()
+
+	if err := gw.startEngineWithLinkFallbackCtx(ctx, link); err != nil {
+		if err := parent.Err(); err != nil {
+			return err
 		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("startup fallback budget of %s exhausted: %w", total, err)
+		}
+		log.Printf("⚠️ Native TUN start failed: %v — retrying through tun2socks", err)
 		gw.nativeTUN = false
-		return gw.restartEngineAsLegacy(link)
+		return gw.restartEngineAsLegacyCtx(ctx, link)
 	}
 
 	return nil
@@ -471,17 +758,25 @@ func (gw *Gateway) startEngineWithFallback(link *profile.Link) error {
 
 // restartEngineAsLegacy kills the current engine process (if any), regenerates config
 // with GatewayMode=false, and restarts the engine in legacy (mixed-inbound) mode.
+// It spends what is left of the startup budget instead of starting a new one.
 func (gw *Gateway) restartEngineAsLegacy(link *profile.Link) error {
-	metrics.TunnelRestarts.Inc()
-	// Kill the failed engine process (or stop embedded runner)
-	if gw.embeddedEngine != nil {
-		gw.embeddedEngine.Stop() //nolint:errcheck
-		gw.embeddedEngine = nil
-	} else if gw.engineProc != nil {
-		gw.engineProc.Process.Kill()
-		gw.engineProc.Wait()
-		gw.engineProc = nil
+	budget := gw.fallbackTotalTimeout()
+	if !gw.startupDeadline.IsZero() {
+		if remaining := time.Until(gw.startupDeadline); remaining < budget {
+			budget = remaining
+		}
 	}
+	if budget <= 0 {
+		return fmt.Errorf("startup budget exhausted before the tun2socks fallback could start")
+	}
+	ctx, cancel := context.WithTimeout(gw.startContext(), budget)
+	defer cancel()
+	return gw.restartEngineAsLegacyCtx(ctx, link)
+}
+
+func (gw *Gateway) restartEngineAsLegacyCtx(ctx context.Context, link *profile.Link) error {
+	metrics.TunnelRestarts.Inc()
+	gw.stopEngineLocked()
 
 	// Temporarily disable NativeTUN so startEngine generates mixed-inbound config
 	origNativeTUN := gw.config.Gateway.NativeTUN
@@ -489,17 +784,122 @@ func (gw *Gateway) restartEngineAsLegacy(link *profile.Link) error {
 	defer func() { gw.config.Gateway.NativeTUN = origNativeTUN }()
 
 	gw.nativeTUN = false
-	return gw.startEngineWithLinkFallback(link)
+	return gw.startEngineWithLinkFallbackCtx(ctx, link)
+}
+
+// Injectable seams for fallback tests. The real implementations start engines
+// and probe the host network, which unit tests cannot do.
+var (
+	startEngineAttempt    = (*Gateway).startEngine
+	startEnginePinned     = (*Gateway).startEnginePinned
+	probeTunnelConnection = (*Gateway).verifyConnection
+	probeTunnelHTTPS      = (*Gateway).verifyHTTPS
+)
+
+const (
+	defaultEndpointFallbackTimeout = 90 * time.Second
+	defaultTotalFallbackTimeout    = 5 * time.Minute
+	defaultProbeTimeout            = 12 * time.Second
+)
+
+func parseFallbackDuration(raw string, fallback time.Duration) time.Duration {
+	if d, err := time.ParseDuration(strings.TrimSpace(raw)); err == nil && d > 0 {
+		return d
+	}
+	return fallback
+}
+
+// fallbackEndpointTimeout bounds one link attempt: engine readiness plus the
+// connectivity probes for that link.
+func (gw *Gateway) fallbackEndpointTimeout() time.Duration {
+	return parseFallbackDuration(gw.config.Engines.Fallback.EndpointTimeout, defaultEndpointFallbackTimeout)
+}
+
+// fallbackTotalTimeout bounds the whole startup chain across every group link.
+func (gw *Gateway) fallbackTotalTimeout() time.Duration {
+	return parseFallbackDuration(gw.config.Engines.Fallback.TotalTimeout, defaultTotalFallbackTimeout)
+}
+
+func (gw *Gateway) probeTimeout() time.Duration {
+	return defaultProbeTimeout
+}
+
+// reserveProbePort picks a free loopback port for the daemon's probe inbound
+// and releases it again; the engine binds it when it starts. Zero means no port
+// could be reserved, in which case no forced probe route is generated and the
+// probes fall back to the client listener.
+func reserveProbePort(socksPort int) int {
+	for i := 0; i < 4; i++ {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return 0
+		}
+		port := l.Addr().(*net.TCPAddr).Port
+		l.Close()
+		if port > 0 && port != socksPort {
+			return port
+		}
+	}
+	return 0
 }
 
 // startEngineWithLinkFallback tries the given link first, then falls back to other links
 // in the same group if the first one fails or can't connect.
 // For each link it tries the preferred engine first, then falls back to the alternative
 // engine (sing-box ↔ xray) before moving to the next link.
+//
+// Cancellation is honored at every step: the total budget context stops the
+// chain, and Stop cancels the gateway context so an in-flight DNS lookup,
+// handshake or probe returns immediately instead of waiting for its timeout.
+//
+// When every attempt failed before an engine could run (local configuration
+// error), the returned error is permanent so the run loop stops instead of
+// retrying a link that cannot work without an edit.
+//
+// The caller holds gw.mu: this runs inside the startup phase, and the cleanup
+// it performs must not interleave with Stop's rollback.
 func (gw *Gateway) startEngineWithLinkFallback(link *profile.Link) error {
-	// Try active link first (with per-link engine fallback)
-	if gw.startEngineWithEngineFallback(link) {
+	ctx, cancel := context.WithTimeout(gw.startContext(), gw.fallbackTotalTimeout())
+	defer cancel()
+	return gw.startEngineWithLinkFallbackCtx(ctx, link)
+}
+
+func (gw *Gateway) startEngineWithLinkFallbackCtx(ctx context.Context, link *profile.Link) error {
+	total := gw.fallbackTotalTimeout()
+	endpoint := gw.fallbackEndpointTimeout()
+
+	attempts := 0
+	var selectedErr error
+	var fallbacks []linkAttempt
+	record := func(failed *profile.Link, err error, selected bool) {
+		err = outcomeError(failed, err)
+		attempts++
+		if selected {
+			selectedErr = err
+			return
+		}
+		fallbacks = append(fallbacks, linkAttempt{Link: linkLabel(failed), Err: err})
+	}
+	// stopped reports shutdown separately from the fallback budget expiring.
+	stopped := func() error {
+		if err := gw.startContext().Err(); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("startup fallback budget of %s exhausted: %w", total, err)
+		}
 		return nil
+	}
+
+	// Try active link first (with per-link engine fallback)
+	if ok, err := gw.startLinkAttempt(ctx, endpoint, link); ok {
+		gw.recordActiveLink(link)
+		gw.clearFallbackNotice()
+		return nil
+	} else if stopErr := stopped(); stopErr != nil {
+		return stopErr
+	} else {
+		record(link, err, true)
 	}
 
 	// Try other links in the group (use the active link's group, not config default)
@@ -507,38 +907,115 @@ func (gw *Gateway) startEngineWithLinkFallback(link *profile.Link) error {
 	if fallbackGroup == "" {
 		fallbackGroup = gw.config.Profiles.ActiveGroup
 	}
+	fail := func() error {
+		failure := &linkFailure{
+			Selected:  linkLabel(link),
+			Group:     fallbackGroup,
+			At:        time.Now(),
+			Cause:     selectedErr,
+			Fallbacks: fallbacks,
+		}
+		if attempts > 0 && failure.allLocalConfig() {
+			return permanent(failure)
+		}
+		return failure
+	}
 	g, gerr := gw.profileMgr.GetGroup(fallbackGroup)
 	if gerr != nil {
-		return fmt.Errorf("no working link found in group '%s'", fallbackGroup)
+		return fail()
 	}
 
-	for _, candidate := range g.Links {
-		if candidate.Remark == link.Remark {
+	for _, candidate := range eligibleFallbackLinks(link, g.Links) {
+		if err := stopped(); err != nil {
+			return err
+		}
+		log.Printf("🔄 Trying link: [%s] %s → %s:%d", candidate.Protocol, candidate.Remark, candidate.Address, candidate.Port)
+
+		if ok, err := gw.startLinkAttempt(ctx, endpoint, candidate); ok {
+			gw.profileMgr.SetActiveLink(candidate)
+			gw.recordActiveLink(candidate)
+			gw.recordFallback(linkLabel(link), selectedErr)
+			return nil
+		} else if stopErr := stopped(); stopErr != nil {
+			return stopErr
+		} else {
+			record(candidate, err, false)
+		}
+	}
+
+	if err := stopped(); err != nil {
+		return err
+	}
+	return fail()
+}
+
+// startLinkAttempt gives one link its own bounded context so a dead endpoint
+// cannot consume the whole fallback budget.
+func (gw *Gateway) startLinkAttempt(parent context.Context, endpoint time.Duration, link *profile.Link) (bool, error) {
+	if err := parent.Err(); err != nil {
+		return false, err
+	}
+	// An OpenVPN link may spend one handshake window on a pinned endpoint that
+	// accepts TCP but never completes the tunnel, then retry another candidate.
+	// Give it room for both windows plus the post-start connectivity probe
+	// instead of letting the generic budget cancel the retry halfway.
+	if link.Protocol == "openvpn" {
+		if min := 2*engine.OpenVPNMinStartup + 15*time.Second; endpoint < min {
+			endpoint = min
+		}
+	}
+	ctx, cancel := context.WithTimeout(parent, endpoint)
+	defer cancel()
+
+	ok, err := gw.startEngineWithEngineFallback(ctx, link)
+	// A canceled parent always wins: the caller must not start another link
+	// while shutdown is in progress.
+	if parentErr := parent.Err(); parentErr != nil {
+		return false, parentErr
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return false, fmt.Errorf("link '%s' exceeded its %s attempt budget", link.Remark, endpoint)
+	}
+	return ok, err
+}
+
+// eligibleFallbackLinks filters the group's links down to those that may
+// replace selected without weakening a security requirement.
+func eligibleFallbackLinks(selected *profile.Link, links []*profile.Link) []*profile.Link {
+	var out []*profile.Link
+	for _, candidate := range links {
+		if candidate == nil {
+			continue
+		}
+		if selected != nil && candidate.Remark == selected.Remark {
 			continue // skip the one we already tried
 		}
 		// Skip info-only links (port < 10 or address 0.0.0.0)
 		if candidate.Port < 10 || candidate.Address == "" || candidate.Address == "0.0.0.0" {
 			continue
 		}
-
-		log.Printf("🔄 Trying link: [%s] %s → %s:%d", candidate.Protocol, candidate.Remark, candidate.Address, candidate.Port)
-
-		if gw.startEngineWithEngineFallback(candidate) {
-			gw.profileMgr.SetActiveLink(candidate)
-			return nil
+		if !engine.FallbackCompatible(selected, candidate) {
+			log.Printf("  ⛔ Skipping link [%s] %s: does not match the selected VLESS Encryption policy", candidate.Protocol, candidate.Remark)
+			continue
 		}
+		out = append(out, candidate)
 	}
-
-	return fmt.Errorf("no working link found in group '%s'", fallbackGroup)
+	return out
 }
 
 // startEngineWithEngineFallback starts an engine for the given link (with automatic
 // engine fallback handled by FallbackController) then verifies connectivity.
-// Returns true if the engine is running and the tunnel has internet access.
-func (gw *Gateway) startEngineWithEngineFallback(link *profile.Link) bool {
-	if err := gw.startEngine(link); err != nil {
+// It reports whether the tunnel is usable and, on failure, the error that
+// stopped startup (nil when only the connectivity probe failed).
+func (gw *Gateway) startEngineWithEngineFallback(ctx context.Context, link *profile.Link) (bool, error) {
+	if err := startEngineAttempt(gw, ctx, link); err != nil {
 		log.Printf("  ❌ Engine start failed: %v", err)
-		return false
+		// A failed attempt may already have launched a process (for example a
+		// deadline during the warm-up). Release the SOCKS port before the next
+		// candidate, exactly like the probe failures below.
+		gw.stopEngineLocked()
+		gw.noteStartError(err)
+		return false, err
 	}
 
 	// CDN-fronted VLESS proxies (e.g. Cloudflare port 2083) need a few seconds
@@ -548,166 +1025,225 @@ func (gw *Gateway) startEngineWithEngineFallback(link *profile.Link) bool {
 	for i, d := range delays {
 		if d > 0 {
 			log.Printf("  🔄 Connectivity check attempt %d/3 (waiting %s for tunnel warm-up)...", i+1, d)
+			timer := time.NewTimer(d)
 			select {
-			case <-gw.ctx.Done():
-				return false
-			case <-time.After(d):
+			case <-ctx.Done():
+				timer.Stop()
+				gw.stopEngineLocked()
+				return false, ctx.Err()
+			case <-timer.C:
 			}
 		}
-		if gw.verifyConnection() {
-			return true
+		if probeTunnelConnection(gw, ctx) {
+			if err := ctx.Err(); err != nil {
+				gw.stopEngineLocked()
+				return false, err
+			}
+			// CONNECTED must mean browsing works. A relay that forwards plain
+			// HTTP but not TLS leaves every https:// request dead, so it is not a
+			// usable tunnel even though the HTTP probe answered.
+			if !probeTunnelHTTPS(gw, ctx) {
+				log.Printf("  ⚠️  Tunnel relays HTTP but not HTTPS")
+				gw.stopEngineLocked()
+				return false, nil
+			}
+			return true, nil
+		}
+		if ctx.Err() != nil {
+			gw.stopEngineLocked()
+			return false, ctx.Err()
 		}
 	}
 
 	log.Printf("  ⚠️  Engine started but no connectivity")
-	if gw.embeddedEngine != nil {
-		gw.embeddedEngine.Stop() //nolint:errcheck
-		gw.embeddedEngine = nil
-	} else if gw.engineProc != nil {
-		gw.engineProc.Process.Kill()
-		gw.engineProc.Wait() //nolint:errcheck
-		gw.engineProc = nil
-	}
-	gw.activeEngine = ""
-	return false
+	gw.stopEngineLocked()
+	return false, nil
 }
-
 
 // verifyConnection checks if the SOCKS proxy can reach the actual internet
 // through the tunnel — NOT just Cloudflare's own CDN edge.
 //
-// CDN-based VLESS proxies (*.okarimi.ir, *.oneset.ir via Cloudflare port 2083)
+// CDN-based VLESS proxies (*.example.net, *.example.org via Cloudflare port 2083)
 // always return 204 for "Host: cp.cloudflare.com / http://1.1.1.1" because
 // the CDN edge answers locally without actually forwarding through the tunnel.
 // We must verify with a NON-Cloudflare target to detect real connectivity.
-func (gw *Gateway) verifyConnection() bool {
-	addr := fmt.Sprintf("socks5h://127.0.0.1:%d", gw.socksPort)
-
-	// Candidates: non-Cloudflare targets that return predictable HTTP responses.
-	// socks5h:// means hostname sent to proxy for remote DNS (no local DNS needed).
-	candidates := []struct {
-		url      string
-		wantCode string
-	}{
-		// Google's generate_204 — returns exactly 204, not Cloudflare.
-		{"http://www.gstatic.com/generate_204", "204"},
-		// Microsoft connectivity check — returns 200 with small body.
-		{"http://www.msftconnecttest.com/connecttest.txt", "200"},
-		// Apple captive portal check — returns 200.
-		{"http://captive.apple.com/hotspot-detect.html", "200"},
-	}
-
-	baseArgs := []string{"-s", "-x", addr, "--connect-timeout", "8", "--max-time", "12",
-		"-o", "/dev/null", "-w", "%{http_code}"}
-	if gw.nativeTUN && gw.localIP != "" {
-		baseArgs = append(baseArgs, "--interface", gw.localIP)
-	}
-
-	tunnelOK := false
-	for _, c := range candidates {
-		args := append(baseArgs, c.url)
-		cmd := exec.CommandContext(gw.ctx, "curl", args...)
-		out, err := cmd.Output()
-		if err == nil && strings.TrimSpace(string(out)) == c.wantCode {
-			tunnelOK = true
-			break
-		}
-	}
-	if !tunnelOK {
-		return false
-	}
-
-	// If Iran is whitelisted, also verify that Iranian sites are routed direct
-	// (not proxied through a foreign exit node).
-	return gw.verifyWhitelistRouting()
+func (gw *Gateway) verifyConnection(ctx context.Context) bool {
+	// Called while the lifecycle lock is held, so the config and port reads
+	// below cannot race a reload.
+	ok, _ := ProbeDataPath(ctx, gw.probeSocksAddr(), gw.probeTimeout())
+	return ok
 }
 
-// verifyWhitelistRouting checks that whitelisted-country sites are reachable via
-// direct routing, not through the proxy. Only runs when relevant countries are configured.
-//
-// Iranian routing check:
-//   - login.samandehi.ir returns HTTP 307 from Iranian IPs, but 403 from foreign IPs.
-//     So 403 means traffic is going through the proxy instead of direct — fail.
-//   - wp.mahex.com/ip and ip.shecan.ir return the caller's IP. If routing is correct
-//     (direct from Iran) these sites are reachable. If going through proxy, they block
-//     foreign TLS and return SSL errors — fail.
-func (gw *Gateway) verifyWhitelistRouting() bool {
-	hasIR := false
-	for _, c := range gw.config.Whitelist.Countries {
-		if strings.EqualFold(c, "ir") {
-			hasIR = true
-			break
+// probeSocksAddr is the listener the daemon's own probes must enter through.
+// The reserved probe inbound exists precisely so the forced tunnel route is
+// scoped to it; the client listener keeps the operator's rules.
+func (gw *Gateway) probeSocksAddr() string {
+	if gw.probePort > 0 {
+		return net.JoinHostPort("127.0.0.1", strconv.Itoa(gw.probePort))
+	}
+	listen := strings.TrimSpace(gw.config.Server.SOCKSListen)
+	if listen == "" || listen == "0.0.0.0" || listen == "::" {
+		listen = "127.0.0.1"
+	}
+	return net.JoinHostPort(listen, strconv.Itoa(gw.socksPort))
+}
+
+// httpsProbeTargets are independent TLS endpoints. example.com is IANA-owned
+// and static; gstatic generate_204 is a second operator, so one blocked host
+// does not condemn a healthy tunnel.
+var httpsProbeTargets = []string{
+	"https://www.example.com/",
+	"https://www.gstatic.com/generate_204",
+}
+
+// verifyHTTPS proves the tunnel carries a verified TLS handshake and an HTTP
+// answer, not just a plaintext relay.
+func (gw *Gateway) verifyHTTPS(ctx context.Context) bool {
+	port := gw.probePort
+	if port <= 0 {
+		port = gw.socksPort
+	}
+	if port <= 0 {
+		return false
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return profile.TestAnyURL(probeCtx, port, httpsProbeTargets)
+}
+
+// dataPathCandidates are non-Cloudflare targets with predictable responses.
+// The in-process SOCKS client sends hostnames to the proxy (remote DNS), so no
+// local resolver or external curl binary is required.
+var dataPathCandidates = []struct {
+	url      string
+	wantCode int
+}{
+	// Google's generate_204 — returns exactly 204, not Cloudflare.
+	{"http://www.gstatic.com/generate_204", 204},
+	// Microsoft connectivity check.
+	{"http://www.msftconnecttest.com/connecttest.txt", 200},
+	// Apple captive portal check.
+	{"http://captive.apple.com/hotspot-detect.html", 200},
+}
+
+// ProbeDataPath reports whether a SOCKS listener reaches the public internet
+// through the tunnel and names the evidence. It is the connectivity half of
+// the proof chain: identity oracles may all be blocked while this still
+// succeeds, and a caller must not present that as a dead tunnel.
+func ProbeDataPath(ctx context.Context, socksAddr string, timeout time.Duration) (bool, string) {
+	if timeout <= 0 {
+		timeout = 6 * time.Second
+	}
+	detail := "no endpoint was tried"
+	for _, c := range dataPathCandidates {
+		if ctx.Err() != nil {
+			return false, ctx.Err().Error()
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, timeout)
+		_, code, err := profile.GetThroughProxyAt(probeCtx, socksAddr, c.url, nil, 4<<10)
+		cancel()
+		if err == nil && code == c.wantCode {
+			return true, c.url
+		}
+		if err != nil {
+			detail = fmt.Sprintf("%s: %v", c.url, err)
+		} else {
+			detail = fmt.Sprintf("%s answered HTTP %d, want %d", c.url, code, c.wantCode)
 		}
 	}
-	if !hasIR {
+	return false, detail
+}
+
+func isCatchAllMatcher(match string) bool {
+	switch strings.ReplaceAll(match, " ", "") {
+	case "default", "ip_cidr:0.0.0.0/0":
 		return true
 	}
-
-	addr := fmt.Sprintf("socks5h://127.0.0.1:%d", gw.socksPort)
-	baseArgs := []string{"-s", "-x", addr, "--connect-timeout", "8", "--max-time", "12",
-		"-o", "/dev/null", "-w", "%{http_code}"}
-
-	// samandehi.ir: 307 = direct (Iranian IP), 403 = going through proxy (foreign IP).
-	code := func(url string) string {
-		args := append(append([]string{}, baseArgs...), url)
-		cmd := exec.CommandContext(gw.ctx, "curl", args...)
-		out, err := cmd.Output()
-		if err != nil {
-			return "000"
-		}
-		return strings.TrimSpace(string(out))
-	}
-
-	samandehiCode := code("https://login.samandehi.ir")
-	if samandehiCode == "403" {
-		log.Printf("  ⚠️  IR routing check: login.samandehi.ir returned 403 (traffic going through proxy, not direct)")
-		return false
-	}
-	if samandehiCode == "000" {
-		log.Printf("  ⚠️  IR routing check: login.samandehi.ir unreachable (000)")
-		return false
-	}
-	log.Printf("  ✅ IR routing: login.samandehi.ir → %s (direct)", samandehiCode)
-
-	// IP checker sites: these block foreign TLS, so reachability = direct routing.
-	ipCheckers := []string{
-		"https://wp.mahex.com/ip",
-		"https://ip.shecan.ir",
-	}
-	baseArgsBody := []string{"-s", "-x", addr, "--connect-timeout", "8", "--max-time", "12"}
-	for _, url := range ipCheckers {
-		args := append(append([]string{}, baseArgsBody...), url)
-		cmd := exec.CommandContext(gw.ctx, "curl", args...)
-		out, err := cmd.Output()
-		if err == nil && len(strings.TrimSpace(string(out))) > 0 {
-			log.Printf("  ✅ IR routing: %s → %s", url, strings.TrimSpace(string(out)))
-			return true
-		}
-		log.Printf("  ⚠️  IR routing: %s unreachable via direct path", url)
-	}
-
-	// samandehi passed but IP checkers were unreachable — not a routing failure,
-	// just those specific sites being down. Consider routing OK.
-	return true
+	return false
 }
 
-func (gw *Gateway) startEngine(link *profile.Link) error {
-	log.Printf("🔧 Starting engine for [%s] %s...", link.Protocol, link.Remark)
-
-	// Pin the server hostname in /etc/hosts BEFORE starting the engine.
-	// The engine needs to connect to the VLESS server by hostname, but ISPs
-	// intercept DNS and return fake IPs. Pinning first ensures the engine gets
-	// the real IP regardless of what the system DNS returns.
-	pinnedHosts := map[string]string{}
-	if link.Address != "" {
-		if ip := gw.pinHostToEtcHosts(link.Address); ip != "" {
-			pinnedHosts[link.Address] = ip
+// defaultOutboundLabel names the outbound the rules send unmatched traffic to.
+func defaultOutboundLabel(cfg *config.Config) string {
+	out := "proxy"
+	for _, r := range cfg.Routing.Rules {
+		if isCatchAllMatcher(r.Match) {
+			out = r.Outbound
 		}
 	}
+	return out
+}
 
-	// Build config generator (shared across all fallback engine attempts).
+// startEngine starts an engine for the link. An OpenVPN link whose pinned
+// endpoint accepts TCP but never completes a handshake is retried with the
+// next validated candidate before the link is declared failed: OpenVPN
+// round-robin records can name such endpoints, and TCP reachability cannot
+// distinguish them from healthy ones.
+func (gw *Gateway) startEngine(ctx context.Context, link *profile.Link) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	log.Printf("🔧 Starting engine for [%s] %s...", link.Protocol, link.Remark)
+
+	sets := gw.pinnedHostSetsFor(ctx, link)
+	tried := map[string]bool{}
+	attempts := 0
+	reresolved := false
+	failedPins := map[string]string{}
+	var lastErr error
+	for attempts < openVPNMaxEndpointAttempts {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if len(sets) == 0 {
+			// OpenVPN rotates its A records: once every known candidate has
+			// failed, one fresh lookup can name an entry point that was not in
+			// the original answer.
+			if link.Protocol != "openvpn" || reresolved {
+				break
+			}
+			reresolved = true
+			log.Printf("  🔄 OpenVPN endpoint candidates exhausted; re-resolving %s", link.Address)
+			for _, s := range gw.pinnedHostSetsFor(ctx, link) {
+				if !tried[pinSetKey(s)] {
+					sets = append(sets, s)
+				}
+			}
+			continue
+		}
+		pins := sets[0]
+		sets = sets[1:]
+		key := pinSetKey(pins)
+		if tried[key] {
+			continue
+		}
+		tried[key] = true
+		if attempts > 0 {
+			log.Printf("  🔄 OpenVPN endpoint %s did not complete a handshake; trying %s", describePinSet(failedPins), describePinSet(pins))
+		}
+		attempts++
+		lastErr = startEnginePinned(gw, ctx, link, pins)
+		if lastErr == nil {
+			return nil
+		}
+		failedPins = pins
+		if errors.Is(lastErr, engine.ErrLocalConfig) || link.Protocol != "openvpn" {
+			return lastErr
+		}
+	}
+	if lastErr == nil || link.Protocol != "openvpn" {
+		return lastErr
+	}
+	return fmt.Errorf("all OpenVPN endpoint candidates failed for link '%s': %w", link.Remark, lastErr)
+}
+
+// engineConfigGenerator builds the runtime generator used by every engine
+// attempt. Country split is independent of routing.rules: it is emitted after
+// the explicit rules and must reach the engine config, or the runtime would
+// keep proxying traffic the panel already reports as direct.
+func (gw *Gateway) engineConfigGenerator(pinnedHosts map[string]string) *tunnel.ConfigGenerator {
 	configGen := tunnel.NewConfigGenerator(paths.Get().TmpDir)
 	configGen.PinnedHosts = pinnedHosts
+	configGen.ProfileDir = gw.profilesDirectory()
 	if len(gw.config.Routing.Rules) > 0 {
 		rules := make([]tunnel.RoutingRule, len(gw.config.Routing.Rules))
 		for i, r := range gw.config.Routing.Rules {
@@ -724,6 +1260,7 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 		configGen.BypassDomains = gw.config.Whitelist.BypassDomains
 		configGen.ForceProxyDomains = gw.config.Whitelist.ForceProxyDomains
 	}
+	configGen.CountrySplit = gw.config.Routing.CountrySplit
 	configGen.DNSUpstream = gw.config.Gateway.DNSUpstream
 	if len(gw.config.Gateway.LocalDNS) > 0 {
 		rules := make([]tunnel.LocalDNSRule, 0, len(gw.config.Gateway.LocalDNS))
@@ -735,6 +1272,10 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 		configGen.LocalDNSRules = rules
 	}
 	configGen.SOCKSPort = gw.socksPort
+	configGen.ProbePort = gw.probePort
+	configGen.SOCKSListen = gw.config.Server.SOCKSListenAddress()
+	configGen.SOCKSUsername = gw.config.Server.SOCKSUsername
+	configGen.SOCKSPassword = gw.config.Server.SOCKSPassword
 	if gw.config.SNISpoof.Enabled {
 		configGen.SNISpoof = gw.config.SNISpoof.SNI
 	}
@@ -742,12 +1283,26 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 		configGen.GatewayMode = true
 		configGen.DNSPort = gw.dnsPort
 	}
+	return configGen
+}
+
+// startEnginePinned starts an engine with the given host pins.
+func (gw *Gateway) startEnginePinned(ctx context.Context, link *profile.Link, pinnedHosts map[string]string) error {
+	// Build config generator (shared across all fallback engine attempts).
+	configGen := gw.engineConfigGenerator(pinnedHosts)
 
 	// Try embedded (in-process) engine first if one is registered (full build only).
 	preferredName := gw.config.Engines.PreferredEngine
-	if preferredName == "" && engine.RequiresXray(link) {
-		// XHTTP is xray-only; skip embedded sing-box so we don't waste a start attempt.
+	if engine.RequiresXray(link) {
+		// XHTTP and VLESS Encryption are xray-only. Falling back to sing-box
+		// would silently drop the encryption parameters, so this is a hard choice.
+		if preferredName != "" && preferredName != "xray" {
+			log.Printf("  ⚠️  Profile requires xray; ignoring configured engine %q", preferredName)
+		}
 		preferredName = "xray"
+	}
+	if link.Protocol == "openvpn" {
+		preferredName = "sing-box"
 	}
 	if preferredName == "" && len(gw.config.Engines.Fallback.Order) > 0 {
 		preferredName = gw.config.Engines.Fallback.Order[0]
@@ -755,92 +1310,393 @@ func (gw *Gateway) startEngine(link *profile.Link) error {
 	if preferredName == "" {
 		preferredName = "sing-box"
 	}
-	if factory, ok := engine.GetEmbedded(preferredName); ok {
+	// OpenVPN endpoints need sing-box >= 1.14; only the verified external binary
+	// path is supported, so skip the embedded runner for these profiles.
+	if factory, ok := engine.GetEmbedded(preferredName); ok && link.Protocol != "openvpn" {
 		configFile, cfgErr := configGen.Generate(&engine.Engine{Name: preferredName}, link)
 		if cfgErr == nil {
 			runner, runErr := factory(configFile)
 			if runErr == nil {
 				if startErr := runner.Start(); startErr == nil {
-					gw.embeddedEngine = runner
-					gw.activeEngine = preferredName
-					time.Sleep(2 * time.Second)
-					log.Printf("  ✅ %s running in-process (embedded) on :%d", preferredName, gw.socksPort)
-					if gw.config.Gateway.Enabled && gw.config.Gateway.NativeTUN && preferredName == "sing-box" {
-						gw.nativeTUN = true
+					// The in-process runner is only usable once our own process
+					// owns the SOCKS listener; a fixed sleep reported success
+					// for engines that had already died.
+					if ownErr := engine.WaitForOwnedListener(ctx, os.Getpid(), gw.socksPort, 10*time.Second); ownErr != nil {
+						runner.Stop() //nolint:errcheck
+						configGen.DiscardConfig(configFile)
+						log.Printf("  ⚠️  Embedded %s does not own :%d: %v — falling back to binary", preferredName, gw.socksPort, ownErr)
+					} else if portErr := waitForPortContext(ctx, gw.socksPort, 5*time.Second); portErr != nil {
+						runner.Stop() //nolint:errcheck
+						configGen.DiscardConfig(configFile)
+						log.Printf("  ⚠️  Embedded %s listener is not answering: %v — falling back to binary", preferredName, portErr)
+					} else {
+						gw.embeddedEngine = runner
+						gw.setEmbedded(runner)
+						gw.activeEngine = preferredName
+						gw.setRuntimeEngine(preferredName)
+						gw.configFile = configFile
+						log.Printf("  ✅ %s running in-process (embedded) on :%d", preferredName, gw.socksPort)
+						// Only sing-box non-OpenVPN profiles get a TUN inbound. Xray
+						// has no TUN and the OpenVPN generator emits SOCKS only, so
+						// claiming native TUN there would wait for a device that is
+						// never created and skip tun2socks.
+						gw.nativeTUN = gw.config.Gateway.Enabled && gw.config.Gateway.NativeTUN &&
+							preferredName == "sing-box" && link.Protocol != "openvpn" && !engine.RequiresXray(link)
+						return nil
 					}
-					return nil
 				} else {
+					configGen.DiscardConfig(configFile)
 					log.Printf("  ⚠️  Embedded %s start failed: %v — falling back to binary", preferredName, startErr)
 				}
 			} else {
+				configGen.DiscardConfig(configFile)
 				log.Printf("  ⚠️  Embedded %s init failed: %v — falling back to binary", preferredName, runErr)
 			}
 		} else {
+			configGen.DiscardGeneration()
 			log.Printf("  ⚠️  Embedded %s config gen failed: %v — falling back to binary", preferredName, cfgErr)
 		}
 	}
 
 	// FallbackController handles engine selection and startup with automatic fallback.
+	// The startup ctx bounds readiness and probes; the gateway root context owns
+	// the process so a successful engine survives the per-attempt deadline.
 	fc := engine.NewFallbackController(gw.engineMgr, gw.config.Engines.Fallback, configGen, gw.socksPort)
-	result, err := fc.StartWithFallback(gw.ctx, link, gw.config.Engines.PreferredEngine)
+	result, err := fc.StartWithLifetime(ctx, gw.startContext(), link, gw.config.Engines.PreferredEngine)
 	if err != nil {
+		if errors.Is(err, engine.ErrLocalConfig) {
+			return permanent(err)
+		}
 		return err
 	}
 
 	gw.engineProc = result.Process
+	gw.setEngineWaiter(result.Waiter)
 	gw.activeEngine = result.EngineName
+	gw.setRuntimeEngine(result.EngineName)
+	gw.configFile = result.ConfigFile
+	// Track the engine so a hard stop or the next startup can kill only
+	// bypath-owned children on every platform (no pkill on Windows).
+	trackChildPID(result.Process.Process.Pid)
 
 	// Give the engine a moment to fully initialize outbound connections.
-	time.Sleep(2 * time.Second)
+	timer := time.NewTimer(2 * time.Second)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		// The process is already assigned and owns the SOCKS port. Leaving it
+		// running would make every later candidate fail on "port in use".
+		gw.stopEngineLocked()
+		return ctx.Err()
+	case <-timer.C:
+	}
 
 	log.Printf("  ✅ %s running on :%d (PID: %d)", result.EngineName, gw.socksPort, gw.engineProc.Process.Pid)
 
-	// Mark native TUN as active only when sing-box started with gateway mode.
-	// xray does not create a TUN device — it provides SOCKS only.
-	if gw.config.Gateway.Enabled && gw.config.Gateway.NativeTUN && result.EngineName == "sing-box" {
-		gw.nativeTUN = true
-	}
+	// Mark native TUN as active only when sing-box actually generated one.
+	// xray provides SOCKS only, and the OpenVPN generator emits SOCKS inbounds
+	// without a TUN, so both must use the tun2socks data path.
+	gw.nativeTUN = gw.config.Gateway.Enabled && gw.config.Gateway.NativeTUN &&
+		result.EngineName == "sing-box" && link.Protocol != "openvpn" && !engine.RequiresXray(link)
 
 	return nil
 }
 
-// disableSystemdResolved stops and disables systemd-resolved if it's running.
+// disableSystemdResolved temporarily stops systemd-resolved when it holds
+// port 53. It is deliberately not disabled persistently: cleanup restarts the
+// service so a reboot keeps the host's original resolver configuration.
 // systemd-resolved binds to port 53 (127.0.0.53 and/or 127.0.0.54) which
 // prevents dns2socks/dnsmasq from binding to 0.0.0.0:53.
 // Common on Debian 12+, Ubuntu 18+. Not present on Armbian minimal.
-func disableSystemdResolved() {
-	// Check if systemd-resolved is active
-	out, err := exec.Command("systemctl", "is-active", "systemd-resolved").Output()
+//
+// Ownership is persisted before the service or resolver file is touched. A
+// persistence failure is returned and leaves the host untouched.
+func (gw *Gateway) disableSystemdResolved() (bool, error) {
+	// In a private network namespace the resolver services of the host are
+	// irrelevant: their port 53 belongs to another network stack, and stopping
+	// them would break host DNS for no benefit.
+	if networkNamespaceIsolated() {
+		return false, nil
+	}
+	// Only the standard port conflicts with systemd-resolved. On a nonstandard
+	// port the resolver keeps running and is the host's own upstream, so
+	// stopping it would be an unnecessary, silent service change.
+	if port := gw.dnsPort; port != 0 && port != 53 {
+		return false, nil
+	}
+	out, err := systemctlOutput("is-active", "systemd-resolved")
 	if err != nil || strings.TrimSpace(string(out)) != "active" {
-		return // not running, nothing to do
+		return false, nil // not running, nothing to do
 	}
 
-	log.Printf("  ⚠️  systemd-resolved is active (conflicts with port 53) — disabling...")
+	log.Printf("  ⚠️  systemd-resolved is active (conflicts with port 53) — stopping temporarily...")
 
-	// Stop and disable
-	exec.Command("systemctl", "stop", "systemd-resolved").Run()
-	exec.Command("systemctl", "disable", "systemd-resolved").Run()
-
-	// Fix /etc/resolv.conf if it's a symlink to systemd-resolved's stub
-	target, err := os.Readlink("/etc/resolv.conf")
-	if err == nil && strings.Contains(target, "systemd") {
-		os.Remove("/etc/resolv.conf")
-		os.WriteFile("/etc/resolv.conf", []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"), 0644)
-		log.Printf("  ✅ /etc/resolv.conf fixed (was symlink to systemd-resolved stub)")
+	// Record ownership before the service changes, so a crash still restores it.
+	st, err := gw.ensureRunState("pending")
+	if err != nil {
+		return false, err
+	}
+	st.ResolvedStopped = true
+	if err := gw.persistRunState(); err != nil {
+		st.ResolvedStopped = false
+		return false, err
 	}
 
-	log.Printf("  ✅ systemd-resolved disabled")
+	if err := systemctlRun("stop", "systemd-resolved"); err != nil {
+		// The record keeps the flag: the service may have stopped despite the
+		// error, and the next recovery run will restore it.
+		return false, fmt.Errorf("stopping systemd-resolved: %w", err)
+	}
+
+	// If the resolver is the systemd stub symlink, remember its target so
+	// cleanup can restore it exactly instead of degrading it to plain 1.1.1.1.
+	if _, statErr := os.Stat(resolvLinkBackup); os.IsNotExist(statErr) {
+		if target, linkErr := os.Readlink(resolvConfPath); linkErr == nil && strings.Contains(target, "systemd") {
+			if err := writeFileAtomic(resolvLinkBackup, []byte(target), 0600); err != nil {
+				return false, fmt.Errorf("saving the systemd-resolved stub target: %w", err)
+			}
+		}
+	}
+	if target, linkErr := os.Readlink(resolvConfPath); linkErr == nil && strings.Contains(target, "systemd") {
+		st.ResolvChanged = true
+		if err := gw.persistRunState(); err != nil {
+			st.ResolvChanged = false
+			return false, err
+		}
+		if err := os.Remove(resolvConfPath); err != nil && !os.IsNotExist(err) {
+			return false, fmt.Errorf("detaching %s: %w", resolvConfPath, err)
+		}
+		if err := writeResolvConf(resolvConfPath, []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"), 0644); err != nil {
+			return false, fmt.Errorf("writing %s: %w", resolvConfPath, err)
+		}
+		log.Printf("  ✅ /etc/resolv.conf detached from systemd-resolved stub (target remembered)")
+	}
+
+	log.Printf("  ✅ systemd-resolved stopped (will be restarted on cleanup)")
+	return true, nil
+}
+
+// dnsPolicy is the explicit DNS leak policy for gateway mode.
+type dnsPolicy int
+
+const (
+	// dnsPolicyStrict resolves DNS only through the tunnel. A failed lookup is
+	// answered with SERVFAIL; it never falls back to direct upstream DNS.
+	dnsPolicyStrict dnsPolicy = iota
+	// dnsPolicyLocal explicitly permits direct upstream DNS queries.
+	dnsPolicyLocal
+)
+
+// parseDNSMode maps gateway.dns_mode to a policy. An unknown value is an error
+// (fail closed) rather than a silent fallback to direct DNS.
+func parseDNSMode(mode string) (dnsPolicy, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "strict":
+		return dnsPolicyStrict, nil
+	case "local":
+		return dnsPolicyLocal, nil
+	default:
+		return dnsPolicyStrict, fmt.Errorf("unsupported gateway.dns_mode %q (use \"strict\" or \"local\")", mode)
+	}
+}
+
+func (p dnsPolicy) allowsDirectDNS() bool { return p == dnsPolicyLocal }
+
+// dnsServerAddr appends the default DNS port unless the upstream already has one.
+func dnsServerAddr(upstream string) string {
+	if _, _, err := net.SplitHostPort(upstream); err == nil {
+		return upstream
+	}
+	if strings.HasPrefix(upstream, "[") && strings.HasSuffix(upstream, "]") {
+		return upstream + ":53"
+	}
+	return net.JoinHostPort(upstream, "53")
+}
+
+// dohURLFor turns a configured upstream into a DoH endpoint. A value that is
+// already a URL is validated and used unchanged; otherwise an explicit port is
+// preserved (the default 443 is omitted), IPv6 literals are bracketed and
+// /dns-query is appended. Invalid input is a controlled error: a malformed
+// endpoint must never become a nil request or a direct-DNS fallback.
+func dohURLFor(upstream string) (string, error) {
+	up := strings.TrimSpace(upstream)
+	if up == "" {
+		return "", fmt.Errorf("empty DNS upstream")
+	}
+	if strings.HasPrefix(up, "https://") || strings.HasPrefix(up, "http://") {
+		parsed, err := url.Parse(up)
+		if err != nil {
+			return "", fmt.Errorf("invalid DoH URL %q: %w", up, err)
+		}
+		if parsed.Scheme != "https" && parsed.Scheme != "http" {
+			return "", fmt.Errorf("invalid DoH URL %q: unsupported scheme %q", up, parsed.Scheme)
+		}
+		if parsed.Host == "" {
+			return "", fmt.Errorf("invalid DoH URL %q: missing host", up)
+		}
+		return up, nil
+	}
+	host, port := up, ""
+	if h, p, err := net.SplitHostPort(up); err == nil {
+		host, port = h, p
+	}
+	if host == "" {
+		return "", fmt.Errorf("invalid DNS upstream %q", upstream)
+	}
+	authority := host
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		authority = "[" + host + "]"
+	}
+	if port != "" && port != "443" {
+		authority += ":" + port
+	}
+	return "https://" + authority + "/dns-query", nil
+}
+
+// buildDoHURLs validates every configured upstream before the DNS listener is
+// started. One malformed endpoint rejects the whole set instead of silently
+// running with a partially working resolver.
+func buildDoHURLs(upstreams []string) ([]string, error) {
+	urls := make([]string, 0, len(upstreams))
+	for _, up := range upstreams {
+		u, err := dohURLFor(up)
+		if err != nil {
+			return nil, err
+		}
+		urls = append(urls, u)
+	}
+	return urls, nil
+}
+
+// dnsWarmupTimeout bounds how long startup waits for the resolver to prove it
+// can answer a query through the tunnel. A bound port is not readiness: DoH
+// through a freshly started tunnel can fail while the handshake completes.
+const dnsWarmupTimeout = 20 * time.Second
+
+// dohRequestTimeout bounds one DoH exchange. Without a bound, a resolver whose
+// :443 path silently drops packets stalls the forwarder indefinitely, so the
+// local policy's direct UDP fallback is never attempted.
+const dohRequestTimeout = 8 * time.Second
+
+// udpQueryTimeout bounds one direct UDP attempt under the local policy.
+const udpQueryTimeout = 4 * time.Second
+
+// dnsForwardBudget is the longest a single query can occupy the forwarder:
+// every upstream gets a DoH attempt, and under the local policy every upstream
+// also gets one direct UDP attempt. Readiness has to outlast that budget, or it
+// gives up while the forwarder is still working and reports a false failure.
+func dnsForwardBudget(upstreams []string, allowDirect bool) time.Duration {
+	budget := time.Duration(len(upstreams)) * dohRequestTimeout
+	if allowDirect {
+		budget += time.Duration(len(upstreams)) * udpQueryTimeout
+	}
+	return budget + time.Second
+}
+
+// dnsWarmup is the readiness budget for this configuration: the floor, or the
+// forwarder's own worst case when that is longer.
+func (gw *Gateway) dnsWarmup() time.Duration {
+	allowDirect := false
+	if policy, err := parseDNSMode(gw.config.Gateway.DNSMode); err == nil {
+		allowDirect = policy.allowsDirectDNS()
+	}
+	warmup := dnsForwardBudget(gw.config.Gateway.DNSUpstream, allowDirect)
+	if warmup < dnsWarmupTimeout {
+		warmup = dnsWarmupTimeout
+	}
+	return warmup
+}
+
+// dnsProbeName picks the readiness query. It prefers a name the plan proxies,
+// because that is the path a tunneled lookup takes; only when every candidate is
+// routed DIRECT does readiness prove the direct resolver instead. The second
+// return reports which path the chosen name takes.
+func (gw *Gateway) dnsProbeName() (string, bool) {
+	candidates := []string{"example.com", "example.net", "example.org"}
+	for _, name := range candidates {
+		if gw.dnsSplit.class(name) != tunnel.NameClassDirect {
+			return name, true
+		}
+	}
+	return candidates[0], false
+}
+
+// verifyDNSReady sends a real query to bypath's own resolver and requires a
+// success answer. Without this, the gateway can report CONNECTED while clients
+// receive SERVFAIL — the exact "gateway is up but nothing resolves" failure.
+// Each attempt is bounded by the remaining warmup deadline rather than a
+// per-query constant, so one complete forwarder path can finish.
+func (gw *Gateway) verifyDNSReady(timeout time.Duration) error {
+	addr := fmt.Sprintf("127.0.0.1:%d", gw.dnsPort)
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		if err := gw.ctx.Err(); err != nil {
+			return err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("DNS proxy did not answer a tunneled query within %s: %w", timeout, lastErr)
+		}
+		client := &dns.Client{Net: "udp", Timeout: remaining}
+		query := new(dns.Msg)
+		probe, viaTunnel := gw.dnsProbeName()
+		query.SetQuestion(probe+".", dns.TypeA)
+		resp, _, err := client.ExchangeContext(gw.ctx, query, addr)
+		if err == nil && resp != nil && resp.Rcode == dns.RcodeSuccess && len(resp.Answer) > 0 {
+			if viaTunnel {
+				log.Printf("  ✅ DNS resolves through the tunnel (%s answered %s)", addr, probe)
+			} else {
+				log.Printf("  ✅ DNS answers (%s resolved %s through the direct resolver)", addr, probe)
+			}
+			return nil
+		}
+		switch {
+		case err != nil:
+			lastErr = err
+		default:
+			lastErr = fmt.Errorf("resolver answered %s without records", dns.RcodeToString[resp.Rcode])
+		}
+		select {
+		case <-gw.ctx.Done():
+			return gw.ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }
 
 func (gw *Gateway) startDNS() error {
 	log.Printf("🔀 Starting DNS proxy on :%d...", gw.dnsPort)
 
-	// Disable systemd-resolved if it's occupying port 53
-	disableSystemdResolved()
+	// Reset the split resolver state before any listener starts. Handlers read
+	// gw.dnsSplit once the built-in forwarder is up, so it is written only here
+	// and in startBuiltinDNS, never while queries are being served.
+	gw.dnsSplit = splitDNS{}
+
+	policy, err := parseDNSMode(gw.config.Gateway.DNSMode)
+	if err != nil {
+		return err
+	}
+	if policy.allowsDirectDNS() {
+		log.Printf("  ⚠️  DNS policy: local — direct upstream queries are explicitly permitted")
+	} else {
+		log.Printf("  🔒 DNS policy: strict — queries resolve through the tunnel; failures return SERVFAIL (no direct fallback)")
+	}
+
+	// Stop systemd-resolved if it is occupying port 53 (gateway mode only).
+	stopped, err := gw.disableSystemdResolved()
+	if err != nil {
+		return fmt.Errorf("freeing port 53: %w", err)
+	}
+	if stopped {
+		gw.resolvedStopped = true
+	}
 	// Also stop dnsmasq: it binds port 53 at boot on many Armbian/Debian setups and
 	// causes dns2socks to fail silently (waitForPort returns true because dnsmasq is
 	// already there, so bypath thinks dns2socks started when it actually crashed).
-	gw.stopDnsmasq()
+	if err := gw.stopDnsmasq(); err != nil {
+		return err
+	}
 
 	// Kill only bypath's own previous DNS proxy (tracked by PID), not user processes.
 	if gw.dnsProc != nil && gw.dnsProc.Process != nil {
@@ -854,12 +1710,14 @@ func (gw *Gateway) startDNS() error {
 		upstream = []string{"1.1.1.1", "8.8.8.8"}
 	}
 
-	// When local_dns rules are configured, dns2socks cannot handle per-domain routing —
-	// it forwards everything to a single upstream through the tunnel. Skip it and use
-	// the built-in DNS forwarder which routes local suffixes directly to the home DNS.
-	if len(gw.config.Gateway.LocalDNS) > 0 {
-		log.Printf("  ℹ️  local_dns configured — using built-in DNS for per-domain routing")
-		return gw.startBuiltinDNS(upstream)
+	// When local_dns rules or a direct resolver are configured, dns2socks cannot
+	// handle per-domain routing — it forwards everything to a single upstream
+	// through the tunnel. Skip it and use the built-in DNS forwarder which routes
+	// local suffixes to the home DNS and DIRECT-class names to the direct
+	// resolver.
+	if len(gw.config.Gateway.LocalDNS) > 0 || strings.TrimSpace(gw.config.Gateway.DirectDNS) != "" {
+		log.Printf("  ℹ️  per-domain DNS routing configured — using built-in DNS for per-domain routing")
+		return gw.startBuiltinDNS(upstream, policy)
 	}
 
 	// Try dns2socks first (routes DNS through the tunnel — preferred).
@@ -868,14 +1726,14 @@ func (gw *Gateway) startDNS() error {
 	if err == nil {
 		gw.dnsProc = exec.CommandContext(gw.ctx, dns2socksPath,
 			"-l", fmt.Sprintf("0.0.0.0:%d", gw.dnsPort),
-			"-d", upstream[0]+":53",
+			"-d", dnsServerAddr(upstream[0]),
 			"-s", fmt.Sprintf("socks5://127.0.0.1:%d", gw.socksPort),
 			"-f", "-c",
 		)
 		if err := gw.dnsProc.Start(); err != nil {
 			return fmt.Errorf("starting dns2socks: %w", err)
 		}
-		if err := waitForPort(gw.dnsPort, 5*time.Second); err != nil {
+		if err := waitForPortContext(gw.ctx, gw.dnsPort, 5*time.Second); err != nil {
 			return fmt.Errorf("dns2socks didn't start: %w", err)
 		}
 		// Verify dns2socks itself is still alive — waitForPort can return true because
@@ -889,44 +1747,47 @@ func (gw *Gateway) startDNS() error {
 		return nil
 	}
 
-	// Fallback: dnsmasq (DNS goes direct, not through tunnel).
-	dnsmasqPath, err := exec.LookPath("dnsmasq")
-	if err == nil {
-		args := []string{"--no-daemon", "--no-resolv", "--listen-address=0.0.0.0", "--bind-interfaces"}
-		for _, ns := range upstream {
-			args = append(args, "--server="+ns)
+	// dnsmasq forwards DNS directly, which leaks queries outside the tunnel. It
+	// is only usable when the operator has explicitly selected the local policy.
+	if policy.allowsDirectDNS() {
+		if dnsmasqPath, err := exec.LookPath("dnsmasq"); err == nil {
+			args := []string{"--no-daemon", "--no-resolv", "--listen-address=0.0.0.0", "--bind-interfaces"}
+			for _, ns := range upstream {
+				args = append(args, "--server="+ns)
+			}
+			gw.dnsProc = exec.CommandContext(gw.ctx, dnsmasqPath, args...)
+			if err := gw.dnsProc.Start(); err != nil {
+				return fmt.Errorf("starting dnsmasq: %w", err)
+			}
+			trackChildPID(gw.dnsProc.Process.Pid)
+			log.Printf("  ⚠️  dnsmasq running → %v (DNS policy local: direct DNS explicitly allowed)", upstream)
+			return nil
 		}
-		gw.dnsProc = exec.CommandContext(gw.ctx, dnsmasqPath, args...)
-		if err := gw.dnsProc.Start(); err != nil {
-			return fmt.Errorf("starting dnsmasq: %w", err)
-		}
-		trackChildPID(gw.dnsProc.Process.Pid)
-		log.Printf("  ⚠️  dnsmasq running → %v (DNS NOT through tunnel — install dns2socks for secure DNS)", upstream)
-		return nil
 	}
 
-	// Last resort: built-in DNS forwarder (no external tool needed).
-	return gw.startBuiltinDNS(upstream)
+	// Last resort: built-in DNS forwarder (no external tool needed). In strict
+	// mode it resolves DoH through the proxy and never falls back to UDP.
+	return gw.startBuiltinDNS(upstream, policy)
 }
 
 // startBuiltinDNS starts a DNS forwarder using DoH (DNS-over-HTTPS) routed through
 // the SOCKS5 proxy. This avoids ISP DNS hijacking/poisoning for blocked sites.
-// Falls back to direct UDP if the proxy-routed DoH fails (e.g. proxy not yet ready).
-func (gw *Gateway) startBuiltinDNS(upstreams []string) error {
-	// Build DoH URLs from upstream IPs.
-	dohURLs := make([]string, 0, len(upstreams))
-	for _, up := range upstreams {
-		if net.ParseIP(up) != nil {
-			dohURLs = append(dohURLs, "https://"+up+"/dns-query")
-		} else {
-			dohURLs = append(dohURLs, up)
-		}
+// In strict policy a failed DoH lookup is answered with SERVFAIL; direct UDP is
+// only used when the operator explicitly selected the local policy. Declared
+// local_dns suffixes are always sent to their configured home DNS server.
+func (gw *Gateway) startBuiltinDNS(upstreams []string, policy dnsPolicy) error {
+	// Build DoH URLs from the configured upstreams. An explicit URL is validated
+	// and used as given; an address gains the standard /dns-query path, keeping a
+	// non-443 port and bracketing IPv6 literals so the URL is always well formed.
+	dohURLs, err := buildDoHURLs(upstreams)
+	if err != nil {
+		return fmt.Errorf("built-in DNS: %w", err)
 	}
 
 	// HTTP client that tunnels through SOCKS5 (xray) — avoids ISP DNS hijacking.
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", gw.socksPort)
 	proxyHTTP := &http.Client{
-		Timeout: 8 * time.Second,
+		Timeout: dohRequestTimeout,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				d := net.Dialer{Timeout: 5 * time.Second}
@@ -945,78 +1806,42 @@ func (gw *Gateway) startBuiltinDNS(upstreams []string) error {
 		},
 	}
 
-	// Fallback: plain UDP client (direct, no proxy) for when proxy isn't ready.
-	udpClient := &dns.Client{Net: "udp", Timeout: 4 * time.Second}
+	// Fallback: plain UDP client (direct, no proxy). Used only under the local
+	// policy; forwardDNS never reaches it in strict mode.
+	udpClient := &dns.Client{Net: "udp", Timeout: udpQueryTimeout}
 
-	// Local DNS clients: per-domain, sent directly to home DNS (not through tunnel).
-	type localDNSEntry struct {
-		suffixes []string
-		server   string
-	}
+	// Local DNS clients: per-domain, sent directly to the declared home DNS.
 	var localDNS []localDNSEntry
 	for _, entry := range gw.config.Gateway.LocalDNS {
 		if entry.Server != "" && len(entry.Domains) > 0 {
 			localDNS = append(localDNS, localDNSEntry{
 				suffixes: entry.Domains,
-				server:   entry.Server + ":53",
+				server:   entry.Server,
 			})
 		}
 	}
+	if len(localDNS) > 0 {
+		log.Printf("  ℹ️  local_dns: %d suffix rule(s) resolve via their configured home DNS (explicit policy)", len(localDNS))
+		if !policy.allowsDirectDNS() {
+			log.Printf("  ⚠️  local_dns bypasses the tunnel by design: only the declared suffixes are sent directly; every other query stays on DoH via the proxy")
+		}
+	}
 
-	queryFn := func(ctx context.Context, r *dns.Msg) *dns.Msg {
-		// Check local DNS rules first — private TLDs (e.g. .home) go directly to the
-		// home DNS server, bypassing the tunnel entirely.
-		if len(r.Question) > 0 && len(localDNS) > 0 {
-			qname := strings.TrimSuffix(strings.ToLower(r.Question[0].Name), ".")
-			for _, entry := range localDNS {
-				for _, suffix := range entry.suffixes {
-					sfx := strings.ToLower(suffix)
-					if qname == sfx || strings.HasSuffix(qname, "."+sfx) {
-						resp, _, err := udpClient.ExchangeContext(ctx, r, entry.server)
-						if err == nil {
-							return resp
-						}
-						// Local DNS unreachable — return NXDOMAIN so clients don't hang.
-						log.Printf("⚠️  local DNS %s unreachable for %s: %v", entry.server, qname, err)
-						nxd := new(dns.Msg)
-						nxd.SetRcode(r, dns.RcodeNameError)
-						return nxd
-					}
-				}
-			}
+	split, err := gw.buildSplitDNS()
+	if err != nil {
+		return err
+	}
+	gw.dnsSplit = split
+	if split.enabled() {
+		log.Printf("  ℹ️  direct_dns %s: names the routing plan sends DIRECT resolve there; every proxied name stays on the tunnel resolver", split.direct.endpoint())
+		if policy.allowsDirectDNS() {
+			log.Printf("  ℹ️  dns_mode local no longer blanket-forwards: proxied names keep the tunnel resolver and get SERVFAIL instead of a direct fallback")
 		}
-
-		packed, err := r.Pack()
-		if err == nil {
-			for _, dohURL := range dohURLs {
-				req, _ := http.NewRequestWithContext(ctx, http.MethodPost, dohURL,
-					bytes.NewReader(packed))
-				req.Header.Set("Content-Type", "application/dns-message")
-				req.Header.Set("Accept", "application/dns-message")
-				resp, err := proxyHTTP.Do(req)
-				if err == nil {
-					body, _ := io.ReadAll(resp.Body)
-					resp.Body.Close()
-					m := new(dns.Msg)
-					if m.Unpack(body) == nil {
-						return m
-					}
-				}
-			}
-		}
-		// Proxy unavailable — fall back to direct UDP.
-		for _, up := range upstreams {
-			resp, _, err := udpClient.ExchangeContext(ctx, r, up+":53")
-			if err == nil {
-				return resp
-			}
-		}
-		return nil
 	}
 
 	mux := dns.NewServeMux()
 	mux.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
-		resp := queryFn(gw.ctx, r)
+		resp := forwardDNS(gw.ctx, r, proxyHTTP, udpClient, dohURLs, upstreams, localDNS, policy, gw.dnsSplit)
 		if resp == nil {
 			m := new(dns.Msg)
 			m.SetRcode(r, dns.RcodeServerFailure)
@@ -1046,8 +1871,127 @@ func (gw *Gateway) startBuiltinDNS(upstreams []string) error {
 	go tcpSrv.ActivateAndServe()
 
 	gw.dnsBuiltin = append(gw.dnsBuiltin, udpSrv, tcpSrv)
-	log.Printf("  ✅ Built-in DNS forwarder on :%d → DoH via proxy (%v)", gw.dnsPort, upstreams)
+	mode := "strict: DoH via proxy, no direct fallback"
+	if policy.allowsDirectDNS() {
+		mode = "local: DoH via proxy, direct UDP permitted"
+	}
+	log.Printf("  ✅ Built-in DNS forwarder on :%d → %s (%v)", gw.dnsPort, mode, upstreams)
 	return nil
+}
+
+// localDNSEntry routes a set of domain suffixes to one explicitly configured
+// home DNS server. Direct access is part of the declared policy.
+type localDNSEntry struct {
+	suffixes []string
+	server   string
+}
+
+// forwardDNS resolves one query. DoH through the proxy is always tried first.
+// Direct UDP is attempted only when the policy explicitly allows it, so a
+// disconnect or DoH failure yields SERVFAIL instead of a DNS leak. When a
+// direct resolver is configured, a name the routing plan sends DIRECT is
+// resolved there instead; every other name stays on the tunnel path and never
+// crosses over, so a proxied lookup cannot reach the direct resolver.
+func forwardDNS(ctx context.Context, r *dns.Msg, proxyHTTP *http.Client, udpClient *dns.Client, dohURLs, upstreams []string, localDNS []localDNSEntry, policy dnsPolicy, split splitDNS) *dns.Msg {
+	var qname string
+	if len(r.Question) > 0 {
+		qname = strings.TrimSuffix(strings.ToLower(r.Question[0].Name), ".")
+	}
+
+	// Check local DNS rules first — private TLDs (e.g. .home) go directly to the
+	// home DNS server declared by the operator, bypassing the tunnel entirely.
+	if qname != "" && len(localDNS) > 0 {
+		for _, entry := range localDNS {
+			for _, suffix := range entry.suffixes {
+				sfx := strings.ToLower(suffix)
+				if qname == sfx || strings.HasSuffix(qname, "."+sfx) {
+					resp, _, err := udpClient.ExchangeContext(ctx, r, dnsServerAddr(entry.server))
+					if err == nil {
+						return resp
+					}
+					// Local DNS unreachable — return NXDOMAIN so clients don't hang.
+					log.Printf("⚠️  local DNS %s unreachable for %s: %v", entry.server, qname, err)
+					nxd := new(dns.Msg)
+					nxd.SetRcode(r, dns.RcodeNameError)
+					return nxd
+				}
+			}
+		}
+	}
+
+	// Split-aware path: only a name the plan sends DIRECT may leave through the
+	// direct resolver. A failure stays a SERVFAIL for that name; falling back to
+	// the tunnel would resolve a direct destination with the tunnel's answer,
+	// and a proxied name must never be handed to a resolver it does not own.
+	if split.enabled() && qname != "" && split.class(qname) == tunnel.NameClassDirect {
+		resp, err := split.direct.exchange(ctx, r)
+		if err == nil && resp != nil {
+			return resp
+		}
+		log.Printf("⚠️  direct resolver %s did not answer %s: %v (SERVFAIL; the tunnel resolver is not used for a DIRECT name)", split.direct.endpoint(), qname, err)
+		return nil
+	}
+
+	packed, err := r.Pack()
+	if err == nil {
+		for _, dohURL := range dohURLs {
+			req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, dohURL,
+				bytes.NewReader(packed))
+			if reqErr != nil {
+				// A malformed endpoint is a configuration error. Skipping it must
+				// never turn into a nil request or a direct-DNS fallback.
+				log.Printf("⚠️  invalid DoH endpoint %q: %v", dohURL, reqErr)
+				continue
+			}
+			req.Header.Set("Content-Type", "application/dns-message")
+			req.Header.Set("Accept", "application/dns-message")
+			resp, err := proxyHTTP.Do(req)
+			if err == nil {
+				body, readErr := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				m := new(dns.Msg)
+				if readErr == nil && m.Unpack(body) == nil {
+					return m
+				}
+			}
+		}
+	}
+
+	// The blanket direct fallback belongs to the local policy. With a direct
+	// resolver configured the trusted direct path is the only one allowed, so
+	// proxied names are never blanket-forwarded to an arbitrary upstream.
+	if !policy.allowsDirectDNS() || split.enabled() {
+		return nil
+	}
+	// Local policy: proxy unavailable — fall back to direct UDP.
+	for _, up := range upstreams {
+		resp, _, err := udpClient.ExchangeContext(ctx, r, dnsServerAddr(up))
+		if err == nil {
+			return resp
+		}
+	}
+	return nil
+}
+
+// buildSplitDNS wires the optional direct resolver to the classifier built from
+// the running engine's plan. It runs when the DNS forwarder starts, so the
+// classification matches the engine config that is about to serve the traffic.
+func (gw *Gateway) buildSplitDNS() (splitDNS, error) {
+	direct, err := newDirectResolver(gw.config.Gateway.DirectDNS)
+	if err != nil {
+		return splitDNS{}, fmt.Errorf("gateway.direct_dns: %w", err)
+	}
+	if direct == nil {
+		return splitDNS{}, nil
+	}
+	engine := gw.activeEngine
+	if engine == "" {
+		engine = gw.config.Engines.PreferredEngine
+	}
+	if strings.TrimSpace(engine) == "" {
+		engine = "sing-box"
+	}
+	return splitDNS{direct: direct, classify: gw.engineConfigGenerator(nil).NameClassifier(engine)}, nil
 }
 
 // socks5Connect performs a minimal SOCKS5 no-auth handshake + CONNECT on an open conn.
@@ -1102,6 +2046,59 @@ func socks5Connect(conn net.Conn, target string) error {
 	return nil
 }
 
+// tun2socksCandidate is one resolvable tun2socks binary and the cleanup its
+// source needs when extraction produced a temporary file.
+type tun2socksCandidate struct {
+	path    string
+	source  string
+	resolve func() (string, string, error) // lazy lookup, used when path is empty
+	cleanup func()
+}
+
+// tun2socksCandidates returns the binaries to try, most trusted first: the
+// embedded copy (full build), then the pinned managed download, then an
+// operator-installed binary. The managed copy makes Lite self-contained instead
+// of depending on a manually installed helper. It is resolved lazily so an
+// embedded binary never triggers a network fetch.
+//
+// A build that embeds the helper must not fall back when that payload is
+// unusable: silently running a download or PATH binary instead would hide a
+// packaging defect and change which executable the gateway runs.
+func (gw *Gateway) tun2socksCandidates() ([]tun2socksCandidate, error) {
+	if embedbin.HasEmbedded() {
+		extracted, err := embedbin.ExtractTun2socks()
+		if err != nil {
+			return nil, fmt.Errorf("embedded tun2socks is not usable: %w", err)
+		}
+		// The embedded helper is the only binary this build verified. A helper
+		// that extracts but cannot exec is a packaging or filesystem defect, and
+		// falling back to a download or a PATH binary would hide it.
+		return []tun2socksCandidate{{
+			path:    extracted,
+			source:  "embedded",
+			cleanup: func() { os.Remove(extracted) },
+		}}, nil
+	}
+	var out []tun2socksCandidate
+	if gw.engineMgr != nil {
+		manager := gw.engineMgr
+		out = append(out, tun2socksCandidate{
+			source: "managed",
+			resolve: func() (string, string, error) {
+				eng, err := manager.EnsureManaged("tun2socks")
+				if err != nil {
+					return "", "", err
+				}
+				return eng.Path, "managed (" + eng.Source + ")", nil
+			},
+		})
+	}
+	if path, err := exec.LookPath("tun2socks"); err == nil {
+		out = append(out, tun2socksCandidate{path: path, source: "system"})
+	}
+	return out, nil
+}
+
 func (gw *Gateway) startTun() error {
 	if runtime.GOOS == "windows" {
 		return fmt.Errorf("TUN gateway mode not supported on Windows (use proxy mode)")
@@ -1109,25 +2106,51 @@ func (gw *Gateway) startTun() error {
 
 	log.Printf("🔧 Setting up TUN device...")
 
-	// Resolve tun2socks: prefer system PATH, fall back to embedded binary.
-	tunPath, err := exec.LookPath("tun2socks")
+	candidates, err := gw.tun2socksCandidates()
 	if err != nil {
-		if embedded, eErr := embedbin.ExtractTun2socks(); eErr == nil {
-			tunPath = embedded
-			defer os.Remove(tunPath)
-		} else {
-			return fmt.Errorf("tun2socks not found (install it or use native TUN mode with a full build)")
+		return err
+	}
+	defer func() {
+		for _, c := range candidates {
+			if c.cleanup != nil {
+				c.cleanup()
+			}
 		}
+	}()
+	if len(candidates) == 0 {
+		return fmt.Errorf("no tun2socks binary available (embedded, pinned managed download, or PATH)")
 	}
 
-	// Remove old TUN if exists
-	run("ip", "link", "del", "tun0")
-	time.Sleep(500 * time.Millisecond)
+	// Never delete an interface bypath cannot prove it owns. A leftover tun0
+	// from this same run is recreated; any other tun0 is a hard error.
+	if linkExists("tun0") {
+		if !gw.tunCreated {
+			return fmt.Errorf("tun0 already exists and is not owned by this bypath run; refusing to delete it")
+		}
+		if err := run("ip", "link", "del", "tun0"); err != nil {
+			return fmt.Errorf("removing previous bypath tun0: %w", err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	st, err := gw.ensureRunState("legacy")
+	if err != nil {
+		return err
+	}
+	st.TunCreated = true
+	if err := saveGatewayState(st); err != nil {
+		return fmt.Errorf("recording tun0 ownership: %w", err)
+	}
 
 	// Create TUN
 	if err := run("ip", "tuntap", "add", "mode", "tun", "dev", "tun0"); err != nil {
+		st.TunCreated = false
+		if saveErr := saveGatewayState(st); saveErr != nil {
+			return fmt.Errorf("creating tun0: %w (recording rollback state also failed: %v)", err, saveErr)
+		}
 		return fmt.Errorf("creating tun0: %w", err)
 	}
+	gw.tunCreated = true
 	if err := run("ip", "addr", "add", "10.0.0.1/24", "dev", "tun0"); err != nil {
 		return fmt.Errorf("assigning IP to tun0: %w", err)
 	}
@@ -1135,155 +2158,543 @@ func (gw *Gateway) startTun() error {
 		return fmt.Errorf("bringing up tun0: %w", err)
 	}
 
-	// Start tun2socks
-	gw.tunProc = exec.CommandContext(gw.ctx, tunPath,
-		"-device", "tun0",
-		"-proxy", fmt.Sprintf("socks5://127.0.0.1:%d", gw.socksPort),
-	)
-	if err := gw.tunProc.Start(); err != nil {
-		return fmt.Errorf("starting tun2socks: %w", err)
-	}
-	trackChildPID(gw.tunProc.Process.Pid)
+	// Start tun2socks. A binary that cannot open the TUN device (no /dev/net/tun,
+	// noexec temp dir) exits immediately, so each candidate is given a short
+	// liveness window before it is accepted.
+	var lastErr error
+	for _, c := range candidates {
+		if c.path == "" && c.resolve != nil {
+			path, source, err := c.resolve()
+			if err != nil {
+				log.Printf("  ⚠️  tun2socks %s unavailable: %v", c.source, err)
+				lastErr = fmt.Errorf("%s: %w", c.source, err)
+				continue
+			}
+			c.path, c.source = path, source
+		}
+		proc := exec.CommandContext(gw.ctx, c.path,
+			"-device", "tun0",
+			"-proxy", fmt.Sprintf("socks5://127.0.0.1:%d", gw.socksPort),
+		)
+		if err := proc.Start(); err != nil {
+			lastErr = fmt.Errorf("%s (%s): %w", c.path, c.source, err)
+			continue
+		}
+		waiter := engine.WaitAsync(proc)
+		trackChildPID(proc.Process.Pid)
+		select {
+		case <-waiter.Done():
+			lastErr = fmt.Errorf("%s (%s) exited during startup: %v", c.path, c.source, waiter.Err())
+			continue
+		case <-gw.ctx.Done():
+			_ = proc.Process.Kill()
+			waiter.Wait(5 * time.Second)
+			return gw.ctx.Err()
+		case <-time.After(1500 * time.Millisecond):
+		}
 
-	time.Sleep(2 * time.Second)
-	log.Printf("  ✅ tun2socks running (tun0 → socks5://127.0.0.1:%d)", gw.socksPort)
-	return nil
+		gw.tunProc = proc
+		gw.setTunWaiter(waiter)
+		log.Printf("  ✅ tun2socks running from %s (tun0 → socks5://127.0.0.1:%d)", c.source, gw.socksPort)
+		return nil
+	}
+	return fmt.Errorf("starting tun2socks: %w", lastErr)
 }
 
+// lanForwardArgs returns the only same-interface forwarding rule bypath
+// installs. Matching on "-i IF -o IF" would also accept LAN-to-WAN traffic on a
+// single-NIC router, where the LAN and the uplink share one interface, and that
+// is exactly the path a dead tunnel must never open. Restricting the rule to
+// the configured LAN subnet keeps client-to-client forwarding working while
+// every other destination falls through to the fail-closed DROP.
+func lanForwardArgs(iface, subnet string) ([]string, error) {
+	if strings.TrimSpace(iface) == "" {
+		return nil, fmt.Errorf("interface is not detected")
+	}
+	_, network, err := net.ParseCIDR(strings.TrimSpace(subnet))
+	if err != nil {
+		return nil, fmt.Errorf("subnet %q is not a CIDR: %w", subnet, err)
+	}
+	ones, bits := network.Mask.Size()
+	if bits != 32 || ones >= 32 {
+		return nil, fmt.Errorf("subnet %q does not describe a LAN range", subnet)
+	}
+	return []string{"-i", iface, "-d", network.String(), "-j", "ACCEPT"}, nil
+}
+
+// setupRouting applies host networking as a transaction. Every operation that
+// can be undone is recorded in the ownership state before it is applied, and
+// the first failure aborts startup so the caller can roll back exactly what was
+// changed.
 func (gw *Gateway) setupRouting() error {
+	if !gw.config.Gateway.Enabled {
+		return nil
+	}
 	log.Printf("🔧 Configuring routing...")
 
-	// Enable IP forwarding (needed in both modes)
-	run("sysctl", "-w", "net.ipv4.ip_forward=1")
+	mode := "legacy"
+	if gw.nativeTUN {
+		mode = "native"
+	}
+	st, err := gw.ensureRunState(mode)
+	if err != nil {
+		return err
+	}
+	gw.networkMutated = true
+	gw.legacyRoutingActive = !gw.nativeTUN
+
+	// Containment first: the guard chain drops every forwarded packet from the
+	// LAN while the real chains are flushed and rebuilt. A retained chain from a
+	// previous run is adopted here, so a restart never has an uncontained gap.
+	if err := ensureGuardContainment(gw.iface); err != nil {
+		return fmt.Errorf("installing fail-closed forwarding guard: %w", err)
+	}
+
+	// IPv6 containment is applied before any IPv4 routing is installed, in both
+	// gateway modes: a partially configured startup must never leave LAN IPv6
+	// able to leave via the host route. On failure nothing else has changed yet,
+	// so the rollback has no IPv4 state to undo.
+	if err := gw.setupIPv6Isolation(st); err != nil {
+		return err
+	}
+
+	// Enable IP forwarding (needed in both modes). Recorded so cleanup only
+	// restores the previous value when bypath actually changed it.
+	if err := gw.enableIPv4Forwarding(st); err != nil {
+		return fmt.Errorf("enabling IPv4 forwarding: %w", err)
+	}
+
+	// Only bypath-owned chains are created and later removed. Built-in chains
+	// (PREROUTING/POSTROUTING/FORWARD) are never flushed.
+	if err := ensureChainE("nat", chainNat); err != nil {
+		return err
+	}
+	if err := flushChainE("nat", chainNat); err != nil {
+		return err
+	}
+	if err := ensureChainE("filter", chainForward); err != nil {
+		return err
+	}
+	if err := flushChainE("filter", chainForward); err != nil {
+		return err
+	}
+	// LAN-to-LAN forwarding is allowed only towards the configured LAN subnet.
+	// Matching on the interface pair instead would accept LAN-to-WAN traffic on
+	// any single-NIC router, because there the LAN and the uplink share one
+	// interface. Without a usable subnet the rule is not installed at all, so
+	// forwarded traffic stays contained by the catch-all DROP.
+	lanRule, err := lanForwardArgs(gw.iface, gw.subnet)
+	if err != nil {
+		return fmt.Errorf("refusing to install forwarding rules without a LAN subnet: %w", err)
+	}
 
 	if gw.nativeTUN {
-		// Native TUN mode: sing-box's auto_route handles policy routing.
-		// We only need NAT masquerade and FORWARD rules for LAN traffic.
-		log.Printf("  ℹ️  Native TUN: skipping fwmark/policy routing (sing-box auto_route handles it)")
-
-		// NAT masquerade on LAN interface so return traffic finds its way back
-		run("iptables", "-t", "nat", "-F", "POSTROUTING")
-		run("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", gw.iface, "-j", "MASQUERADE")
-
-		// FORWARD rules: allow traffic between LAN interface and tun0
-		run("iptables", "-F", "FORWARD")
-		run("iptables", "-A", "FORWARD", "-i", gw.iface, "-o", "tun0", "-j", "ACCEPT")
-		run("iptables", "-A", "FORWARD", "-i", "tun0", "-o", gw.iface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
-		run("iptables", "-A", "FORWARD", "-i", gw.iface, "-o", gw.iface, "-j", "ACCEPT")
-
-		// Intercept LAN DNS so DHCP-configured DNS doesn't bypass the tunnel.
-		gw.setupDNSIntercept()
-
-		log.Printf("  ✅ Routing configured (native TUN: LAN ↔ tun0 via sing-box auto_route)")
-	} else {
-		// Legacy mode: full policy routing with fwmark + route table 100
-		// Table 100: default via tun0 + local subnet direct
-		run("ip", "route", "flush", "table", "100")
-		run("ip", "route", "add", "default", "via", "10.0.0.1", "dev", "tun0", "table", "100")
-		run("ip", "route", "add", gw.subnet, "dev", gw.iface, "table", "100")
-
-		// Mark packets from LAN (not destined to LAN) with fwmark 0x1
-		// Whitelist (geoip IR → direct) is now handled inside sing-box, no ipset needed.
-		run("iptables", "-t", "mangle", "-F", "PREROUTING")
-		run("iptables", "-t", "mangle", "-A", "PREROUTING",
-			"-i", gw.iface,
-			"-s", gw.subnet,
-			"!", "-d", gw.subnet,
-			"-j", "MARK", "--set-mark", "0x1")
-
-		// Route marked traffic through table 100
-		run("ip", "rule", "del", "fwmark", "0x1", "lookup", "100")
-		run("ip", "rule", "add", "fwmark", "0x1", "lookup", "100", "prio", "100")
-
-		// NAT
-		run("iptables", "-t", "nat", "-F", "POSTROUTING")
-		run("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", "tun0", "-j", "MASQUERADE")
-		run("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", gw.iface, "-j", "MASQUERADE")
-
-		// Forward
-		run("iptables", "-F", "FORWARD")
-		run("iptables", "-A", "FORWARD", "-i", gw.iface, "-o", "tun0", "-j", "ACCEPT")
-		run("iptables", "-A", "FORWARD", "-i", "tun0", "-o", gw.iface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
-		run("iptables", "-A", "FORWARD", "-i", gw.iface, "-o", gw.iface, "-j", "ACCEPT")
-
-		// Intercept LAN DNS so DHCP-configured DNS doesn't bypass the tunnel.
-		gw.setupDNSIntercept()
-
-		log.Printf("  ✅ Routing configured (LAN → tun0 → tunnel, whitelist via sing-box geoip)")
-
-		// Pin the tunnel server's hostname in /etc/hosts BEFORE switching DNS.
-		// This prevents a chicken-and-egg problem: after resolv.conf points to
-		// dns2socks (127.0.0.1), xray needs to resolve the server hostname but
-		// can't do so until xray itself is up and forwarding DNS queries.
-		if gw.engineProc != nil || gw.embeddedEngine != nil {
-			// pin the tunnel server's hostname before switching DNS
-			if link := gw.profileMgr.GetActiveLink(); link != nil && link.Address != "" {
-				gw.pinHostToEtcHosts(link.Address)
+		// Native TUN mode: sing-box's auto_route handles policy routing using
+		// bypath's reserved table and rule index. Start recorded ownership before
+		// the engine ran; this is a defensive re-assert for callers that build a
+		// Gateway directly.
+		log.Printf("  ℹ️  Native TUN: skipping fwmark/policy routing (sing-box auto_route owns reserved table %d)", tunnel.NativeRouteTable)
+		if !st.NativeRules || st.NativeRuleTable != tunnel.NativeRouteTable {
+			st.NativeRules = true
+			st.NativeRuleTable = tunnel.NativeRouteTable
+			if err := saveGatewayState(st); err != nil {
+				return fmt.Errorf("recording sing-box policy-rule ownership: %w", err)
 			}
 		}
 
-		// Point the host's own DNS resolver to dns2socks (127.0.0.1) so that
-		// processes on Orange Pi itself (xray, curl, etc.) get unblocked DNS.
-		// Without this, /etc/resolv.conf points to 8.8.8.8 which is DNS-poisoned
-		// in Iran and returns fake IPs (e.g. 10.10.34.36) for blocked sites.
-		gw.setResolvConf("127.0.0.1")
+		if err := run("iptables", "-t", "nat", "-A", chainNat, "-o", gw.iface, "-j", "MASQUERADE"); err != nil {
+			return err
+		}
+		if err := ensureJumpE("nat", "POSTROUTING", chainNat); err != nil {
+			return err
+		}
+
+		// FORWARD rules: allow traffic between LAN interface and tun0
+		if err := run("iptables", "-A", chainForward, "-i", gw.iface, "-o", "tun0", "-j", "ACCEPT"); err != nil {
+			return err
+		}
+		if err := run("iptables", "-A", chainForward, "-i", "tun0", "-o", gw.iface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"); err != nil {
+			return err
+		}
+		if err := run("iptables", append([]string{"-A", chainForward}, lanRule...)...); err != nil {
+			return err
+		}
+		// Fail closed: every remaining forwarded LAN packet is bound for the WAN.
+		// That is exactly the leak that appears when tun0 disappears, so it is
+		// dropped instead of being accepted or routed by the main table. The
+		// catch-all comes last because a packet has a single output interface and
+		// iptables accepts only one -o per rule.
+		if err := run("iptables", "-A", chainForward, "-i", gw.iface, "-j", "DROP"); err != nil {
+			return err
+		}
+		// Intercept LAN DNS so DHCP-configured DNS doesn't bypass the tunnel.
+		if err := gw.setupDNSIntercept(); err != nil {
+			return err
+		}
+
+		log.Printf("  ✅ Routing configured (native TUN: LAN ↔ tun0 via sing-box auto_route)")
+	} else {
+		// Legacy mode: full policy routing with fwmark + route table 100.
+		// Table 100 is never flushed: only routes bypath recorded are removed.
+		if err := gw.applyRoute(st, "route", "add", "default", "via", "10.0.0.1", "dev", "tun0", "table", "100"); err != nil {
+			return err
+		}
+		// The tunnel default disappears with tun0. Keep a blackhole at a higher
+		// metric in the same table so marked packets are dropped instead of
+		// falling through to the main table and leaving through the WAN. While
+		// tun0 exists its metric-0 route wins; the blackhole is only reachable
+		// during an outage, which is exactly when fail-closed is required.
+		if err := gw.applyRoute(st, "route", "add", "blackhole", "default", "metric", "4096", "table", "100"); err != nil {
+			return err
+		}
+		if err := gw.applyRoute(st, "route", "add", gw.subnet, "dev", gw.iface, "table", "100"); err != nil {
+			return err
+		}
+
+		// Mark packets from LAN (not destined to LAN) with fwmark 0x1.
+		// Whitelist (geoip IR → direct) is handled inside sing-box, no ipset.
+		if err := ensureChainE("mangle", chainMangle); err != nil {
+			return err
+		}
+		if err := flushChainE("mangle", chainMangle); err != nil {
+			return err
+		}
+		if err := run("iptables", "-t", "mangle", "-A", chainMangle,
+			"-i", gw.iface,
+			"-s", gw.subnet,
+			"!", "-d", gw.subnet,
+			"-j", "MARK", "--set-mark", "0x1"); err != nil {
+			return err
+		}
+		if err := ensureJumpE("mangle", "PREROUTING", chainMangle); err != nil {
+			return err
+		}
+
+		// Route marked traffic through table 100. A pre-existing rule is reused
+		// and never claimed; only a rule bypath added is removed on cleanup.
+		if err := gw.applyFwmarkRule(st); err != nil {
+			return err
+		}
+
+		if err := run("iptables", "-t", "nat", "-A", chainNat, "-o", "tun0", "-j", "MASQUERADE"); err != nil {
+			return err
+		}
+		if err := run("iptables", "-t", "nat", "-A", chainNat, "-o", gw.iface, "-j", "MASQUERADE"); err != nil {
+			return err
+		}
+		if err := ensureJumpE("nat", "POSTROUTING", chainNat); err != nil {
+			return err
+		}
+
+		if err := run("iptables", "-A", chainForward, "-i", gw.iface, "-o", "tun0", "-j", "ACCEPT"); err != nil {
+			return err
+		}
+		if err := run("iptables", "-A", chainForward, "-i", "tun0", "-o", gw.iface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"); err != nil {
+			return err
+		}
+		if err := run("iptables", append([]string{"-A", chainForward}, lanRule...)...); err != nil {
+			return err
+		}
+		// Fail closed: marked LAN traffic that is bound for neither the LAN nor
+		// tun0 would leave unencrypted through the WAN. The blackhole route in
+		// table 100 already drops it; this catch-all keeps the filter path closed
+		// too, including the window before the route changes. It comes last
+		// because iptables accepts only one -o per rule.
+		if err := run("iptables", "-A", chainForward, "-i", gw.iface, "-j", "DROP"); err != nil {
+			return err
+		}
+		if err := ensureJumpE("filter", "FORWARD", chainForward); err != nil {
+			return err
+		}
+
+		// Intercept LAN DNS so DHCP-configured DNS doesn't bypass the tunnel.
+		if err := gw.setupDNSIntercept(); err != nil {
+			return err
+		}
+
+		routeStyle := "whitelist via geo databases"
+		if len(gw.config.Routing.Rules) > 0 {
+			routeStyle = fmt.Sprintf("%d routing rule(s), default → %s", len(gw.config.Routing.Rules), defaultOutboundLabel(gw.config))
+		}
+		log.Printf("  ✅ Routing configured (LAN → tun0 → tunnel, %s)", routeStyle)
+	}
+
+	// The FORWARD jump must be the first rule evaluated: an earlier ACCEPT rule
+	// owned by another service would let LAN traffic bypass the fail-closed
+	// catch-all. It is verified by reading the effective list, not by trusting
+	// the command that generated it.
+	if err := ensureJumpFirst("iptables", "filter", "FORWARD", chainForward); err != nil {
+		return fmt.Errorf("installing fail-closed FORWARD jump: %w", err)
+	}
+	if err := verifyJumpFirst("iptables", "filter", "FORWARD", chainForward); err != nil {
+		return err
+	}
+	// The real chain is now in place and first, so the placeholder may go. A
+	// guard left behind would also drop LAN-to-LAN forwarding.
+	if err := removeGuardContainment(); err != nil {
+		return fmt.Errorf("removing fail-closed forwarding guard: %w", err)
+	}
+	if st.ContainmentRetained {
+		st.ContainmentRetained = false
+		st.ContainmentIface = ""
+		if err := saveGatewayState(st); err != nil {
+			return fmt.Errorf("recording adopted containment: %w", err)
+		}
+	}
+
+	// Both data paths rewrite the host resolver, so both must pin the tunnel
+	// server's hostname first: after resolv.conf points at bypath, the engine
+	// could no longer resolve its own endpoint without this record.
+	link := gw.currentActiveLink()
+	if link == nil && gw.profileMgr != nil {
+		link = gw.profileMgr.GetActiveLink()
+	}
+	if link != nil && link.Address != "" && (gw.engineProc != nil || gw.embeddedEngine != nil) {
+		if _, err := gw.pinHostToEtcHosts(link.Address); err != nil {
+			return err
+		}
+	}
+	if err := gw.setHostResolver(); err != nil {
+		return err
 	}
 
 	return nil
+}
+
+// setHostResolver keeps this host's own name resolution working while the
+// native TUN carries its traffic. On the standard port /etc/resolv.conf can
+// name 127.0.0.1 directly. On a nonstandard port (for example 5335 because
+// another resolver owns port 53) resolv.conf cannot express a port, so writing
+// 127.0.0.1 there would blackhole host DNS — and an installer rerun could no
+// longer resolve its download host. The gateway therefore updates the
+// systemd-resolved drop-in when the stub is in use and otherwise leaves the
+// host resolver untouched with an explicit warning. It never stops a resolver
+// for this path.
+func (gw *Gateway) setHostResolver() error {
+	port := gw.config.Server.DNSPort
+	if port == 0 {
+		port = 53
+	}
+	if port == 53 {
+		return gw.setResolvConf("127.0.0.1")
+	}
+	if resolvedStubInUse() {
+		return gw.setResolvedDropIn(port)
+	}
+	log.Printf("⚠️  Host DNS is unchanged: the gateway answers on port %d and %s cannot express a port. Point this host at 127.0.0.1:%d explicitly, or use DNS port 53.", port, resolvConfPath, port)
+	return nil
+}
+
+// resolvedStubInUse reports whether /etc/resolv.conf is the systemd-resolved
+// stub, which is the only case where a drop-in can change host DNS. It is a
+// variable so tests can exercise the drop-in path without a real symlink.
+var resolvedStubInUse = func() bool {
+	target, err := os.Readlink(resolvConfPath)
+	if err != nil || !strings.Contains(target, "systemd") {
+		return false
+	}
+	out, err := commandOutput("systemctl", "is-active", "systemd-resolved")
+	return err == nil && strings.TrimSpace(out) == "active"
+}
+
+// setResolvedDropIn forwards the host's stub resolver to the gateway listener.
+// systemd-resolved keeps running; only its upstream is pointed at bypath.
+func (gw *Gateway) setResolvedDropIn(port int) error {
+	if existing, err := os.ReadFile(resolvedDropInPath); err == nil && !strings.Contains(string(existing), resolvedDropInMarker) {
+		return fmt.Errorf("%s already exists and was not written by bypath; refusing to overwrite it", resolvedDropInPath)
+	}
+	st, err := gw.ensureRunState("")
+	if err != nil {
+		return err
+	}
+	if !st.ResolvedDropIn {
+		st.ResolvedDropIn = true
+		if err := gw.persistRunState(); err != nil {
+			st.ResolvedDropIn = false
+			return err
+		}
+	}
+	if err := removeLegacyResolvedDropIn(); err != nil {
+		return err
+	}
+	content := resolvedDropInContent(port)
+	if err := os.MkdirAll(filepath.Dir(resolvedDropInPath), 0755); err != nil {
+		return fmt.Errorf("creating %s: %w", filepath.Dir(resolvedDropInPath), err)
+	}
+	if err := writeFileAtomic(resolvedDropInPath, []byte(content), 0644); err != nil {
+		return fmt.Errorf("writing %s: %w", resolvedDropInPath, err)
+	}
+	if err := systemctlRun("restart", "systemd-resolved"); err != nil {
+		return fmt.Errorf("restarting systemd-resolved with the bypath drop-in: %w", err)
+	}
+	log.Printf("🔧 systemd-resolved now forwards host DNS to 127.0.0.1:%d (service left enabled)", port)
+	return nil
+}
+
+// setupIPv6Isolation drops forwarded IPv6 arriving from the LAN. Without it a
+// dual-stack client would bypass the tunnel entirely because tun0 carries only
+// IPv4. The dedicated chain is removed by cleanupBypathChains.
+//
+// The jump is inserted at the head of FORWARD and then verified by reading the
+// effective rule list: an appended jump behind an earlier ACCEPT would leave
+// IPv6 uncontained, so verification failure aborts startup instead of logging
+// success.
+func (gw *Gateway) setupIPv6Isolation(st *gatewayRunState) error {
+	if err := ensureChain6E("filter", chainV6Drop); err != nil {
+		return err
+	}
+	if err := flushChain6E("filter", chainV6Drop); err != nil {
+		return err
+	}
+	for _, rule := range ipv6IsolationRules(gw.iface) {
+		if err := run(rule[0], rule[1:]...); err != nil {
+			return err
+		}
+	}
+
+	st.V6Isolated = true
+	if err := saveGatewayState(st); err != nil {
+		return err
+	}
+	// Fail closed when the containment chain cannot be placed first.
+	if err := ensureJump6Top("filter", "FORWARD", chainV6Drop); err != nil {
+		return fmt.Errorf("installing IPv6 isolation jump: %w", err)
+	}
+	if err := verifyJump6First("filter", "FORWARD", chainV6Drop); err != nil {
+		return err
+	}
+	log.Printf("  🛡️  IPv6 isolation: forwarded IPv6 on %s dropped (not tunneled, verified first in FORWARD)", gw.iface)
+	return nil
+}
+
+// ipv6IsolationRules is the ordered ip6tables rule list that prevents a
+// dual-stack LAN client from escaping the IPv4-only tunnel. It is separate
+// from execution so the policy can be asserted without root or a live host.
+func ipv6IsolationRules(iface string) [][]string {
+	return [][]string{
+		{"ip6tables", "-t", "filter", "-A", chainV6Drop, "-i", iface, "-j", "DROP"},
+	}
 }
 
 // pinHostToEtcHosts resolves hostname bypassing /etc/resolv.conf (which may
 // be ISP-poisoned) and writes a static entry to /etc/hosts. This lets
 // xray/sing-box reach the tunnel server after resolv.conf is switched to 127.0.0.1.
 // Returns the resolved IP on success, or "" if resolution failed or hostname is already an IP.
-func (gw *Gateway) pinHostToEtcHosts(hostname string) string {
-	// Skip if it's already an IP
+// resolveHostDirect resolves a server hostname through the configured upstream
+// DNS (bypassing a poisoned system resolver) without touching /etc/hosts.
+func (gw *Gateway) resolveHostDirect(ctx context.Context, hostname string) string {
+	addrs := lookupServerAddresses(gw, ctx, hostname)
+	if len(addrs) == 0 {
+		return ""
+	}
+	return addrs[0]
+}
+
+// dnsUpstreams returns the configured resolvers, defaulting to the public
+// pair when none is configured. Only IP literals can be dialed directly.
+func (gw *Gateway) dnsUpstreams() []string {
+	if gw.config != nil && len(gw.config.Gateway.DNSUpstream) > 0 {
+		return gw.config.Gateway.DNSUpstream
+	}
+	return []string{"1.1.1.1", "8.8.8.8"}
+}
+
+// resolveHostDirectAll is resolveHostDirect without the single-answer
+// assumption: a round-robin record can return several addresses and some of
+// them may be unusable, so every validated address is returned (IPv4 first).
+// The first upstream that answers wins; failure on one upstream falls through
+// to the next, as before.
+func (gw *Gateway) resolveHostDirectAll(ctx context.Context, hostname string) []string {
 	if net.ParseIP(hostname) != nil {
-		return ""
+		return nil
 	}
-
-	// Use the configured upstream DNS servers directly (bypass system resolv.conf).
-	// ISPs often poison resolv.conf DNS for proxy server hostnames, returning
-	// internal IPs (e.g. 10.10.34.36) that masquerade as the real server.
-	upstream := gw.config.Gateway.DNSUpstream
-	if len(upstream) == 0 {
-		upstream = []string{"1.1.1.1", "8.8.8.8"}
+	for _, ns := range gw.dnsUpstreams() {
+		if err := ctx.Err(); err != nil {
+			log.Printf("⚠️  Server resolution canceled for %s: %v", hostname, err)
+			return nil
+		}
+		if addrs := gw.resolveHostFromUpstream(ctx, hostname, ns); len(addrs) > 0 {
+			return addrs
+		}
 	}
+	log.Printf("⚠️  Could not resolve %s via any upstream DNS", hostname)
+	return nil
+}
 
-	var ip string
-	for _, ns := range upstream {
-		r := &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-				return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "udp", ns+":53")
-			},
-		}
-		addrs, err := r.LookupHost(context.Background(), hostname)
-		if err != nil || len(addrs) == 0 {
-			continue
-		}
-		candidate := addrs[0]
-		// Reject obviously-intercepted IPs: private/loopback ranges used by ISPs
-		// to redirect blocked hostnames.
-		if parsed := net.ParseIP(candidate); parsed != nil {
-			if parsed.IsLoopback() || parsed.IsPrivate() {
-				log.Printf("⚠️  Rejected intercepted IP %s for %s (from %s)", candidate, hostname, ns)
-				continue
-			}
-		}
-		ip = candidate
-		break
+// resolveHostFromUpstream queries one configured resolver directly. Only an
+// address upstream can be dialed; a hostname upstream would have to be
+// resolved first, which is exactly what this path exists to avoid.
+func (gw *Gateway) resolveHostFromUpstream(ctx context.Context, hostname, ns string) []string {
+	if err := ctx.Err(); err != nil {
+		return nil
 	}
+	host := ns
+	if h, _, err := net.SplitHostPort(ns); err == nil {
+		host = h
+	}
+	if net.ParseIP(host) == nil {
+		log.Printf("⚠️  Skipping non-IP DNS upstream %q for direct server resolution", ns)
+		return nil
+	}
+	addr := dnsServerAddr(ns)
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			return (&net.Dialer{}).DialContext(dialCtx, "udp", addr)
+		},
+	}
+	addrs, err := r.LookupHost(ctx, hostname)
+	if err != nil || len(addrs) == 0 {
+		return nil
+	}
+	usable := usableServerIPs(addrs)
+	if len(usable) == 0 {
+		// Reject obviously-intercepted addresses: private/loopback ranges are
+		// used by ISPs to redirect blocked hostnames.
+		log.Printf("⚠️  Rejected intercepted addresses %v for %s (from %s)", addrs, hostname, ns)
+		return nil
+	}
+	return usable
+}
 
+// pinHostToEtcHosts records ownership before writing /etc/hosts. A persistence
+// failure aborts the pin: bypath must not mutate the host without a durable
+// inverse. A failed write leaves the ownership flag in place so recovery removes
+// any partial entry.
+func (gw *Gateway) pinHostToEtcHosts(hostname string) (string, error) {
+	if net.ParseIP(hostname) != nil {
+		return "", nil
+	}
+	// The pin exists only to keep the engine resolvable after the host resolver
+	// is switched to bypath. Namespaced runs never switch it, and /etc/hosts is
+	// still the host's file.
+	if networkNamespaceIsolated() {
+		return "", nil
+	}
+	ip := gw.resolveHostDirect(gw.ctx, hostname)
 	if ip == "" {
-		log.Printf("⚠️  Could not resolve %s via any upstream DNS", hostname)
-		return ""
+		return "", nil
+	}
+
+	st, err := gw.ensureRunState("")
+	if err != nil {
+		return "", err
+	}
+	st.HostsPinned = true
+	if err := saveGatewayState(st); err != nil {
+		st.HostsPinned = false
+		return "", fmt.Errorf("recording /etc/hosts ownership: %w", err)
 	}
 
 	marker := "# bypath-pin"
 	entry := fmt.Sprintf("%s %s %s\n", ip, hostname, marker)
 
-	current, _ := os.ReadFile("/etc/hosts")
+	current, err := os.ReadFile(hostsFilePath)
+	if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("reading %s: %w", hostsFilePath, err)
+	}
 	// Remove any existing bypath-pin lines for this host
 	var filtered []string
 	for _, line := range strings.Split(string(current), "\n") {
@@ -1298,32 +2709,49 @@ func (gw *Gateway) pinHostToEtcHosts(hostname string) string {
 	}
 	newContent += entry
 
-	if err := os.WriteFile("/etc/hosts", []byte(newContent), 0644); err != nil {
-		log.Printf("⚠️  Could not pin %s to /etc/hosts: %v", hostname, err)
-		return ""
+	if err := os.WriteFile(hostsFilePath, []byte(newContent), 0644); err != nil {
+		return "", fmt.Errorf("pinning %s in %s: %w", hostname, hostsFilePath, err)
 	}
-	log.Printf("🔧 Pinned %s → %s in /etc/hosts", hostname, ip)
-	return ip
+	log.Printf("🔧 Pinned %s → %s in %s", hostname, ip, hostsFilePath)
+	return ip, nil
 }
 
-// unpinHostsFromEtcHosts removes all bypath-pin entries added by pinHostToEtcHosts.
-func (gw *Gateway) unpinHostsFromEtcHosts() {
+// unpinHostsFromEtcHosts removes all bypath-pin entries added by
+// pinHostToEtcHosts. A missing file is already clean; any other read or write
+// failure is returned so the ownership flag survives for the next attempt.
+func (gw *Gateway) unpinHostsFromEtcHosts() error {
 	marker := "# bypath-pin"
-	current, err := os.ReadFile("/etc/hosts")
+	current, err := os.ReadFile(hostsFilePath)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("reading %s: %w", hostsFilePath, err)
 	}
 	var filtered []string
+	changed := false
 	for _, line := range strings.Split(string(current), "\n") {
 		if strings.Contains(line, marker) {
+			changed = true
 			continue
 		}
 		filtered = append(filtered, line)
 	}
-	os.WriteFile("/etc/hosts", []byte(strings.Join(filtered, "\n")), 0644)
+	if !changed {
+		return nil
+	}
+	if err := os.WriteFile(hostsFilePath, []byte(strings.Join(filtered, "\n")), 0644); err != nil {
+		return fmt.Errorf("restoring %s: %w", hostsFilePath, err)
+	}
+	return nil
 }
 
-const resolvBackup = "/etc/resolv.conf.bypath-backup"
+var (
+	resolvBackup = "/etc/resolv.conf.bypath-backup"
+	// resolvLinkBackup remembers the systemd-resolved stub symlink target so
+	// cleanup restores the exact host resolver configuration.
+	resolvLinkBackup = "/etc/resolv.conf.bypath-link"
+)
 
 // trackChildPID appends the PID of a bypath-owned child process to the children
 // file so cleanupPreviousRun can kill only our own processes, not user-started ones.
@@ -1361,138 +2789,427 @@ func killTrackedChildren() {
 }
 
 // setResolvConf saves the current resolv.conf (DHCP-assigned) as a backup,
-// then overwrites it with bypath's nameserver (immutable so dhcpcd can't clobber it).
-func (gw *Gateway) setResolvConf(nameserver string) {
-	exec.Command("chattr", "-i", "/etc/resolv.conf").Run()
+// then overwrites it with bypath's nameserver. Ownership is recorded first so a
+// crash mid-write still leaves an exact restoration path.
+func (gw *Gateway) setResolvConf(nameserver string) error {
+	// The mount namespace is shared even when the network stack is not: this
+	// file belongs to the host, and rewriting it would blackhole host DNS while
+	// the listener only exists inside the private namespace.
+	if networkNamespaceIsolated() {
+		log.Printf("🌐 Network namespace detected: leaving %s untouched", resolvConfPath)
+		return nil
+	}
+	if resolvConfPinned() {
+		return permanent(fmt.Errorf("gateway mode cannot manage %s: it is a bind mount (a container runtime owns it); use proxy-only mode, or install bypath on the LAN host itself", resolvConfPath))
+	}
+	st, err := gw.ensureRunState("")
+	if err != nil {
+		return err
+	}
+	st.ResolvChanged = true
+	if err := saveGatewayState(st); err != nil {
+		st.ResolvChanged = false
+		return fmt.Errorf("recording resolver ownership: %w", err)
+	}
 
-	// Back up whatever the DHCP client wrote — we'll restore it on stop.
-	if orig, err := os.ReadFile("/etc/resolv.conf"); err == nil {
+	exec.Command("chattr", "-i", resolvConfPath).Run()
+
+	// Back up whatever the DHCP client wrote — we'll restore it on stop. A
+	// backup that cannot be written aborts before the live file is changed.
+	// A live file that cannot be read is also fatal: overwriting it would
+	// destroy the only copy of the host's resolver configuration.
+	orig, readErr := os.ReadFile(resolvConfPath)
+	switch {
+	case readErr == nil:
 		if !strings.Contains(string(orig), "127.0.0.1") {
-			os.WriteFile(resolvBackup, orig, 0644)
+			if err := writeFileAtomic(resolvBackup, orig, 0644); err != nil {
+				return fmt.Errorf("saving the resolver backup: %w", err)
+			}
 		}
+	case !os.IsNotExist(readErr):
+		return fmt.Errorf("reading %s before replacing it: %w", resolvConfPath, readErr)
 	}
 
 	content := fmt.Sprintf("nameserver %s\n", nameserver)
-	if err := os.WriteFile("/etc/resolv.conf", []byte(content), 0644); err != nil {
-		log.Printf("⚠️  Could not update /etc/resolv.conf: %v", err)
-		return
+	if err := writeResolvConf(resolvConfPath, []byte(content), 0644); err != nil {
+		return fmt.Errorf("updating %s: %w", resolvConfPath, err)
 	}
 
-	if err := exec.Command("chattr", "+i", "/etc/resolv.conf").Run(); err != nil {
+	if err := exec.Command("chattr", "+i", resolvConfPath).Run(); err != nil {
 		log.Printf("⚠️  chattr +i failed (non-ext4?): %v", err)
 	}
 
-	log.Printf("🔧 /etc/resolv.conf → nameserver %s (immutable)", nameserver)
+	log.Printf("🔧 %s → nameserver %s (immutable)", resolvConfPath, nameserver)
+	return nil
 }
 
 // restoreResolvConf removes the immutable flag and restores the original
-// DHCP-assigned resolv.conf. Falls back to 8.8.8.8 if no backup exists.
-func (gw *Gateway) restoreResolvConf() {
-	exec.Command("chattr", "-i", "/etc/resolv.conf").Run()
+// DHCP-assigned resolv.conf. It reports every failure so the ownership flag is
+// retained and the next recovery attempt retries the restoration.
+func (gw *Gateway) restoreResolvConf() error {
+	exec.Command("chattr", "-i", resolvConfPath).Run()
 
-	if backup, err := os.ReadFile(resolvBackup); err == nil && len(backup) > 0 {
-		if err := os.WriteFile("/etc/resolv.conf", backup, 0644); err == nil {
-			os.Remove(resolvBackup)
-			log.Printf("🔧 /etc/resolv.conf restored (DHCP original)")
-			return
+	// Restore the original systemd-resolved stub symlink when we detached it.
+	linkTarget, linkErr := os.ReadFile(resolvLinkBackup)
+	if linkErr != nil && !os.IsNotExist(linkErr) {
+		return fmt.Errorf("reading the systemd-resolved stub record: %w", linkErr)
+	}
+	if len(linkTarget) > 0 {
+		link := strings.TrimSpace(string(linkTarget))
+		if err := os.Remove(resolvConfPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing %s: %w", resolvConfPath, err)
 		}
+		if err := os.Symlink(link, resolvConfPath); err != nil {
+			return fmt.Errorf("restoring the systemd-resolved symlink: %w", err)
+		}
+		os.Remove(resolvLinkBackup)
+		os.Remove(resolvBackup)
+		log.Printf("🔧 %s restored (systemd-resolved symlink)", resolvConfPath)
+		return nil
 	}
 
-	// No backup — write a safe fallback so DNS works after stop.
-	os.WriteFile("/etc/resolv.conf", []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0644)
-	log.Printf("🔧 /etc/resolv.conf restored (fallback 8.8.8.8)")
+	backup, backupErr := os.ReadFile(resolvBackup)
+	if backupErr != nil && !os.IsNotExist(backupErr) {
+		return fmt.Errorf("reading the resolver backup: %w", backupErr)
+	}
+	if len(backup) > 0 {
+		// A previous attempt may have failed after the file was already intact
+		// (a bind-mounted resolver cannot be renamed at all). Treat an identical
+		// live file as restored so recovery cannot block forever.
+		if current, readErr := os.ReadFile(resolvConfPath); readErr == nil && bytes.Equal(current, backup) {
+			os.Remove(resolvBackup)
+			log.Printf("🔧 %s already matches the backup; nothing to restore", resolvConfPath)
+			return nil
+		}
+		if err := writeResolvConf(resolvConfPath, backup, 0644); err != nil {
+			return fmt.Errorf("restoring the DHCP resolver backup: %w", err)
+		}
+		os.Remove(resolvBackup)
+		log.Printf("🔧 %s restored (DHCP original)", resolvConfPath)
+		return nil
+	}
+
+	// No backup: only replace the value bypath itself wrote. An untouched
+	// resolv.conf is left exactly as the host configured it.
+	content, err := os.ReadFile(resolvConfPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("reading %s during restoration: %w", resolvConfPath, err)
+	}
+	if strings.TrimSpace(string(content)) == "nameserver 127.0.0.1" {
+		if err := writeResolvConf(resolvConfPath, []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0644); err != nil {
+			return fmt.Errorf("replacing the bypath resolver value: %w", err)
+		}
+		log.Printf("🔧 %s restored (bypath value replaced)", resolvConfPath)
+		return nil
+	}
+	return nil
 }
 
 // setupDNSIntercept redirects all DNS queries (port 53) arriving on the LAN
 // interface to bypath's own DNS proxy, regardless of what DNS server the
 // DHCP gave the client. This is the transparent DNS hijack that makes bypath
 // work without the user ever touching their DNS settings.
-func (gw *Gateway) setupDNSIntercept() {
+func (gw *Gateway) setupDNSIntercept() error {
 	dnsPort := fmt.Sprintf("%d", gw.dnsPort)
 	// Redirect UDP and TCP DNS from LAN clients to our local DNS proxy.
 	// Only applies to traffic arriving on the LAN interface so we don't
 	// redirect bypath's own DNS queries (those originate from lo/tun0).
-	run("iptables", "-t", "nat", "-A", "PREROUTING",
+	// Rules live in a dedicated chain so cleanup never flushes PREROUTING.
+	if err := ensureChainE("nat", chainDNS); err != nil {
+		return err
+	}
+	if err := flushChainE("nat", chainDNS); err != nil {
+		return err
+	}
+	if err := run("iptables", "-t", "nat", "-A", chainDNS,
 		"-i", gw.iface,
 		"-s", gw.subnet,
 		"-p", "udp", "--dport", "53",
-		"-j", "REDIRECT", "--to-port", dnsPort)
-	run("iptables", "-t", "nat", "-A", "PREROUTING",
+		"-j", "REDIRECT", "--to-port", dnsPort); err != nil {
+		return err
+	}
+	if err := run("iptables", "-t", "nat", "-A", chainDNS,
 		"-i", gw.iface,
 		"-s", gw.subnet,
 		"-p", "tcp", "--dport", "53",
-		"-j", "REDIRECT", "--to-port", dnsPort)
+		"-j", "REDIRECT", "--to-port", dnsPort); err != nil {
+		return err
+	}
+	if err := ensureJumpE("nat", "PREROUTING", chainDNS); err != nil {
+		return err
+	}
 	log.Printf("🔀 DNS intercept active: LAN :53 → :%s (DHCP DNS ignored)", dnsPort)
+	return nil
 }
 
-func (gw *Gateway) cleanupRouting() {
-	// Always clean up iptables rules regardless of mode
-	run("iptables", "-t", "mangle", "-F", "PREROUTING")
-	run("iptables", "-t", "nat", "-F", "PREROUTING")
-	run("iptables", "-t", "nat", "-F", "POSTROUTING")
-	run("iptables", "-F", "FORWARD")
+// needsNetworkCleanup reports whether host networking may have been changed
+// by this instance or by a crashed gateway run. Proxy-only runs must leave
+// host DNS, routes, interfaces and firewall untouched.
+func (gw *Gateway) needsNetworkCleanup() bool {
+	if gw.networkMutated {
+		return true
+	}
+	_, err := os.Stat(gatewayStateFile())
+	return err == nil
+}
 
-	if !gw.nativeTUN {
-		// Legacy mode: also clean up policy routing and TUN device
-		run("ip", "rule", "del", "fwmark", "0x1", "lookup", "100")
-		run("ip", "route", "flush", "table", "100")
-		run("ip", "link", "del", "tun0")
+// cleanupRouting applies the inverse of every host change bypath recorded and
+// reports whether the rollback finished. A returned error means the ownership
+// record was retained and the next start must retry the remaining work.
+func (gw *Gateway) cleanupRouting() error {
+	if !gw.needsNetworkCleanup() {
+		return nil
 	}
 
-	// Always restore DNS and hosts — both legacy and native TUN modes may have
-	// modified resolv.conf, and we must leave the system working after stop.
-	gw.restoreResolvConf()
-	gw.unpinHostsFromEtcHosts()
-	// Restore dnsmasq only if it was ACTIVE before this Gateway instance started.
-	gw.restoreDnsmasq()
+	st := gw.run
+	if st == nil {
+		loaded, err := loadGatewayState()
+		if err != nil {
+			// Keep the record: it is the only description of whatever bypath
+			// changed, and deleting it would make the damage unrecoverable.
+			log.Printf("⚠️  Cannot read the ownership record: %v", err)
+			gw.run = nil
+			gw.networkMutated = false
+			gw.legacyRoutingActive = false
+			gw.tunCreated = false
+			gw.resolvedStopped = false
+			gw.dnsmasq = dnsmasqPriorState{}
+			return fmt.Errorf("incomplete network cleanup: %w", err)
+		}
+		st = loaded
+	}
+	cleanupComplete := true
+	containmentRetained := false
+	var cleanupErr error
+	if st != nil {
+		// Firewall containment is deferred until every route, rule, interface
+		// and resolver change has been reversed; a stopped run that keeps
+		// forwarding enabled by another service (Docker, libvirt) must never
+		// expose an uncontained window or disable that forwarding.
+		keepChains := hostFirewallAvailable() && !st.LegacyFormat
+		if err := gw.undoNetworkStateWith(st, keepChains, false); err != nil {
+			cleanupComplete = false
+			cleanupErr = fmt.Errorf("incomplete network cleanup: %w", err)
+			log.Printf("⚠️  Incomplete network cleanup: %v", err)
+		} else if keepChains {
+			retained, err := gw.finishStopContainment(st)
+			if err != nil {
+				cleanupComplete = false
+				cleanupErr = fmt.Errorf("incomplete containment handover: %w", err)
+				log.Printf("⚠️  Incomplete containment handover: %v", err)
+			}
+			containmentRetained = retained
+		}
+	} else {
+		// No ownership record: remove only bypath-named chains. Routes,
+		// interfaces, resolver files and services are left untouched because
+		// nothing proves this process changed them.
+		if err := cleanupBypathChains(); err != nil {
+			cleanupErr = fmt.Errorf("incomplete chain cleanup: %w", err)
+			log.Printf("⚠️  Incomplete chain cleanup: %v", err)
+		}
+	}
+
+	// Keep the pruned record when an inverse failed; it names the remaining work
+	// for the next recovery attempt. Services are restored inside the record's
+	// inverse pass, only when it proves bypath stopped them. A retained
+	// containment record is also kept so the next start or an explicit teardown
+	// owns the chains that were deliberately left behind.
+	if cleanupComplete && !containmentRetained {
+		clearGatewayState()
+	}
+	gw.run = nil
+	gw.networkMutated = false
+	gw.legacyRoutingActive = false
+	gw.tunCreated = false
+	gw.resolvedStopped = false
+	gw.dnsmasq = dnsmasqPriorState{}
+	return cleanupErr
+}
+
+// finishStopContainment decides what survives a stop. When the host still
+// forwards because another service owns ip_forward, the fail-closed DROP
+// chains are kept: LAN client traffic can never fall through to the WAN after
+// bypath is gone. When forwarding is off, every bypath chain is removed.
+func (gw *Gateway) finishStopContainment(st *gatewayRunState) (bool, error) {
+	if st.Mode != "legacy" && st.Mode != "native" {
+		return false, cleanupBypathChains()
+	}
+	enabled, err := ipv4ForwardingEnabled()
+	if err != nil {
+		// An unreadable forwarding setting cannot prove forwarding is off:
+		// keep the fail-closed chains rather than open a direct path.
+		enabled = true
+	}
+	if !enabled {
+		st.ContainmentRetained = false
+		return false, cleanupBypathChains()
+	}
+
+	// Only the fail-closed FORWARD and IPv6 chains may remain; DNS redirection,
+	// NAT and packet marking reference a data path that no longer exists.
+	if err := cleanupInterceptChains(); err != nil {
+		return true, err
+	}
+	iface := gw.iface
+	if iface == "" {
+		iface = st.ContainmentIface
+	}
+	if iface == "" {
+		// A crashed run never recorded its interface, but the installed chain
+		// still names it.
+		installed, discovered, err := forwardContainmentInstalled()
+		if err != nil {
+			return true, err
+		}
+		if installed {
+			iface = discovered
+		}
+	}
+	if iface == "" {
+		return true, fmt.Errorf("cannot retain forwarding containment without a LAN interface")
+	}
+	if err := retainForwardContainment(iface); err != nil {
+		return true, err
+	}
+	st.ContainmentRetained = true
+	st.ContainmentIface = iface
+	if err := saveGatewayState(st); err != nil {
+		return true, fmt.Errorf("recording retained containment: %w", err)
+	}
+	log.Printf("🛡️  Forwarding remains enabled by another service: fail-closed LAN containment kept on %s", iface)
+	return true, nil
+}
+
+// prepareNativeOwnership reserves bypath's routing table before sing-box can
+// create auto_route policy objects, and persists that ownership first. The
+// reserved table must be empty and unreferenced; anything else means another
+// component owns it and native mode cannot be started safely. This turns the
+// engine's routing into a deterministic, recoverable resource instead of the
+// engine's private defaults.
+func (gw *Gateway) prepareNativeOwnership() error {
+	table := strconv.Itoa(tunnel.NativeRouteTable)
+	rules, err := commandOutput("ip", "rule", "show")
+	if err != nil {
+		return fmt.Errorf("inspecting policy rules: %w", err)
+	}
+	if strings.Contains(rules, "lookup "+table) {
+		return fmt.Errorf("reserved native route table %s is already referenced by a policy rule; refusing to start", table)
+	}
+	routes, err := routesInTable(table)
+	if err != nil {
+		return fmt.Errorf("inspecting reserved native route table %s: %w", table, err)
+	}
+	if strings.TrimSpace(routes) != "" {
+		return fmt.Errorf("reserved native route table %s already contains routes; refusing to start", table)
+	}
+
+	st, err := gw.ensureRunState("native")
+	if err != nil {
+		return err
+	}
+	if !st.NativeRules || st.NativeRuleTable != tunnel.NativeRouteTable {
+		st.NativeRules = true
+		st.NativeRuleTable = tunnel.NativeRouteTable
+		if err := saveGatewayState(st); err != nil {
+			return fmt.Errorf("recording native route ownership: %w", err)
+		}
+	}
+	log.Printf("  🔒 Native routing reserved: table %d, rule index %d (ownership recorded before engine start)", tunnel.NativeRouteTable, tunnel.NativeRuleIndex)
+	return nil
+}
+
+// pkillCommand is injectable so lifecycle tests never signal host processes.
+var pkillCommand = func(pattern string) {
+	exec.Command("pkill", "-f", pattern).Run()
 }
 
 // cleanupPreviousRun kills leftover child processes and restores network state
 // from any previous crashed or kill-9'd bypath instance. Called unconditionally
 // at the start of Start() so every startup begins from a known-clean state.
-func (gw *Gateway) cleanupPreviousRun() {
+// Cleanup is driven by the persisted ownership record: nothing is deleted,
+// flushed or restarted unless the record proves bypath changed it. Any failure
+// is returned and must abort startup.
+func (gw *Gateway) cleanupPreviousRun() error {
 	log.Println("🧹 Cleaning up state from previous run...")
 
 	// Kill child processes from the previous instance.
 	// Engine processes: kill by config-path pattern (safe — only matches bypath's own).
-	exec.Command("pkill", "-f", "xray run -c /tmp/bypath").Run()
-	exec.Command("pkill", "-f", "sing-box run -c /tmp/bypath").Run()
+	// The runtime directory is /run/bypath; the /tmp/bypath pattern covers
+	// leftovers from builds that used a per-process temp directory. pkill does
+	// not exist on Windows; there the job object reaps engines when the daemon
+	// dies, and the children file covers the rest.
+	if runtime.GOOS != "windows" {
+		pkillCommand("xray run -c /run/bypath")
+		pkillCommand("sing-box run -c /run/bypath")
+		pkillCommand("xray run -c /tmp/bypath")
+		pkillCommand("sing-box run -c /tmp/bypath")
+	}
 	// dns2socks / tun2socks: kill only tracked PIDs to avoid killing user processes.
 	killTrackedChildren()
 
 	// Allow processes to exit before cleaning up network state.
 	time.Sleep(300 * time.Millisecond)
 
-	// Clean up network state unconditionally — we don't know what the
-	// previous instance's mode was (legacy vs native TUN).
-	exec.Command("iptables", "-t", "mangle", "-F", "PREROUTING").Run()
-	exec.Command("iptables", "-t", "nat", "-F", "PREROUTING").Run()
-	exec.Command("iptables", "-t", "nat", "-F", "POSTROUTING").Run()
-	exec.Command("iptables", "-F", "FORWARD").Run()
-	exec.Command("ip", "rule", "del", "fwmark", "0x1", "lookup", "100").Run()
-	exec.Command("ip", "route", "flush", "table", "100").Run()
-	exec.Command("ip", "link", "del", "tun0").Run()
-
-	// Clean up native TUN policy rules (sing-box uses prio 9000+).
-	for _, prio := range []string{"9000", "9001", "9002", "9003", "9010"} {
-		exec.Command("ip", "rule", "del", "prio", prio).Run()
+	// The previous engine is now stopped and reaped, so any remaining gen-*
+	// directory holds stale credentials and is safe to remove (D6).
+	if removed, err := tunnel.RemoveStaleGenerations(paths.Get().TmpDir, ""); err != nil {
+		log.Printf("⚠️  Could not remove stale generation directories: %v", err)
+	} else if removed > 0 {
+		log.Printf("🧹 Removed %d stale generation directorie(s)", removed)
 	}
-	exec.Command("ip", "route", "flush", "table", "2022").Run()
 
-	// Restore resolv.conf if bypath left it pointing to 127.0.0.1.
-	// Restore resolv.conf: prefer the DHCP backup, fall back to 8.8.8.8.
-	exec.Command("chattr", "-i", "/etc/resolv.conf").Run()
-	if backup, err := os.ReadFile(resolvBackup); err == nil && len(backup) > 0 {
-		os.WriteFile("/etc/resolv.conf", backup, 0644)
-		os.Remove(resolvBackup)
-	} else if content, err := os.ReadFile("/etc/resolv.conf"); err == nil {
-		if strings.TrimSpace(string(content)) == "nameserver 127.0.0.1" {
-			os.WriteFile("/etc/resolv.conf", []byte("nameserver 8.8.8.8\nnameserver 1.1.1.1\n"), 0644)
+	// A retried Start on the same instance must not inherit in-memory ownership
+	// from the failed attempt; the recovered record is the authority.
+	gw.run = nil
+	gw.networkMutated = false
+
+	st, err := loadGatewayState()
+	if err != nil {
+		// A record that exists but cannot be read might still describe live host
+		// changes. Refusing startup keeps a new run from layering unowned state on
+		// top of an unknown rollback.
+		return fmt.Errorf("reading the previous-run ownership record: %w", err)
+	}
+	if st == nil {
+		// A proxy-only run must leave unrelated host networking untouched. Only
+		// a run that requested gateway mode may remove bypath-named chains, and
+		// even then only its own chains (never built-in ones).
+		if gw.config.Gateway.Enabled {
+			if err := cleanupBypathChains(); err != nil {
+				return fmt.Errorf("cleaning up bypath firewall chains: %w", err)
+			}
 		}
+		return nil
 	}
-
-	// Remove any host pins left by a previous run.
-	gw.unpinHostsFromEtcHosts()
+	var recoverErr error
+	if gw.config.Gateway.Enabled {
+		// A gateway restart must not open an uncontained window: the firewall
+		// containment and the forwarding ownership are adopted by setupRouting
+		// a few seconds later.
+		recoverErr = gw.recoverStateKeepingContainment(st)
+	} else {
+		recoverErr = gw.recoverState(st)
+	}
+	if recoverErr != nil {
+		// The pruned record keeps naming what failed. Startup must abort: a new
+		// run on top of an interrupted rollback would layer unowned changes.
+		return fmt.Errorf("incomplete cleanup of previous run: %w", recoverErr)
+	}
+	// Keep the record when the next setupRouting must inherit ownership of
+	// forwarding, IPv6 isolation or retained containment. Otherwise the
+	// recovery is complete and the record is cleared.
+	if gw.config.Gateway.Enabled && (st.ForwardingWasOff || st.V6Isolated || st.ContainmentRetained) {
+		if err := saveGatewayState(st); err != nil {
+			return fmt.Errorf("persisting adopted ownership: %w", err)
+		}
+		return nil
+	}
+	clearGatewayState()
+	return nil
 }
 
 // --- Accessors for API ---
@@ -1518,15 +3235,6 @@ func localDNSChanged(a, b []config.LocalDNSEntry) bool {
 	return false
 }
 
-func run(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s %s: %s (%w)", name, strings.Join(args, " "), string(out), err)
-	}
-	return nil
-}
-
 // startAutoChains starts all chains that have auto_start: true.
 func (gw *Gateway) startAutoChains() {
 	for _, chainCfg := range gw.config.Chains {
@@ -1543,15 +3251,28 @@ func (gw *Gateway) startAutoChains() {
 }
 
 func waitForPort(port int, timeout time.Duration) error {
+	return waitForPortContext(context.Background(), port, timeout)
+}
+
+// waitForPortContext polls until the port accepts a connection or the deadline
+// or context ends. Shutdown does not wait for the full poll timeout.
+func waitForPortContext(ctx context.Context, port int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
 		if err == nil {
 			conn.Close()
 			return nil
 		}
-		time.Sleep(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 	return fmt.Errorf("port %d not ready after %v", port, timeout)
 }
@@ -1559,13 +3280,55 @@ func waitForPort(port int, timeout time.Duration) error {
 // waitForTUNDevice polls for a network interface to appear within the given timeout.
 // It checks every 500ms using net.InterfaceByName until the interface exists or timeout is reached.
 func waitForTUNDevice(name string, timeout time.Duration) error {
+	return waitForTUNDeviceContext(context.Background(), name, timeout)
+}
+
+func waitForTUNDeviceContext(ctx context.Context, name string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		_, err := net.InterfaceByName(name)
 		if err == nil {
 			return nil
 		}
-		time.Sleep(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 	return fmt.Errorf("TUN device %q not found after %v", name, timeout)
+}
+
+// routingChanged reports whether the inputs that are compiled into the engine
+// routing configuration differ. A reload alone cannot republish them, so every
+// field the plan reads has to be listed here: a missed field leaves the engine
+// running the old policy while every panel view describes the new one.
+func routingChanged(a, b *config.Config) bool {
+	if a.Routing.CountrySplit != b.Routing.CountrySplit {
+		return true
+	}
+	if len(a.Routing.Rules) != len(b.Routing.Rules) {
+		return true
+	}
+	for i := range a.Routing.Rules {
+		if a.Routing.Rules[i].Match != b.Routing.Rules[i].Match ||
+			a.Routing.Rules[i].Outbound != b.Routing.Rules[i].Outbound {
+			return true
+		}
+	}
+	if len(a.Routing.ExternalOutbounds) != len(b.Routing.ExternalOutbounds) {
+		return true
+	}
+	for name, url := range a.Routing.ExternalOutbounds {
+		if b.Routing.ExternalOutbounds[name] != url {
+			return true
+		}
+	}
+	return strings.Join(a.Whitelist.Countries, ",") != strings.Join(b.Whitelist.Countries, ",") ||
+		strings.Join(a.Whitelist.GeositeCountries, ",") != strings.Join(b.Whitelist.GeositeCountries, ",") ||
+		strings.Join(a.Whitelist.BypassDomains, ",") != strings.Join(b.Whitelist.BypassDomains, ",") ||
+		strings.Join(a.Whitelist.ForceProxyDomains, ",") != strings.Join(b.Whitelist.ForceProxyDomains, ",")
 }

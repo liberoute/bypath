@@ -1,0 +1,28 @@
+BYPATH [FULL]  CONNECTED  pid 4242      
+ 12/12 About                            
+                                        
+ Bypath                                 
+                                        
+ Version      3.0.0                     
+ Variant      FULL (Full embeds engines;
+              Lite manages them)        
+ Commit       477458f                   
+ Build date   —                         
+                                        
+ Installation                           
+                                        
+ Config       /etc/bypath/config.yaml   
+ Profiles     /etc/bypath/profiles      
+ Runtime      /run/bypath/tmp           
+ Logs         /var/log/bypath           
+ API listen   —:8080                    
+                                        
+ Terminal keys                          
+                                        
+ 1-9 jump to a section · tab/shift+tab  
+ cycle · esc back · q quit · ctrl+c quit
+ anywhere                               
+ Lists: ↑/↓ move, enter open.           
+ Destructive actions always ask for     
+ confirmation.                          
+ 1-9 jump  tab cycle  q quit            

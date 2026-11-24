@@ -116,11 +116,12 @@ func TestProperty_UTLSFingerprintInclusion(t *testing.T) {
 	})
 }
 
-// Feature: reality-support, Property 4: Non-Reality TLS backward compatibility
+// Feature: reality-support, Property 4: Non-Reality TLS certificate policy
 //
 // For any Link with `TLS == true` and `Security != "reality"`, the generated
-// sing-box config SHALL contain `tls.insecure == true` and SHALL NOT contain
-// a `reality` sub-object.
+// sing-box config SHALL verify certificates by default (`tls.insecure` false),
+// mirror the link's explicit `Insecure` opt-out, and SHALL NOT contain a
+// `reality` sub-object. Certificates are never skipped implicitly.
 //
 // **Validates: Requirements 5.1**
 
@@ -163,6 +164,7 @@ func TestProperty_NonRealityTLSBackwardCompatibility(t *testing.T) {
 		sni := sniGen.Draw(t, "sni")
 		fp := fpGen.Draw(t, "fp")
 		network := networkGen.Draw(t, "network")
+		insecure := rapid.Bool().Draw(t, "insecure")
 
 		link := &profile.Link{
 			Protocol:    "vless",
@@ -171,6 +173,7 @@ func TestProperty_NonRealityTLSBackwardCompatibility(t *testing.T) {
 			UUID:        uuid,
 			Security:    security,
 			TLS:         true,
+			Insecure:    insecure,
 			SNI:         sni,
 			Network:     network,
 			Fingerprint: fp,
@@ -196,13 +199,14 @@ func TestProperty_NonRealityTLSBackwardCompatibility(t *testing.T) {
 			t.Fatalf("tls is not a map, got %T", tlsRaw)
 		}
 
-		// Property: tls.insecure must be true for non-Reality TLS
+		// Property: tls.insecure mirrors the link's explicit opt-out and is
+		// false by default; certificates are never skipped implicitly.
 		insecureVal, hasInsecure := tls["insecure"]
 		if !hasInsecure {
 			t.Fatal("expected tls.insecure to be present for non-Reality TLS link")
 		}
-		if insecureVal != true {
-			t.Fatalf("tls.insecure: got %v, want true", insecureVal)
+		if insecureVal != insecure {
+			t.Fatalf("tls.insecure: got %v, want %v", insecureVal, insecure)
 		}
 
 		// Property: tls SHALL NOT contain a "reality" sub-object

@@ -20,9 +20,16 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatalf("Load failed: %v", err)
 	}
 
-	// Check defaults are applied
-	if cfg.Server.Listen != "0.0.0.0" {
-		t.Errorf("expected listen 0.0.0.0, got %s", cfg.Server.Listen)
+	// The management API and the proxy stay on loopback unless the operator
+	// opts in explicitly.
+	if cfg.Server.Listen != "127.0.0.1" {
+		t.Errorf("expected listen 127.0.0.1, got %s", cfg.Server.Listen)
+	}
+	if cfg.Server.SOCKSListen != "127.0.0.1" {
+		t.Errorf("expected socks_listen 127.0.0.1, got %s", cfg.Server.SOCKSListen)
+	}
+	if cfg.Server.SSHHostKey != SSHHostKeyAcceptNew {
+		t.Errorf("expected ssh_host_key accept-new, got %s", cfg.Server.SSHHostKey)
 	}
 	if cfg.Server.APIPort != 9090 {
 		t.Errorf("expected api_port 9090, got %d", cfg.Server.APIPort)
@@ -268,7 +275,6 @@ gateway:
 	}
 }
 
-
 // Feature: vpn-detection-bypass, Property 5: Config serialization round-trip preserves bypass_domains
 // **Validates: Requirements 4.1, 4.2**
 func TestProperty5_ConfigSerializationRoundTripPreservesBypassDomains(t *testing.T) {
@@ -370,6 +376,12 @@ func TestFallbackConfigDefaults(t *testing.T) {
 			t.Errorf("Fallback.Order[%d]: expected %q, got %q", i, e, cfg.Engines.Fallback.Order[i])
 		}
 	}
+	if cfg.Engines.Fallback.EndpointTimeout != "90s" {
+		t.Errorf("expected Fallback.EndpointTimeout \"90s\", got %q", cfg.Engines.Fallback.EndpointTimeout)
+	}
+	if cfg.Engines.Fallback.TotalTimeout != "5m" {
+		t.Errorf("expected Fallback.TotalTimeout \"5m\", got %q", cfg.Engines.Fallback.TotalTimeout)
+	}
 }
 
 func TestFallbackConfigExplicitValues(t *testing.T) {
@@ -380,6 +392,8 @@ engines:
   fallback:
     enabled: false
     timeout: "5s"
+    endpoint_timeout: "20s"
+    total_timeout: "45s"
     order:
       - "xray"
       - "sing-box"
@@ -404,6 +418,315 @@ engines:
 	for i, e := range want {
 		if cfg.Engines.Fallback.Order[i] != e {
 			t.Errorf("Fallback.Order[%d]: expected %q, got %q", i, e, cfg.Engines.Fallback.Order[i])
+		}
+	}
+	if cfg.Engines.Fallback.EndpointTimeout != "20s" {
+		t.Errorf("expected Fallback.EndpointTimeout \"20s\", got %q", cfg.Engines.Fallback.EndpointTimeout)
+	}
+	if cfg.Engines.Fallback.TotalTimeout != "45s" {
+		t.Errorf("expected Fallback.TotalTimeout \"45s\", got %q", cfg.Engines.Fallback.TotalTimeout)
+	}
+}
+
+func TestLoadRejectsGeoPathTraversal(t *testing.T) {
+	cases := []string{
+		"whitelist:\n  geosite_countries: [\"../../etc\"]\n",
+		"whitelist:\n  countries: [\"ir/../../root\"]\n",
+		"routing:\n  rules:\n    - match: \"geoip:../x\"\n      outbound: direct\n",
+	}
+	for i, body := range cases {
+		path := filepath.Join(t.TempDir(), "bad.yaml")
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatalf("case %d: Load accepted a path-like geo name", i)
+		}
+	}
+}
+
+func TestLoadAcceptsGeoRuleSetTags(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ok.yaml")
+	body := "whitelist:\n  geosite_countries: [ir, category-ads-all, geolocation-!cn]\n"
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatalf("Load rejected valid geosite tags: %v", err)
+	}
+}
+
+// TestValidateServerExposurePolicy covers the SOCKS bind policy: exact loopback
+// or an explicit wildcard opt-in, and no credentials (the gateway's own probe,
+// DNS and subscription clients connect without them).
+func TestValidateServerExposurePolicy(t *testing.T) {
+	base := ServerConfig{SOCKSListen: "127.0.0.1", SOCKSPort: 2801}
+	if err := ValidateServer(base); err != nil {
+		t.Fatalf("loopback bind was rejected: %v", err)
+	}
+	lan := base
+	lan.SOCKSListen = "0.0.0.0"
+	if err := ValidateServer(lan); err == nil {
+		t.Fatal("LAN bind without socks_allow_lan was accepted")
+	}
+	lan.SOCKSAllowLAN = true
+	if err := ValidateServer(lan); err != nil {
+		t.Fatalf("explicit LAN bind was rejected: %v", err)
+	}
+	v6 := base
+	v6.SOCKSListen = "[::]"
+	v6.SOCKSAllowLAN = true
+	if err := ValidateServer(v6); err == nil {
+		t.Fatal("IPv6 wildcard accepted without IPv6 containment support")
+	}
+	nic := lan
+	nic.SOCKSListen = "192.168.1.5"
+	if err := ValidateServer(nic); err == nil {
+		t.Fatal("unowned interface bind was accepted")
+	}
+	for _, listen := range []string{"proxy.example.com", "localhost", "::1", "127.0.0.2"} {
+		c := base
+		c.SOCKSListen = listen
+		if err := ValidateServer(c); err == nil {
+			t.Fatalf("%q was accepted; internal clients only reach 127.0.0.1", listen)
+		}
+	}
+	auth := base
+	auth.SOCKSUsername = "user"
+	auth.SOCKSPassword = "pass"
+	if err := ValidateServer(auth); err == nil {
+		t.Fatal("SOCKS credentials were accepted even though internal clients cannot send them")
+	}
+	badKey := base
+	badKey.SSHHostKey = "insecure"
+	if err := ValidateServer(badKey); err == nil {
+		t.Fatal("unknown ssh_host_key policy was accepted")
+	}
+}
+
+// TestParseSeparatesDefaultsFromValidation proves a portable document can be
+// parsed and merged with host-local fields before it is validated.
+func TestParseSeparatesDefaultsFromValidation(t *testing.T) {
+	cfg, err := Parse([]byte("server:\n  socks_listen: 0.0.0.0\n"))
+	if err != nil {
+		t.Fatalf("Parse rejected a document that needs merging: %v", err)
+	}
+	if cfg.Server.SOCKSPort != 2801 {
+		t.Fatalf("defaults not applied: socks_port=%d", cfg.Server.SOCKSPort)
+	}
+	cfg.Server.SOCKSListen = "127.0.0.1"
+	if err := cfg.NormalizeAndValidate(); err != nil {
+		t.Fatalf("merged document rejected: %v", err)
+	}
+	if got := cfg.Server.SOCKSListenAddress(); got != "127.0.0.1" {
+		t.Fatalf("listen address = %q", got)
+	}
+}
+
+// TestLocalDNSDomainsAreNormalized proves the resolve rule and the direct route
+// rule are generated from the same trimmed suffix list.
+func TestLocalDNSDomainsAreNormalized(t *testing.T) {
+	cfg, err := Parse([]byte("gateway:\n  local_dns:\n    - server: \" 192.0.2.53 \"\n      domains: [\" home \", \"\", \"lan\"]\n    - server: \"\"\n      domains: [ignored]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.NormalizeAndValidate(); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Gateway.LocalDNS) != 1 {
+		t.Fatalf("entries = %+v, want only the usable one", cfg.Gateway.LocalDNS)
+	}
+	entry := cfg.Gateway.LocalDNS[0]
+	if entry.Server != "192.0.2.53" {
+		t.Fatalf("server = %q", entry.Server)
+	}
+	if len(entry.Domains) != 2 || entry.Domains[0] != "home" || entry.Domains[1] != "lan" {
+		t.Fatalf("domains = %v", entry.Domains)
+	}
+}
+
+// TestLoadRejectsLANProxyWithoutOptIn proves a legacy config that exposed the
+// proxy on every interface now fails closed with an actionable message.
+func TestLoadRejectsLANProxyWithoutOptIn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lan.yaml")
+	if err := os.WriteFile(path, []byte("server:\n  socks_listen: 0.0.0.0\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("LAN SOCKS bind loaded without socks_allow_lan")
+	}
+	if err := os.WriteFile(path, []byte("server:\n  socks_listen: 0.0.0.0\n  socks_allow_lan: true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("opted-in LAN SOCKS bind was rejected: %v", err)
+	}
+	if cfg.Server.SOCKSListenAddress() != "0.0.0.0" {
+		t.Fatalf("socks_listen = %q, want 0.0.0.0", cfg.Server.SOCKSListenAddress())
+	}
+}
+
+func loadBody(t *testing.T, body string) (*Config, error) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "cfg.yaml")
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return Load(path)
+}
+
+func TestRoutingRuleValidation(t *testing.T) {
+	bad := []string{
+		"routing:\n  rules:\n    - match: \"asn:1234\"\n      outbound: direct\n",                                                 // unsupported matcher
+		"routing:\n  rules:\n    - match: \"geoip:de\"\n      outbound: \"\"\n",                                                   // empty outbound
+		"routing:\n  rules:\n    - match: \"geoip:de\"\n      outbound: office\n",                                                   // undefined outbound
+		"routing:\n  rules:\n    - match: \"ip_cidr:10.0.0.0\"\n      outbound: direct\n",                                         // not a CIDR
+		"routing:\n  rules:\n    - match: \"\"\n      outbound: direct\n",                                                         // empty matcher
+		"routing:\n  rules:\n    - match: \"default\"\n      outbound: proxy\n    - match: \"default\"\n      outbound: direct\n", // duplicate default
+		"routing:\n  rules:\n    - match: \"domain:.example.com\"\n      outbound: direct\n",                                      // dot form belongs to domain_suffix
+		"routing:\n  external_outbounds:\n    office: \"wireguard://10.20.30.10:8088\"\n",                                         // unsupported scheme
+		"routing:\n  external_outbounds:\n    office: \"socks5://10.20.30.10\"\n",                                                 // no port
+		"routing:\n  external_outbounds:\n    proxy: \"socks5://10.20.30.10:8088\"\n",                                           // collides with builtin
+	}
+	for i, body := range bad {
+		if _, err := loadBody(t, body); err == nil {
+			t.Fatalf("case %d: invalid routing config was accepted:\n%s", i, body)
+		}
+	}
+
+	good := `
+routing:
+  external_outbounds:
+    office: "socks5://10.20.30.10:8088"
+  rules:
+    - match: "domain_suffix:de"
+      outbound: direct
+    - match: "geoip:de"
+      outbound: direct
+    - match: "domain_suffix:blocked.example"
+      outbound: deny
+    - match: "domain:ads.example"
+      outbound: reject
+    - match: "ip_cidr:203.0.113.0/24"
+      outbound: office
+    - match: "default"
+      outbound: proxy
+`
+	cfg, err := loadBody(t, good)
+	if err != nil {
+		t.Fatalf("valid routing config rejected: %v", err)
+	}
+	if len(cfg.Routing.Rules) != 6 {
+		t.Fatalf("rules = %d, want 6", len(cfg.Routing.Rules))
+	}
+	if !IsDenyOutbound("block") || !IsDenyOutbound("DENY") || IsDenyOutbound("direct") {
+		t.Fatal("IsDenyOutbound does not recognize the deny spellings")
+	}
+}
+
+// TestCountrySplitValidation pins the opt-in split policy: a two-letter country
+// code is accepted (case and padding normalised), and everything that could
+// name an unexpected asset path or leave the policy half-configured is refused.
+func TestCountrySplitValidation(t *testing.T) {
+	cfg, err := loadBody(t, "routing:\n  country_split: \" IR \"\n  rules:\n    - match: \"default\"\n      outbound: proxy\n")
+	if err != nil {
+		t.Fatalf("valid country_split rejected: %v", err)
+	}
+	if cfg.Routing.CountrySplit != "ir" {
+		t.Fatalf("country_split = %q, want normalized %q", cfg.Routing.CountrySplit, "ir")
+	}
+
+	bad := []string{
+		"routing:\n  country_split: ir\n    - match: x\n",                            // malformed YAML shape
+		"routing:\n  country_split: ir\n",                                             // no rules block (legacy mode)
+		"routing:\n  country_split: irx\n  rules:\n    - match: default\n      outbound: proxy\n",
+		"routing:\n  country_split: i1\n  rules:\n    - match: default\n      outbound: proxy\n",
+		"routing:\n  country_split: \"../x\"\n  rules:\n    - match: default\n      outbound: proxy\n",
+		"routing:\n  country_split: \"iran\"\n  rules:\n    - match: default\n      outbound: proxy\n",
+	}
+	for i, body := range bad {
+		if _, err := loadBody(t, body); err == nil {
+			t.Fatalf("case %d: invalid country_split config was accepted:\n%s", i, body)
+		}
+	}
+}
+
+// TestShippedDefaultConfigStartsNeutral guards the release default: a fresh
+// installation must not ship a provider, a subscription, a selected connection,
+// a geographic routing assumption or a LAN listener. The gateway stays off
+// until the first-run wizard has verified a working connection.
+func TestShippedDefaultConfigStartsNeutral(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "..", "configs", "default.yaml"))
+	if err != nil {
+		t.Fatalf("shipped config does not load: %v", err)
+	}
+	if cfg.Gateway.Enabled {
+		t.Error("shipped config enables the gateway before any connection exists")
+	}
+	if cfg.Gateway.Interface != "" {
+		t.Errorf("shipped config pins gateway.interface = %q; it must auto-detect", cfg.Gateway.Interface)
+	}
+	if cfg.Server.SOCKSAllowLAN || cfg.Server.SOCKSListen != "127.0.0.1" {
+		t.Errorf("shipped config exposes the proxy: listen=%q allow_lan=%v", cfg.Server.SOCKSListen, cfg.Server.SOCKSAllowLAN)
+	}
+	if len(cfg.Server.SOCKSAllowCIDRs) != 0 {
+		t.Errorf("shipped config carries a trusted CIDR allow-list: %v", cfg.Server.SOCKSAllowCIDRs)
+	}
+	if cfg.Server.Web.Enabled {
+		t.Error("shipped config enables the web panel")
+	}
+	if cfg.Server.APIToken != "" {
+		t.Error("shipped config embeds an API token")
+	}
+	if len(cfg.Chains) != 0 {
+		t.Errorf("shipped config defines chains: %+v", cfg.Chains)
+	}
+	if len(cfg.Routing.ExternalOutbounds) != 0 {
+		t.Errorf("shipped config defines external outbounds: %v", cfg.Routing.ExternalOutbounds)
+	}
+	want := []RoutingRule{{Match: "default", Outbound: "proxy"}}
+	if len(cfg.Routing.Rules) != len(want) || cfg.Routing.Rules[0] != want[0] {
+		t.Fatalf("routing.rules = %+v, want exactly %+v", cfg.Routing.Rules, want)
+	}
+}
+
+// TestUpdateFeedURLValidation keeps self-update pointed at a channel the build
+// owner controls: https anywhere, http only for a loopback test feed.
+func TestUpdateFeedURLValidation(t *testing.T) {
+	accepted := []string{
+		"",
+		"https://releases.example.net/bypath/latest.json",
+		"http://127.0.0.1:8089/release.json",
+		"http://localhost:8089/release.json",
+		"http://[::1]:8089/release.json",
+	}
+	for _, raw := range accepted {
+		path := filepath.Join(t.TempDir(), "ok.yaml")
+		body := "update:\n  url: \"" + raw + "\"\n"
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err != nil {
+			t.Errorf("Load rejected update.url %q: %v", raw, err)
+		}
+	}
+
+	rejected := []string{
+		"http://releases.example.net/bypath/latest.json",
+		"ftp://releases.example.net/bypath/latest.json",
+		"releases.example.net/latest.json",
+		"https://",
+	}
+	for _, raw := range rejected {
+		path := filepath.Join(t.TempDir(), "bad.yaml")
+		body := "update:\n  url: \"" + raw + "\"\n"
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Errorf("Load accepted update.url %q", raw)
 		}
 	}
 }
