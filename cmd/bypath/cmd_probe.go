@@ -33,7 +33,7 @@ func cmdTest(args []string) {
 			os.Exit(1)
 		}
 
-		detectedEngine := detectEngine(link.Protocol, forceEngine)
+		detectedEngine := detectEngine(link, forceEngine)
 		fmt.Printf("📋 Parsed link:\n")
 		fmt.Printf("   Protocol: %s\n", link.Protocol)
 		fmt.Printf("   Server:   %s:%d\n", link.Address, link.Port)

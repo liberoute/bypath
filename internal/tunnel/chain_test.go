@@ -43,10 +43,10 @@ func TestResolveChainStrategy_SSHHop(t *testing.T) {
 	// Create profiles with an SSH link and a sing-box link
 	profiles := setupProfilesWithLinks(t, map[string]*profile.Link{
 		"ssh-relay": {
-			Protocol: "ssh",
-			Address:  "relay.example.com",
-			Port:     22,
-			SSHUser:  "root",
+			Protocol:   "ssh",
+			Address:    "relay.example.com",
+			Port:       22,
+			SSHUser:    "root",
 			SSHKeyPath: "/path/to/key",
 		},
 		"vless-exit": {

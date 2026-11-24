@@ -1,0 +1,21 @@
+BYPATH [FULL]  CONNECTED  pid 4242      
+ 2/12 Connections                       
+                                        
+ view: all   search: —   hidden: exclude
+  Organisation is not set up yet. M adds
+  labels only; links, .active and the   
+  serving tunnel are not rewritten.     
+   NAME            PROTO    ADDRESS     
+ ▶ imported/Maple… VLESS    cdn.example.
+   imported/东京…  OPENVPN  europe3.vpn.
+                                        
+ ● selected   ▶ running                 
+ (a saves the selection; c applies it)  
+ credentials: none stored               
+ ↑/↓ move  enter inspect  c connect     
+ a next start  u credentials  e rename  
+ d display name  x delete  h hide       
+ H hidden  m move  N group              
+ R rename group  X delete group         
+ [ ] order  g filter  / search  f clear 
+ M migrate  n import                    

@@ -5,18 +5,20 @@
 //   - Config:   /etc/bypath/config.yaml
 //   - Profiles: /etc/bypath/profiles/
 //   - Geo:      /etc/bypath/geo/
-//   - Tmp:      /tmp/bypath-<random>/
+//   - Tmp:      /run/bypath/
 //   - Logs:     /var/log/bypath/
 //   - Engines:  /opt/bypath/engines/
 //
 // If bypath is running locally (./bypath or from a dev directory),
-// it uses relative paths:
+// configuration and data use working-directory-relative paths:
 //   - Config:   configs/default.yaml
 //   - Profiles: ./data/profiles/
 //   - Geo:      ./data/geo/
-//   - Tmp:      ./data/tmp/
-//   - Logs:     (stdout only)
 //   - Engines:  ./engines/
+//
+// Runtime state (pidfile, stop requests, crash-recovery records) is anchored to
+// the executable's directory instead, so `bypath run` and `bypath stop` agree
+// even when they are invoked from different working directories.
 package paths
 
 import (
@@ -46,6 +48,14 @@ type Resolved struct {
 	LogDir       string
 	PidFile      string
 	ChildrenFile string // PIDs of child processes started by bypath (dns2socks, tun2socks)
+	// ControlSocket is the permissioned local socket the TUI/CLI use to reach
+	// the running daemon without reading root-only configuration. Empty when
+	// the platform has no Unix-domain socket support.
+	ControlSocket string
+	// RuntimeRoot is the daemon-owned directory the control socket lives
+	// under, so the listener can keep the group able to traverse to it. Empty
+	// when the socket is not nested in a runtime root (installed mode).
+	RuntimeRoot string
 }
 
 var current *Resolved
@@ -60,37 +70,71 @@ func Detect() *Resolved {
 	mode := detectMode()
 
 	if mode == ModeInstalled {
-		// Use /tmp/bypath-<pid> for temp files
-		tmpDir := fmt.Sprintf("/tmp/bypath-%d", os.Getpid())
+		// A stable, root-owned runtime directory. A per-PID directory under
+		// /tmp cannot hold crash-recovery state: the next process has a
+		// different PID and would never find it.
+		tmpDir := "/run/bypath"
 
 		current = &Resolved{
-			Mode:         ModeInstalled,
-			ConfigFile:   "/etc/bypath/config.yaml",
-			DataDir:      "/etc/bypath",
-			ProfileDir:   "/etc/bypath/profiles",
-			TmpDir:       tmpDir,
-			GeoDir:       "/etc/bypath/geo",
-			EngineDir:    "/opt/bypath/engines",
-			LogDir:       "/var/log/bypath",
-			PidFile:      "/var/run/bypath.pid",
-			ChildrenFile: "/var/run/bypath.children",
+			Mode:          ModeInstalled,
+			ConfigFile:    "/etc/bypath/config.yaml",
+			DataDir:       "/etc/bypath",
+			ProfileDir:    "/etc/bypath/profiles",
+			TmpDir:        tmpDir,
+			GeoDir:        "/etc/bypath/geo",
+			EngineDir:     "/opt/bypath/engines",
+			LogDir:        "/var/log/bypath",
+			PidFile:       "/var/run/bypath.pid",
+			ChildrenFile:  "/var/run/bypath.children",
+			ControlSocket: controlSocketPath(true, ""),
 		}
 	} else {
+		runtimeRoot := localRuntimeRoot()
 		current = &Resolved{
-			Mode:         ModeLocal,
-			ConfigFile:   "configs/default.yaml",
-			DataDir:      "./data",
-			ProfileDir:   "./data/profiles",
-			TmpDir:       "./data/tmp",
-			GeoDir:       "./data/geo",
-			EngineDir:    "./engines",
-			LogDir:       "",
-			PidFile:      "./bypath.pid",
-			ChildrenFile: "./bypath.children",
+			Mode:          ModeLocal,
+			ConfigFile:    "configs/default.yaml",
+			DataDir:       "./data",
+			ProfileDir:    "./data/profiles",
+			TmpDir:        filepath.Join(runtimeRoot, "data", "tmp"),
+			GeoDir:        "./data/geo",
+			EngineDir:     "./engines",
+			LogDir:        "",
+			PidFile:       filepath.Join(runtimeRoot, "bypath.pid"),
+			ChildrenFile:  filepath.Join(runtimeRoot, "bypath.children"),
+			ControlSocket: controlSocketPath(false, runtimeRoot),
+			RuntimeRoot:   runtimeRoot,
 		}
 	}
 
 	return current
+}
+
+// localRuntimeRoot returns an absolute directory that identifies this
+// installation regardless of the current working directory. Run and stop used
+// to resolve the pidfile and stop-request directory against cwd, so stopping a
+// daemon from another directory reported "no daemon" while bypath was still
+// serving clients. The executable's directory is stable and writable for a
+// local install; when it is read-only the per-user temp directory is used.
+// BYPATH_RUNTIME_DIR overrides the location for isolated test runs and
+// side-by-side installations.
+func localRuntimeRoot() string {
+	if dir := strings.TrimSpace(os.Getenv("BYPATH_RUNTIME_DIR")); dir != "" {
+		if abs, err := filepath.Abs(dir); err == nil {
+			return abs
+		}
+		return dir
+	}
+	if exe, err := os.Executable(); err == nil {
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = resolved
+		}
+		dir := filepath.Dir(exe)
+		if probe, err := os.MkdirTemp(dir, ".bypath-probe-*"); err == nil {
+			os.Remove(probe)
+			return dir
+		}
+	}
+	return filepath.Join(os.TempDir(), fmt.Sprintf("bypath-%d", os.Getuid()))
 }
 
 // Get returns the current resolved paths. Panics if Detect() hasn't been called.
@@ -116,7 +160,13 @@ func (r *Resolved) EnsureDirs() error {
 		dirs = append(dirs, filepath.Dir(r.ConfigFile))
 	}
 	for _, d := range dirs {
-		if err := os.MkdirAll(d, 0755); err != nil {
+		// The temp directory holds per-run engine configs and secrets; it must
+		// never be world-readable or group-readable.
+		mode := os.FileMode(0755)
+		if d == r.TmpDir {
+			mode = 0700
+		}
+		if err := os.MkdirAll(d, mode); err != nil {
 			return err
 		}
 	}

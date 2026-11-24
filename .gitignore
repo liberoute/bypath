@@ -1,13 +1,21 @@
 # Build output
 /build/
 dist/
+# Staging directories for local release candidates (rc.2 build).
+dist-rc2/
 
 # Engine binaries (downloaded at runtime)
 engines/
 
-# Embedded binaries (downloaded at build time via make fetch-tun2socks-*)
+# Embedded binaries (staged at build time via make stage-tun2socks-*)
 assets/embed/tun2socks
 assets/embed/tun2socks.zip
+internal/embedbin/assets/tun2socks
+internal/embedbin/assets/tun2socks.zip
+# Per-architecture staged helpers — digests are pinned in asset.go + Makefile.
+internal/embedbin/assets/tun2socks_linux_amd64
+internal/embedbin/assets/tun2socks_linux_arm64
+internal/embedbin/assets/tun2socks_linux_armv7
 
 # Runtime data
 data/profiles/
@@ -49,6 +57,9 @@ CLAUDE.md
 *.dylib
 *.out
 vendor/
+# The panel's browser modules are source (embedded via go:embed), not a Go
+# vendor tree.
+!internal/api/webui/vendor/
 
 # Environment
 .env

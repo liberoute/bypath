@@ -20,7 +20,7 @@ func TestGenerateSingBoxVmess(t *testing.T) {
 	eng := &engine.Engine{Name: "sing-box"}
 	link := &profile.Link{
 		Protocol: "vmess",
-		Address:  "1.2.3.4",
+		Address:  "192.0.2.4",
 		Port:     443,
 		UUID:     "test-uuid",
 		Security: "auto",
@@ -64,7 +64,7 @@ func TestGenerateSingBoxVmess(t *testing.T) {
 	if proxy["type"] != "vmess" {
 		t.Errorf("outbound type: got %v", proxy["type"])
 	}
-	if proxy["server"] != "1.2.3.4" {
+	if proxy["server"] != "192.0.2.4" {
 		t.Errorf("server: got %v", proxy["server"])
 	}
 }
@@ -606,9 +606,9 @@ func TestGenerateSingBoxVlessStandardTLS_NoReality(t *testing.T) {
 		t.Errorf("tls.enabled: got %v, want true", tls["enabled"])
 	}
 
-	// Standard TLS has insecure: true
-	if tls["insecure"] != true {
-		t.Errorf("tls.insecure: got %v, want true", tls["insecure"])
+	// Standard TLS verifies certificates unless the link opts out explicitly.
+	if tls["insecure"] != false {
+		t.Errorf("tls.insecure: got %v, want false", tls["insecure"])
 	}
 
 	// Standard TLS SHALL NOT have reality sub-object
@@ -660,7 +660,6 @@ func TestGenerateChainConfig_SingleHopNoDetour(t *testing.T) {
 		t.Errorf("last outbound type: got %v, want direct", outbounds[1]["type"])
 	}
 }
-
 
 // Feature: vpn-detection-bypass, Property 3: Generated config contains correct domain bypass rule
 //
@@ -951,14 +950,15 @@ func TestProperty_GeneratedConfigContainsCorrectDomainBypassRule(t *testing.T) {
 			t.Fatalf("rules is not an array, got %T", rulesRaw)
 		}
 
-		// Find the domain_suffix rule
+		// Find the domain_suffix rule that routes traffic direct (the forced
+		// startup-probe rule and a resolve rule may precede it).
 		var domainRule map[string]interface{}
 		for _, ruleRaw := range rules {
 			rule, ok := ruleRaw.(map[string]interface{})
 			if !ok {
 				continue
 			}
-			if _, hasDomainSuffix := rule["domain_suffix"]; hasDomainSuffix {
+			if _, hasDomainSuffix := rule["domain_suffix"]; hasDomainSuffix && rule["action"] == "route" && rule["outbound"] == "direct" {
 				domainRule = rule
 				break
 			}
@@ -1001,7 +1001,6 @@ func TestProperty_GeneratedConfigContainsCorrectDomainBypassRule(t *testing.T) {
 	})
 }
 
-
 // TestEndToEnd_ConfigLoadToSingBoxBypassDomains is an integration test that verifies
 // the full flow: load YAML config with bypass_domains → create ConfigGenerator →
 // generate sing-box config → verify domain_suffix rule is present and routes to "direct".
@@ -1014,6 +1013,7 @@ func TestEndToEnd_ConfigLoadToSingBoxBypassDomains(t *testing.T) {
 	yamlContent := `
 server:
   listen: "0.0.0.0"
+  api_token: "test-only-token"
   api_port: 8080
   socks_port: 2801
 whitelist:
@@ -1104,14 +1104,15 @@ whitelist:
 		t.Fatalf("rules is not an array, got %T", rulesRaw)
 	}
 
-	// Find the domain_suffix rule
+	// Find the domain_suffix rule that routes traffic direct (the forced
+	// startup-probe rule and a resolve rule may precede it).
 	var domainRule map[string]interface{}
 	for _, ruleRaw := range rules {
 		rule, ok := ruleRaw.(map[string]interface{})
 		if !ok {
 			continue
 		}
-		if _, hasDomainSuffix := rule["domain_suffix"]; hasDomainSuffix {
+		if _, hasDomainSuffix := rule["domain_suffix"]; hasDomainSuffix && rule["action"] == "route" && rule["outbound"] == "direct" {
 			domainRule = rule
 			break
 		}
@@ -1150,5 +1151,110 @@ whitelist:
 	// Verify the rule has action "route"
 	if domainRule["action"] != "route" {
 		t.Fatalf("domain bypass rule action: got %v, want \"route\"", domainRule["action"])
+	}
+}
+
+func TestRemoveStaleGenerationsKeepsActiveAndUnrelated(t *testing.T) {
+	root := t.TempDir()
+	stale := filepath.Join(root, "gen-stale")
+	active := filepath.Join(root, "gen-active")
+	unrelated := filepath.Join(root, "profiles")
+	for _, d := range []string{stale, active, unrelated} {
+		if err := os.MkdirAll(d, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(stale, "config.json"), []byte("secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	activeConfig := filepath.Join(active, "sing-box-config.json")
+
+	removed, err := RemoveStaleGenerations(root, activeConfig)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale generation still exists: %v", err)
+	}
+	if _, err := os.Stat(active); err != nil {
+		t.Errorf("active generation was removed: %v", err)
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Errorf("unrelated directory was removed: %v", err)
+	}
+}
+
+func TestRemoveStaleGenerationsMissingDir(t *testing.T) {
+	removed, err := RemoveStaleGenerations(filepath.Join(t.TempDir(), "absent"), "")
+	if err != nil || removed != 0 {
+		t.Fatalf("removed=%d err=%v, want 0/nil", removed, err)
+	}
+}
+
+func TestSingboxTransportTranslatesWSPathEarlyData(t *testing.T) {
+	link := &profile.Link{
+		Protocol: "vless",
+		Address:  "cdn.example.com",
+		Port:     443,
+		UUID:     "uuid",
+		Network:  "ws",
+		TLS:      true,
+		SNI:      "cdn.example.com",
+		Host:     "cdn.example.com",
+		// Persisted RC3 profile shape: hint still inside the shared path.
+		Path: "/ws?ed=2560",
+	}
+	tr := singboxTransport(link, link.Host)
+	if tr["path"] != "/ws" {
+		t.Fatalf("path: got %v want /ws", tr["path"])
+	}
+	if tr["max_early_data"] != 2560 {
+		t.Fatalf("max_early_data: got %v want 2560", tr["max_early_data"])
+	}
+	if tr["early_data_header_name"] != "Sec-WebSocket-Protocol" {
+		t.Fatalf("early_data_header_name: got %v", tr["early_data_header_name"])
+	}
+}
+
+func TestSingboxTransportKeepsWSQueryWithoutHint(t *testing.T) {
+	link := &profile.Link{Protocol: "vless", Network: "ws", TLS: true, Path: "/ws?token=abc"}
+	tr := singboxTransport(link, "")
+	if tr["path"] != "/ws?token=abc" {
+		t.Fatalf("path: got %v", tr["path"])
+	}
+	if _, ok := tr["max_early_data"]; ok {
+		t.Fatalf("unexpected early data for path without hint")
+	}
+}
+
+func TestXrayWSSettingsTranslatePathEarlyData(t *testing.T) {
+	link := &profile.Link{Protocol: "vless", Network: "ws", TLS: true, Host: "cdn.example.com", Path: "/?ed=2560"}
+	stream := map[string]interface{}{}
+	xrayStreamNetwork(stream, link)
+	ws, ok := stream["wsSettings"].(map[string]interface{})
+	if !ok {
+		t.Fatal("missing wsSettings")
+	}
+	if ws["path"] != "/" {
+		t.Fatalf("path: got %v want /", ws["path"])
+	}
+	if ws["maxEarlyData"] != 2560 {
+		t.Fatalf("maxEarlyData: got %v want 2560", ws["maxEarlyData"])
+	}
+	if ws["earlyDataHeaderName"] != "Sec-WebSocket-Protocol" {
+		t.Fatalf("earlyDataHeaderName: got %v", ws["earlyDataHeaderName"])
+	}
+}
+
+func TestXrayWSEarlyDataKeptFromExplicitParam(t *testing.T) {
+	link := &profile.Link{Protocol: "vless", Network: "ws", TLS: true, Path: "/ws", WSMaxEarlyData: 2048, WSEarlyDataHeader: "X-Early"}
+	stream := map[string]interface{}{}
+	xrayStreamNetwork(stream, link)
+	ws := stream["wsSettings"].(map[string]interface{})
+	if ws["maxEarlyData"] != 2048 || ws["earlyDataHeaderName"] != "X-Early" {
+		t.Fatalf("explicit early data lost: %v", ws)
 	}
 }

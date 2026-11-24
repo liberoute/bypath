@@ -48,29 +48,9 @@ func Remove(path string) {
 }
 
 // IsRunning checks if the process with the given PID is still running.
+// Platform-specific liveness is in alive_windows.go / alive_unix.go.
 func IsRunning(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	// On Windows, FindProcess already checks existence.
-	// On Unix, FindProcess always succeeds; send signal 0 to test liveness.
-	// Must use syscall.Signal(0) — os.Signal(nil) is a nil interface and
-	// causes "unsupported signal type" error instead of the intended no-op kill.
-	err = proc.Signal(syscall.Signal(0))
-	if err == nil {
-		return true
-	}
-	// EPERM means the process exists but we can't signal it (e.g. different user).
-	if err == syscall.EPERM ||
-		strings.Contains(err.Error(), "operation not permitted") ||
-		strings.Contains(err.Error(), "access is denied") {
-		return true
-	}
-	return false
+	return processAlive(pid)
 }
 
 // IsRunningFromFile reads the PID file and checks if that process is running.

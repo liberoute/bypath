@@ -4,151 +4,230 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
-// downloadFile downloads a file from url to destPath.
-// If the file is an archive (.tar.gz, .zip), it extracts the binary.
-func downloadFile(url, destPath string) error {
-	resp, err := http.Get(url)
+// maxArtifactSize bounds engine archives so a malicious or broken response
+// cannot fill the disk before the checksum is checked.
+const maxArtifactSize = 512 << 20
+
+var artifactClient = &http.Client{
+	Timeout: 10 * time.Minute,
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   30 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       90 * time.Second,
+	},
+}
+
+// artifactAttempts bounds transport-level retries. Release downloads redirect
+// to a CDN and a single TLS handshake failure should not make an install look
+// like a missing artifact. HTTP status errors are returned immediately.
+var artifactAttempts = 3
+
+func getArtifact(url string) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt < artifactAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+		resp, err := artifactClient.Get(url)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("after %d attempts: %w", artifactAttempts, lastErr)
+}
+
+// downloadVerified downloads url to dest and fails closed unless the content
+// matches the pinned SHA-256 exactly. The file is removed on any mismatch.
+func downloadVerified(url, dest, wantSHA256 string) error {
+	want := strings.ToLower(strings.TrimSpace(wantSHA256))
+	if len(want) != sha256.Size*2 {
+		return fmt.Errorf("invalid pinned checksum for %s", filepath.Base(url))
+	}
+
+	resp, err := getArtifact(url)
 	if err != nil {
 		return fmt.Errorf("HTTP GET failed: %w", err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
 	}
 
-	// Determine if we need to extract
-	if strings.HasSuffix(url, ".tar.gz") || strings.HasSuffix(url, ".tgz") {
-		return extractTarGz(resp.Body, destPath)
-	} else if strings.HasSuffix(url, ".zip") {
-		return extractZip(resp.Body, destPath)
-	}
-
-	// Direct download
-	out, err := os.Create(destPath)
+	out, err := os.OpenFile(dest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 
-	_, err = io.Copy(out, resp.Body)
-	return err
+	hash := sha256.New()
+	n, copyErr := io.Copy(io.MultiWriter(out, hash), io.LimitReader(resp.Body, maxArtifactSize+1))
+	closeErr := out.Close()
+	if copyErr != nil {
+		os.Remove(dest)
+		return copyErr
+	}
+	if closeErr != nil {
+		os.Remove(dest)
+		return closeErr
+	}
+	if n > maxArtifactSize {
+		os.Remove(dest)
+		return fmt.Errorf("%s is larger than the %d byte limit", filepath.Base(url), maxArtifactSize)
+	}
+
+	got := hex.EncodeToString(hash.Sum(nil))
+	if got != want {
+		os.Remove(dest)
+		return fmt.Errorf("checksum mismatch for %s: got sha256:%s, want sha256:%s", filepath.Base(url), got, want)
+	}
+	return nil
 }
 
-// extractTarGz extracts the main binary from a tar.gz archive.
-func extractTarGz(reader io.Reader, destDir string) error {
-	gzr, err := gzip.NewReader(reader)
+// installArtifact extracts exactly one expected binary from a verified archive
+// (or copies a verified raw binary) into destDir. Any other archive entry is
+// ignored, so a release cannot install extra executables.
+func installArtifact(src, artifactName, destDir, binaryName string) error {
+	return installArtifactAs(src, artifactName, destDir, binaryName, binaryName)
+}
+
+// installArtifactAs is installArtifact for releases whose archive member name
+// differs from the installed executable name (tun2socks zips carry a platform
+// suffix).
+func installArtifactAs(src, artifactName, destDir, binaryName, archiveName string) error {
+	switch {
+	case strings.HasSuffix(artifactName, ".tar.gz"), strings.HasSuffix(artifactName, ".tgz"):
+		return extractTarGzFile(src, destDir, binaryName, archiveName)
+	case strings.HasSuffix(artifactName, ".zip"):
+		return extractZipFile(src, destDir, binaryName, archiveName)
+	default:
+		return copyArtifact(src, destDir, binaryName)
+	}
+}
+
+func copyArtifact(src, destDir, binaryName string) error {
+	in, err := os.Open(src)
 	if err != nil {
 		return err
+	}
+	defer in.Close()
+	return writeAtomic(destDir, binaryName, in, 0755)
+}
+
+func extractTarGzFile(src, destDir, binaryName, archiveName string) error {
+	f, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gzr, err := gzip.NewReader(f)
+	if err != nil {
+		return fmt.Errorf("opening archive: %w", err)
 	}
 	defer gzr.Close()
 
 	tr := tar.NewReader(gzr)
-	dir := filepath.Dir(destDir)
-
+	found := false
 	for {
 		header, err := tr.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return err
+			return fmt.Errorf("reading archive: %w", err)
 		}
-
-		// Only extract regular files that look like binaries
-		if header.Typeflag != tar.TypeReg {
+		if header.Typeflag != tar.TypeReg || filepath.Base(header.Name) != archiveName {
 			continue
 		}
-
-		name := filepath.Base(header.Name)
-		// Skip non-binary files
-		if strings.HasSuffix(name, ".md") || strings.HasSuffix(name, ".txt") ||
-			strings.HasSuffix(name, ".json") || strings.HasPrefix(name, ".") {
-			continue
+		if found {
+			return fmt.Errorf("archive contains more than one %q entry", archiveName)
 		}
-
-		// Extract to engines directory
-		outPath := filepath.Join(dir, name)
-		outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
-		if err != nil {
+		if err := writeAtomic(destDir, binaryName, tr, 0755); err != nil {
 			return err
 		}
-
-		if _, err := io.Copy(outFile, tr); err != nil {
-			outFile.Close()
-			return err
-		}
-		outFile.Close()
+		found = true
 	}
-
+	if !found {
+		return fmt.Errorf("archive does not contain %q", archiveName)
+	}
 	return nil
 }
 
-// extractZip extracts the main binary from a zip archive.
-func extractZip(reader io.Reader, destDir string) error {
-	// We need to write to a temp file first since zip needs random access
-	tmpFile, err := os.CreateTemp("", "liberoute-download-*.zip")
+func extractZipFile(src, destDir, binaryName, archiveName string) error {
+	zr, err := zip.OpenReader(src)
 	if err != nil {
-		return err
+		return fmt.Errorf("opening archive: %w", err)
 	}
-	defer os.Remove(tmpFile.Name())
-	defer tmpFile.Close()
+	defer zr.Close()
 
-	if _, err := io.Copy(tmpFile, reader); err != nil {
-		return err
-	}
-
-	// Open as zip
-	zipReader, err := zip.OpenReader(tmpFile.Name())
-	if err != nil {
-		return err
-	}
-	defer zipReader.Close()
-
-	dir := filepath.Dir(destDir)
-
-	for _, f := range zipReader.File {
-		if f.FileInfo().IsDir() {
+	found := false
+	for _, entry := range zr.File {
+		if entry.FileInfo().IsDir() || filepath.Base(entry.Name) != archiveName {
 			continue
 		}
-
-		name := filepath.Base(f.Name)
-		// Skip non-binary files
-		if strings.HasSuffix(name, ".md") || strings.HasSuffix(name, ".txt") ||
-			strings.HasSuffix(name, ".json") || strings.HasPrefix(name, ".") ||
-			strings.HasSuffix(name, ".dat") || strings.HasSuffix(name, ".sig") {
-			continue
+		if found {
+			return fmt.Errorf("archive contains more than one %q entry", archiveName)
 		}
-
-		rc, err := f.Open()
+		if entry.UncompressedSize64 > maxArtifactSize {
+			return fmt.Errorf("archive entry %q is larger than the %d byte limit", archiveName, maxArtifactSize)
+		}
+		rc, err := entry.Open()
 		if err != nil {
 			return err
 		}
-
-		outPath := filepath.Join(dir, name)
-		outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
-		if err != nil {
-			rc.Close()
-			return err
-		}
-
-		if _, err := io.Copy(outFile, rc); err != nil {
-			outFile.Close()
-			rc.Close()
-			return err
-		}
-
-		outFile.Close()
+		writeErr := writeAtomic(destDir, binaryName, rc, 0755)
 		rc.Close()
+		if writeErr != nil {
+			return writeErr
+		}
+		found = true
 	}
-
+	if !found {
+		return fmt.Errorf("archive does not contain %q", archiveName)
+	}
 	return nil
+}
+
+// writeAtomic copies r into dir/name through a uniquely named temporary file so
+// a failed extraction never replaces a working engine.
+func writeAtomic(dir, name string, r io.Reader, mode os.FileMode) error {
+	tmp, err := os.CreateTemp(dir, ".bypath-extract-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	n, err := io.Copy(tmp, io.LimitReader(r, maxArtifactSize+1))
+	if err != nil {
+		tmp.Close()
+		return err
+	}
+	if n > maxArtifactSize {
+		tmp.Close()
+		return fmt.Errorf("extracted %q is larger than the %d byte limit", name, maxArtifactSize)
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, filepath.Join(dir, name))
 }

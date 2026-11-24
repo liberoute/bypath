@@ -2,9 +2,14 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +24,14 @@ type testConfigGen struct{ path string }
 
 func (g *testConfigGen) Generate(eng *Engine, link *profile.Link) (string, error) {
 	return g.path, nil
+}
+
+// failingConfigGen simulates a link whose stored configuration cannot produce a
+// valid engine config (for example a missing credential).
+type failingConfigGen struct{ err error }
+
+func (g failingConfigGen) Generate(*Engine, *profile.Link) (string, error) {
+	return "", g.err
 }
 
 // makeFakeManager builds a Manager with engines pointing to a nonexistent binary (fail-fast on Start).
@@ -128,6 +141,45 @@ func TestEngineOrder_PreferredMovedFromMiddle(t *testing.T) {
 	}
 }
 
+// TestConfigGenerationFailureIsLocal verifies that a link which cannot produce
+// a configuration is reported with the ErrLocalConfig sentinel, so the run loop
+// stops retrying instead of waiting for a server-side recovery.
+func TestConfigGenerationFailureIsLocal(t *testing.T) {
+	mgr := makeFakeManager(t, "sing-box")
+	fc := NewFallbackController(mgr, config.FallbackConfig{
+		Enabled: false,
+		Timeout: "500ms",
+		Order:   []string{"sing-box"},
+	}, failingConfigGen{err: errors.New("missing credential")}, 12803)
+
+	_, err := fc.StartWithFallback(context.Background(), &profile.Link{Remark: "broken"}, "")
+	if !errors.Is(err, ErrLocalConfig) {
+		t.Fatalf("err = %v, want ErrLocalConfig", err)
+	}
+}
+
+// TestBinaryStartFailureIsNotLocal verifies that a missing binary stays a
+// transient failure: the engine can be downloaded or repaired without editing
+// the stored link.
+func TestBinaryStartFailureIsNotLocal(t *testing.T) {
+	cfgFile, cleanup := makeTempFile(t)
+	defer cleanup()
+	mgr := makeFakeManager(t, "sing-box", "xray")
+	fc := NewFallbackController(mgr, config.FallbackConfig{
+		Enabled: true,
+		Timeout: "500ms",
+		Order:   []string{"sing-box", "xray"},
+	}, &testConfigGen{path: cfgFile}, 12804)
+
+	_, err := fc.StartWithFallback(context.Background(), &profile.Link{Remark: "no-binary"}, "")
+	if err == nil {
+		t.Fatal("expected an error for missing engine binaries")
+	}
+	if errors.Is(err, ErrLocalConfig) {
+		t.Fatalf("missing binaries must stay transient, got %v", err)
+	}
+}
+
 // --- Property 2: fallback initiation when alternative engine is available ---
 
 // TestProperty2_FallbackEnabled_AllEnginesTried verifies that when fallback is enabled,
@@ -177,4 +229,72 @@ func TestFallbackDisabled_OnlyFirstEngineTried(t *testing.T) {
 	if strings.Contains(err.Error(), "xray") {
 		t.Errorf("xray should not be tried when fallback is disabled, but error contains it: %v", err)
 	}
+}
+
+// TestStartWithLifetimeOutlivesStartupAttempt guards the contract that bounded
+// startup deadlines must not own the engine process. Regression: a per-attempt
+// context passed to exec.CommandContext killed the engine as soon as the
+// fallback attempt returned, producing a restart loop on every connection.
+func TestStartWithLifetimeOutlivesStartupAttempt(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("process ownership check needs /proc")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not available")
+	}
+
+	port := freeTCPPort(t)
+	dir := t.TempDir()
+	script := filepath.Join(dir, "fake-engine.sh")
+	body := "#!/bin/sh\nexec python3 -m http.server " + strconv.Itoa(port) + " --bind 127.0.0.1\n"
+	if err := os.WriteFile(script, []byte(body), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cfgFile := filepath.Join(dir, "engine.json")
+	if err := os.WriteFile(cfgFile, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := NewManager(config.EnginesConfig{Directory: dir})
+	mgr.engines["sing-box"] = &Engine{Name: "sing-box", Path: script, Source: "test"}
+	fc := NewFallbackController(mgr, config.FallbackConfig{
+		Enabled: false,
+		Timeout: "10s",
+		Order:   []string{"sing-box"},
+	}, &testConfigGen{path: cfgFile}, port)
+
+	startCtx, startCancel := context.WithCancel(context.Background())
+	lifetime, lifeCancel := context.WithCancel(context.Background())
+	defer lifeCancel()
+
+	res, err := fc.StartWithLifetime(startCtx, lifetime, &profile.Link{Remark: "test", Protocol: "vless"}, "")
+	if err != nil {
+		startCancel()
+		t.Fatalf("StartWithLifetime: %v", err)
+	}
+	defer killAndReap(res.Process, res.Waiter)
+
+	startCancel()
+	select {
+	case <-res.Waiter.Done():
+		t.Fatal("engine was killed when the startup attempt ended")
+	case <-time.After(700 * time.Millisecond):
+	}
+
+	lifeCancel()
+	select {
+	case <-res.Waiter.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("engine survived cancellation of its lifetime context")
+	}
+}
+
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
 }

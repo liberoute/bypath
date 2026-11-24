@@ -1,350 +1,436 @@
 # Changelog
 
-## v2.6.7 (2026-08-31)
+This branch starts a new, independently constructed public history for Bypath.
+Earlier internal development history is not part of it. Entries below describe
+the public release candidate only.
 
-### Fixed
-- **Bypath lifecycle / dnsmasq interaction** — Bypath could be stopped through its systemd interaction with dnsmasq. The generated unit included `Conflicts=dnsmasq.service`; when dnsmasq was started (on boot, manually, or by Bypath on shutdown), systemd would stop Bypath because of the symmetric conflict relation. Bypath now records whether dnsmasq was actually ACTIVE before it started, and restores it only when it was previously running. The symmetric `Conflicts=dnsmasq.service` directive has been removed from the generated unit.
+## v3.0.0-rc.4 — pre-release
+
+Benchmark reliability and proxy-guard hardening on the rc.3 tree. This
+candidate contains 21 implementation commits since `v3.0.0-rc.3`, plus
+documentation-only commits after `689759e` (`ef73acd` and the correction that
+follows it): 23 commits in total at this review. The public tag is created
+from the reviewed export. Release candidate; no support claim beyond the
+platforms in [RELEASE_NOTES.md](RELEASE_NOTES.md).
+
+### Benchmark CLI approval (behaviour change)
+
+- `bypath bench --help` and `-h` print usage and exit 0 without probing or
+  touching the profile store; the command previously had no help path and fell
+  through to a full sweep (D-928d993-1). Unknown options and positional
+  arguments exit 1 with usage and change nothing.
+- A benchmark no longer rewrites the active link automatically. Selection
+  requires `--yes` or an interactive `y`/`yes`; EOF, an empty line, a closed
+  stdin or any non-terminal stdin never approves and prints
+  `Selection unchanged (non-interactive; pass --yes to select the best link).`
+- **`bench --auto` no longer implies approval.** On non-interactive stdin it
+  refuses before benchmarking unless `--yes` is also passed: exit 1 with
+  `--auto needs --yes when stdin is not a terminal; nothing was benchmarked and
+  the selection is unchanged`. Scripts that relied on `bench --auto` from cron
+  or a pipe must add `--yes`.
+- `--single N` still probes one row and never changes the selection; `-g`/
+  `--group` filtering and row numbering (sorted by remark) are unchanged.
+- The CLI help path stays non-interactive and pipe-safe (`5a9143a`). The
+  regression suite covers help, invalid flags, EOF, non-interactive stdin,
+  declined prompts, `--yes`, `--auto --yes` and `--single`, and asserts the
+  persistent selection actually changes only where a write is expected
+  (`f6a615f`, `689759e`).
+
+### Proxy guard lifecycle
+
+- The guard lease is an abstract Unix socket scoped to the network namespace,
+  so it has no pathname to unlink and is released on process death; a file lock
+  at `/var/lib/bypath/proxy-guard.lock` additionally excludes lock-aware builds
+  in both directions (`697648d`, `928d993`).
+- Ownership is proved from the record together with the installed rules; a
+  record-free chain is never adopted, a failed install touches only objects the
+  record can prove, and `bypath stop` removes only the guard of the run it
+  stopped. Automatic recovery therefore requires verifiable ownership: a chain
+  with no record, or one whose rules no longer match it, is retained and can
+  block startup until an operator resolves it. A chain left by a crash or an
+  interrupted install no longer causes a crash loop (`bb11c37`, `2916c1e`).
+- A loopback-only listener installs no guard and needs no `iptables` access,
+  including in root containers without `NET_ADMIN` (`2916c1e`).
+- Builds older than every lock (`d175a19`, `bb11c37`) cannot be excluded while
+  they run; a current daemon detects the ownership change and stops instead of
+  serving unguarded. The mandatory stop / verify / swap / start procedure is
+  documented in INSTALL.md and
+  [TROUBLESHOOTING.md](TROUBLESHOOTING.md#changing-the-binary-while-a-guard-is-installed).
+
+### Benchmark measurement and evidence
+
+- WebSocket early-data hints in the shared path (`?ed=2560`) are translated for
+  both engines instead of being sent verbatim, and startup verifies a real TLS
+  handshake and HTTP answer through the tunnel before declaring CONNECTED
+  (`9148411`).
+- Startup probes are forced through the tunnel ahead of DIRECT rules, scoped to
+  the daemon's own inbound, and the uplink oracle is bound to the physical
+  interface so it cannot measure the tunnel exit (`8df1837`, `fd7d1f2`,
+  `ed47dee`).
+- The serving link is measured through its own isolated instance when the live
+  path cannot be route-checked (`c26bb4b`). A carried HTTPS answer with an
+  unproven or shared exit is kept as `measured`/`exit_unverified` instead of
+  being discarded; ranking still requires the full L1+L2 proof (`7d4928b`,
+  `d9daec0`).
+- `tests.bootstrap_dns` pins tested endpoints through validated private LAN
+  resolvers before an isolated tunnel exists; failures report the stage
+  (`dns_bootstrap_failure`, `tcp_connection_failure`, `handshake_failure`,
+  `https_failure`) instead of one generic error (`ed47dee`).
+- Host-worker jobs resolve through group and remark, the host worker receives
+  the LAN bootstrap resolver, and the live-path control uses an endpoint that
+  echoes an address (`50e20fb`, `255570e`, `9654670`).
+
+### Benchmark sessions, speed and latency
+
+- A serving gateway caps concurrent benchmark tunnel sessions at one
+  (`tests.max_sessions`, default 1, hard cap 3) so measurements do not compete
+  with the connection carrying user traffic (`d175a19`).
+- Latency reports a fast delay (HTTPS stopped at response headers) separately
+  from the full P50/P90 sample; a failed sample no longer hides an answered
+  probe (`989990f`, `939ad4f`).
+- Speed transfers get a 45 s transfer budget on top of the 25 s setup window,
+  rank from the first body byte after a warm-up, retry only within the byte
+  cap, and report phase, elapsed time, TLS/TTFB and received bytes. A non-2xx
+  target is `TARGET_REJECTED`, never a speed result; the monthly budget charges
+  actual spend (`989990f`).
+- The panel keeps the compare chip to its verdict and ranks completed rows
+  ahead of failed and superseded ones (`e7d59cd`, `939ad4f`).
+
+### Configuration
+
+- `tests.bootstrap_dns` (up to four private `ip[:port]` resolvers; loopback and
+  public addresses are rejected) and `tests.max_sessions` (default 1, hard cap
+  3) are new optional keys. Configurations without them keep the proxy-only
+  defaults recorded in `internal/config/config.go`.
 
 ### Validation
-- Validated on Linux ARM64 (Anzali Orange Pi) and Linux ARMv7/GOARM=7 (Tehran Orange Pi).
-- XHTTP runtime connectivity validated on both architectures.
-- Long-running service stability verified without restart loops or unexpected self-shutdowns.
-- 15-minute stability window passed on both Tehran (ARMv7) and Anzali (ARM64).
 
-## v2.6.6-xhttp (2026-08-12) — local / edge deploy (not yet GitHub-tagged)
-
-Deployed on **Orange Pi Zero 3 Anzali** (`172.20.100.12`, host `orangepizero3`) as lite arm64 build (`Commit: local-remark`). GitHub release tag optional follow-up.
-
-### Bug Fixes
-- **VLESS XHTTP / SplitHTTP broken** — Subscriptions like sudo/sudonetwork ship `type=xhttp` with `mode`, `extra`/`xPaddingBytes`, path `?ed=…`. Parser dropped mode/extra; xray config never emitted `xhttpSettings` (only bare `network: xhttp`). Links worked in v2rayN, failed on bypath. Fixed: parse `mode`/`extra`/`x_padding_bytes`; xray `xhttpSettings` + fingerprint; sing-box transport pass-through; **auto-prefer xray** when `Network` is `xhttp`/`splithttp`.
-- **Subscription fetch TLS timeout in IR** — Direct GET to panel ports (e.g. `:2083`) often fails (`TLS handshake timeout`). Fetch now tries env proxy → local SOCKS if listening → direct (8.8.8.8 DNS). UA set to `v2rayN/6.45`. Offline path: `bypath sub import <file>`.
-- **Duplicate subscription entries** — Same URL with/without `#fragment` created two entries (or two mental “groups”). Normalized URLs strip fragment for identity; global duplicate check; `bypath sub dedupe`.
-
-### Added
-- **Subscription `#remark` → group name** — v2rayN convention: `https://panel/…/token#tonysopranosjr_1` names the group `tonysopranosjr_1` (not domain `sudonetwork`). Re-adding an existing URL renames a domain-named group to the `#remark` when free.
-- **`bypath sub import [-g group] <file>`** — Load plain/base64 sub dump from disk (scp from free network when panel blocked).
-- **`bypath sub dedupe`** — Normalize + unique subscription URLs across groups.
-- **`bypath sub list`** — Lists all groups by default (not only `default`).
-
-### Changed
-- xray outbounds use pinned host IPs when available (same bootstrap reason as sing-box).
-- `RenameGroup` on profile manager (disk + `.active` + in-memory links).
-
-## v2.6.5 (2026-06-16)
-
-### Bug Fixes
-- **TUI: selecting a server from a renamed group picks from the wrong group** — When a group was renamed (e.g. `ha-man2` → `mazin`), the link objects inside its JSON file still carried the old `"group"` field value. `SetActiveLink` then wrote the stale name to `.active`; on gateway restart `GetActiveLink` could not find that group and fell back to the first group in map iteration order (non-deterministic — often a different group entirely). Fixed in two places: `loadAll()` now always overwrites `link.Group` with the current group name from the file, and `cmd select` explicitly sets `link.Group = group` before calling `SetActiveLink`.
-- **TUI: live-status hangs indefinitely** — The connection test used `http://icanhazip.com` (domain-based), which could be matched by `bypass_domains` and route direct — making the test meaningless or slow. Replaced with `https://1.1.1.1/cdn-cgi/trace` (IP-based URL, never intercepted by domain rules). Added `--max-time 12` timeout. Country code is now parsed directly from the trace response (`loc=` field), removing one extra network round-trip.
-- **TUI: Country and ISP blank in live-status output** — Country was fetched via a geo API through the proxy (same bypass_domains problem). Now parsed from the Cloudflare trace response (`loc=`) directly. ISP lookup uses `ip-api.com` direct (no proxy) because the tunnel is already confirmed working by this point and `ip-api.com` might itself be in bypass_domains.
-- **Gateway restart race: new connection fails briefly** — Gateway stop used `SIGTERM` which left the SOCKS port bound for up to ~2 s while sub-processes shut down. The new `bypath run` would start before the port was free and immediately fail. Fixed by switching all engine kills in `cmdStop` to `SIGKILL` (`-9`) for immediate port release, and adding a polling loop in `restartGateway()` that waits until the SOCKS port is actually free (up to 3 s) before starting the new instance.
-
-### Changed
-- **TUI: live-status is cancellable** — Press `esc` or `q` while the status check is running to abort it immediately. Previously the TUI was locked for up to 20 s with no way out.
-
-## v2.6.4 (2026-06-12)
-
-### Added
-- **`gateway.local_dns` — home DNS / private TLD support** — New config section routes specific domain suffixes to a designated local DNS server, bypassing the tunnel entirely. Useful when your home/office DNS serves private TLDs (e.g. `.home`, `.lan`, `.internal`) that public resolvers (1.1.1.1, 8.8.8.8) cannot answer. Both DNS resolution and traffic routing for matched domains are handled locally (direct, no tunnel).
-
-  ```yaml
-  gateway:
-    local_dns:
-      - server: "192.168.1.1"   # your home/local DNS server
-        domains: ["home", "lan"] # domain suffixes without leading dot
-  ```
-
-  Multiple entries are supported. Each entry routes its domains to a separate DNS server. Works with both **sing-box** (native TUN) and **xray** (legacy + routing-rules) engines.
-
-### Changed
-- **Built-in DNS forwarder gains per-domain routing** — When `local_dns` is configured, bypath uses the built-in DNS forwarder instead of `dns2socks` (which only supports a single upstream). Local-suffix queries are forwarded directly to the configured local DNS server via plain UDP; all other queries still go through DoH-over-proxy to avoid ISP poisoning. `dns2socks` and `dnsmasq` are skipped when local DNS rules are present.
-
-## v2.6.3 (2026-06-10)
-
-### Bug Fixes
-- **TUI: subscription group resets to "default" after action** — After running any action (update, bench, start), the TUI reloaded groups alphabetically and restored `activeGroup` by saved index. If a new group was inserted before the current one, the index shifted — pointing to "default" instead of the user's selected group. Fixed by saving the group *name* before reload and restoring by name after.
-- **dnsmasq conflict on port 53 (Armbian / Debian / Raspbian)** — On boards like Orange Pi and Raspberry Pi running Armbian or Raspbian, `dnsmasq` starts at boot and holds port 53. When bypath tried to start `dns2socks`, it exited immediately — but `waitForPort(53)` returned a false positive because dnsmasq was already there. Bypath incorrectly believed DNS was running and started the gateway with a broken DNS proxy. Fixed with two changes: (1) `stopDnsmasq()` is called before starting `dns2socks`; (2) after `waitForPort` succeeds, the dns2socks process is verified to still be alive via `/proc/<pid>` so a false positive from another process on port 53 is caught immediately.
-
-### Changed
-- **install.sh: sudo auto-escalation** — Non-root users no longer need to know about `sudo`. Running `./install.sh` as a regular user automatically re-executes with `sudo` (prompting for password if needed). Previously the installer exited with "must be run as root".
-- **install.sh: dnsmasq conflict handled at install time** — `check_deps()` now stops `dnsmasq` if active, so bypath works immediately after first install on Armbian/Debian/Raspbian systems without a manual reboot or service tweak.
-- **install.sh: `Conflicts=dnsmasq.service` in generated systemd unit** — The generated `/etc/systemd/system/bypath.service` now includes `Conflicts=dnsmasq.service`. Systemd stops dnsmasq automatically when bypath starts; bypath restarts dnsmasq when it exits. Previously this required a manual unit edit after install.
-
-## v2.6.2 (2026-06-08)
-
-### Bug Fixes
-- **systemd-resolved conflict on Debian 12+** — On systems with `systemd-resolved` active (Debian 12, Ubuntu 18+), port 53 was occupied, preventing `dns2socks` from starting. Gateway would start without DNS → LAN clients got no resolution. Now `disableSystemdResolved()` is called automatically at the top of `startDNS()` — detects, stops, disables the service, and fixes the `/etc/resolv.conf` symlink. Also added to `install.sh` so fresh installs handle this at install time.
-- **Double "v" in version output** — `bypath version` displayed `vv2.6.1` when the version string was injected with a "v" prefix via ldflags. Now `versionStr()` normalizes to a single "v" prefix.
-
-### Added
-- **TUI: scrollable output view** — Version info and command output panels now support `↑↓`/`j`/`k` scrolling. Previously long output (engines, geo data) overflowed on small terminals. Close with `q`/`esc`/`enter`.
-
-### Changed
-- **install.sh disables systemd-resolved** — `check_deps()` now automatically stops and disables `systemd-resolved` if active, freeing port 53 for bypath's DNS proxy.
-
-## v2.6.1 (2026-06-07)
-
-### Bug Fixes
-- **`singboxRuleFromMatcher` crash on missing `.srs` file** — When a `geoip:` or `geosite:` rule was configured but the corresponding `.srs` file didn't exist, sing-box would crash at startup because the route rule referenced an undefined rule_set tag. Now `singboxRuleFromMatcher` checks file existence (via `ruleSetForMatcher`) before adding the rule. Missing rule_sets are silently skipped with a warning log.
-
-### Changed
-- **Default config includes `domain_suffix:ir`** — All default configs (`configs/default.yaml`, `install.sh`, `createDefaultConfig()`) now include `domain_suffix:ir → direct` rule. This ensures `.ir` domains route directly regardless of whether `geoip:ir` IP-based matching works correctly with the active engine. Previously only `geoip:ir` was used, which required successful DNS resolution before matching — unreliable with some xray+CDN configurations.
-- **`createDefaultConfig()` migrated to `routing.rules`** — The Go fallback config (`cmd/bypath/helpers.go`) now writes the new `routing.rules` format with `native_tun`, `fallback` config, and `domain_suffix:ir` instead of the deprecated `whitelist` format.
-
-### Added
-- **`geo.DownloadXrayGeoFiles()`** — downloads `geoip.dat` and `geosite.dat` (xray format, from v2fly) at startup for full builds or when `engines.preferred: xray`. Previously required manual download or relied on install.sh; now clean installs with xray engine work automatically.
-- **Default config includes `cloudflare.com` direct rule** — `configs/default.yaml` now ships with `domain_suffix:cloudflare.com` and `domain_suffix:ip-api.com` as direct rules, ensuring CDN check endpoints and IP detection services route directly without going through the tunnel.
-
-## v2.6.0 (2026-06-06)
-
-### Bug Fixes
-- **sing-box DNS poisoning bypass (DoH)** — `dns-tunnel` type changed from `udp` to `https` (DoH). Plain UDP DNS silently fails over TCP-only transports (VLESS-WS, Trojan-WS): queries are dropped or intercepted by the ISP. Iranian ISPs also return bogon IPs (e.g. `10.10.34.36`) for blocked domains like youtube.com — causing `ip_is_private` to match and route them direct to censorship servers. DoH goes over TCP through the proxy outbound, bypassing both issues. YouTube now returns 200 correctly.
-- **`geoip:ir` never matched (resolve action missing)** — Added `{"action": "resolve", "server": "dns-tunnel"}` route rule after the sniff action, for both `singboxRouteFromRules()` and the legacy `singboxRoute()`. Without a `resolve` action, sing-box routes based on unresolved domain names — `geoip:ir` is an IP-based rule and never fires for domain traffic. With resolve using `dns-tunnel` (DoH), domains are resolved to real IPs before the geoip rule is evaluated. `login.samandehi.ir` now correctly returns 307 (direct) instead of 403 (tunnel → foreign exit → blocked).
-- **`default_domain_resolver` changed to `dns-direct`** — The global default was `dns-tunnel` (all domain resolution going through the proxy). Now `dns-direct` is used as the global default; the `resolve` action explicitly routes proxy-bound domains through `dns-tunnel`. This avoids unnecessary proxy load for direct-routed traffic.
-- **geoip `.srs` missing → sing-box crash** — `ruleSetForMatcher()` now checks if `geoip-{country}.srs` exists on disk before including it in the sing-box config (same pattern as geosite). Previously, a missing file caused sing-box to crash at startup ("port :2801 not ready within 10s"). Now logs a warning and skips the rule — bypath starts without geoip routing rather than failing entirely.
-- **Auto-download geoip `.srs` files at startup** — `cmd_run.go` now parses `routing.rules` for `geoip:<country>` matchers and calls `geo.DownloadGeoipFiles()` before starting the engine. Fresh installs no longer require a manual `bypath geo update` — the file is downloaded on first `bypath run`. Combined with the existence check above, clean-machine deployments work end-to-end without any manual steps.
-
-## v2.5.10 (2026-06-05)
-
-### Bug Fixes
-- **`ir` in default `bypass_domains`** — Iranian sites (e.g. `login.samandehi.ir`) were routed through the tunnel because `countries: []` was set to avoid requiring `geoip.dat`. Without `ir` in `bypass_domains`, `.ir` domains went through the foreign exit node and received 403/connection refused. Added `"ir"` as the first entry in the default `bypass_domains` list so all `.ir` domains route direct without needing any geo data files.
-
-## v2.5.9 (2026-06-05)
-
-### Bug Fixes
-- **Built-in DNS forwarder** — When `dns2socks` and `dnsmasq` are both absent, bypath now starts its own DNS server on port 53 using `miekg/dns`. Queries are forwarded via DoH (HTTPS) through the SOCKS5 proxy, avoiding ISP DNS hijacking (e.g. `youtube.com → 10.10.34.36`). Falls back to direct UDP only if the proxy itself is temporarily unavailable.
-- **xray DoH DNS** — `xrayDNSConfig()` now uses DoH (`https://1.1.1.1/dns-query`) instead of plain UDP. Plain UDP DNS silently fails through TCP-only VLESS WebSocket transports (xray 25.x). DoH goes over TCP/HTTPS → survives any transport.
-- **xray routing `domainStrategy: IPIfNonMatch`** — Was `UseIPv4`, which skipped DNS resolution entirely in xray 25.x routing decisions. `IPIfNonMatch`: if no domain rule matches directly, resolve the domain to an IP, then re-check IP rules (geoip:ir). Required for `geoip:ir` to match Iranian sites at all.
-- **xray freedom outbound `UseIPv4`** — Direct (freedom) outbound now has `domainStrategy: UseIPv4` so it resolves hostnames through xray's own DNS (DoH) rather than system DNS (`127.0.0.1` with no server). Fixes `SSL_ERROR_SYSCALL` / HTTP 000 for Iranian sites in gateway mode.
-- **geosite:ir removed from xray routing** — Standard `geosite.dat` distributions (v2fly/domain-list-community, Loyalsoldier) do not include an `IR` category. Removed the rule entirely; `geoip:ir` alone handles Iranian IP routing correctly.
-- **IR routing health check (`verifyWhitelistRouting`)** — New check runs at gateway startup when `ir` is in whitelist countries. Tests `login.samandehi.ir` (expects 307 = direct/Iranian IP; 403 = traffic going through foreign proxy), then `wp.mahex.com/ip` and `ip.shecan.ir` as IP-checker fallbacks. If Iranian routing is broken, bypath marks the engine unhealthy and tries the next link/engine.
-
-## v2.5.8 (2026-06-05)
-
-### Bug Fixes
-- **Self-healing on restart** — `cleanupPreviousRun()` runs at the top of `Start()`, killing bypath's own tracked child processes (not user-run daemons), flushing iptables/routing tables, and restoring `/etc/resolv.conf` from backup. A crash or `kill -9` no longer leaves the network broken.
-- **Child process safety** — PIDs are tracked in `/var/run/bypath.children`; cleanup only kills processes bypath itself started. User-run sing-box/xray/tun2socks are untouched.
-- **DNS intercept for DHCP clients** — `setupDNSIntercept()` adds iptables `PREROUTING REDIRECT :53 → bypath_dns_port` so LAN clients that receive a different DNS via DHCP still hit bypath's resolver. No manual DNS config needed on clients.
-- **resolv.conf backup/restore** — `setResolvConf()` backs up the original `/etc/resolv.conf` before overwriting; `restoreResolvConf()` restores it on `bypath stop` (falls back to `8.8.8.8` if backup is missing).
-- **dns_upstream from config** — `startDNS()` no longer hardcodes `1.1.1.1`; reads from `gateway.dns_upstream` in config.
-- **Double dns2socks** — `startDNS()` kills its own previous dns2socks instance before starting a new one, preventing two concurrent DNS proxies on restart.
-- **pinHostToEtcHosts ISP bypass** — Host pinner uses a direct resolver (bypassing `/etc/resolv.conf`) and rejects private/bogon IPs from ISP DNS interception. Called before engine start, not after.
-- **verifyConnection false positive** — Tests `gstatic.com`, `msftconnecttest.com`, and `captive.apple.com` instead of `cp.cloudflare.com`. CDN-based VLESS proxies (Cloudflare edge) always answered the old check from their own edge, giving a false success for non-working proxies.
-- **xray geosite guard** — `xrayGeositeAvailable()` checks for `geosite.dat` before adding the `geosite:ir` rule. Previously, if the file was missing (e.g. Orange Pi without xray system package), xray crashed with "code not found in geosite.dat: IR" and never started.
-- **xray domainStrategy** — Changed from `AsIs` to `IPIfNonMatch` for correct `geoip:ir` matching in proxy mode. With `AsIs`, domains were never resolved so `geoip:ir` never fired and Iranian sites (e.g. samandehi.ir) went through the tunnel. Now dns2socks resolves via the tunnel → real IPs → correct routing.
-- **systemd crash loop** — `install.sh` adds `StartLimitIntervalSec=0` to `[Unit]` so bypath never enters systemd "failed" state. `PrivateTmp=false` allows engine binaries in `/opt/bypath/engines/` to be reached.
-- **sub update while running** — `bypath sub update` detects if bypath is active and routes the HTTP request through the local SOCKS proxy, avoiding the stale `resolv.conf → 127.0.0.1` that would otherwise block reaching the subscription URL.
-
-### Improvements
-- **bench tests all groups** — `bypath bench` (without `-g`) now tests every group, shows per-group results, and selects the best server across all groups. Previously it only tested the first group.
-- **cmdRun retry loop** — `bypath run` retries every 30 s on engine failure instead of `log.Fatalf`, preventing systemd from immediately entering "failed" state when no servers are reachable.
-
-## v2.5.7 (2026-06-04)
-
-### Bug Fixes
-- **xray DNS poisoning (native TUN)** — `domainStrategy` changed from `IPIfNonMatch` to `AsIs`. Iranian ISPs poison DNS (e.g. `youtube.com → 10.10.34.36`); with `IPIfNonMatch`, that fake private IP was routed direct to the censorship server. With `AsIs`, domains are never resolved locally before routing.
-- **xray VLESS/WS** — Added `wsSettings` with `host` header to xray outbound config; added `allowInsecure: true` to `tlsSettings`. Previously missing, causing WS transport connections to fail.
-- **xray geoip** — Replaced `geoip:private` rule with explicit RFC1918 ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`). Standalone xray does not include `geoip:private` in its built-in database.
-- **Engine detection** — `detectEngines()` in `bypath version` now resolves the `engines/` directory relative to the binary path (via `os.Executable()`). Previously used `./engines/` (CWD-relative), so xray appeared as "not found" in installed mode even when present at `/opt/bypath/engines/xray`.
-- **Multiple instances** — Pidfile now uses atomic `O_EXCL` creation + `syscall.Signal(0)` liveness check. A `nil` dereference bug caused the stale-PID check to always fail, allowing multiple concurrent daemon instances.
-- **API version** — `/api/v1/status` endpoint now returns the real build version instead of hardcoded `"2.0.0"`.
-- **VLESS fingerprint** — Non-reality VLESS TLS was missing `utls`/`fingerprint` support in `BuildSingboxOutbound`. Fixed; property test now covers both reality and standard-TLS fingerprint paths.
-
-### Improvements
-- **`singboxOutbounds` refactor** — Removed ~200 lines of duplicated protocol switch; now delegates to `BuildSingboxOutbound` and adds tag + chain proxy logic.
-- **`install.sh`** — Downloads `geoip.dat`/`geosite.dat` for xray engine if xray is installed but geo data is missing. Fixed `/dev/tty` access in non-interactive (piped curl) installs.
-
-## v2.5.5 (2026-06-03)
-
-### Bug Fixes
-- **Legacy mode DNS poisoning** — In legacy mode (`native_tun: false`), `setupRouting()` now sets `/etc/resolv.conf` to `127.0.0.1` (dns2socks) so processes on the gateway host itself get unblocked DNS. Previously `8.8.8.8` was used directly, which returns poisoned IPs (e.g. `10.10.34.36`) for blocked sites in Iran, causing xray to route them direct via `geoip:ir` instead of through the tunnel.
-- **Chicken-and-egg DNS bootstrap** — Before switching `resolv.conf`, the tunnel server's hostname is pre-resolved and pinned to `/etc/hosts` (tagged `# bypath-pin`). This ensures xray can connect to its server even after DNS is redirected through itself. Entries are cleaned up on `bypath stop`.
-- **systemd-networkd overwriting resolv.conf** — After writing `resolv.conf`, `chattr +i` makes the file immutable so `systemd-networkd` and `dhclient` cannot overwrite it while bypath is running. Removed on cleanup.
-- **xray bypass_domains not working** — `domainStrategy` in xray routing was `IPOnDemand`, which resolves domains to IPs before routing — so domain-based bypass rules never matched. Changed to `AsIs` so SNI-sniffed domain names are matched against bypass rules first.
-
-## v2.5.4 (2026-06-02)
-
-### Features
-- **DNSUpstream config** — `gateway.dns_upstream` config field is now passed through to `ConfigGenerator`, enabling custom upstream DNS servers in generated tunnel configs
-
-### Improvements
-- **Code cleanup** — Removed dead code from `internal/tui/bench.go`: unused `benchModel` Tea interface, `testRelayXray()`, `testUpload()`, `sortMode` type and constants (bench UI is embedded in main TUI model; xray bench was never called)
-- **Code cleanup** — Removed unused `makeRaw()` / `restoreTerminal()` helper functions from `cmd/bypath/main.go`
-- **Remove unused files** — Deleted stub/unused files: `internal/gateway/dhcp.go`, `internal/gateway/dns.go`, `internal/gateway/router.go`, `internal/health/health.go`, `internal/isolation/netns.go`
-
-## v2.5.3 (2026-06-01)
-
-### Bug Fixes
-- **Active link matching** — Fixed trailing whitespace in subscription link remarks causing `GetActiveLink()` to fail silently, falling back to wrong servers
-- **xray stop cleanup** — `bypath stop` now kills xray processes (previously only killed sing-box)
-- **sing-box 1.13 TUN** — Fixed `inet4_address` → `address` field and removed deprecated `sniff` from TUN inbound
-- **verifyConnection DNS** — Uses direct IP (`1.1.1.1`) instead of hostname to avoid DNS bootstrap race condition
-- **active link persistence** — Gateway now correctly loads active link from persisted group/remark
-
-### Features
-- **xray routing** — xray config now includes `geoip:ir` direct routing and bypass_domains support with sniffing
-- **xray DNS** — Added DNS section and sniffing to xray config for proper domain resolution
-- **Update download choice** — TUI self-update now asks "Direct / Over Bypath" before downloading
-- **Status IP fix** — Live status now uses `icanhazip.com` for IP detection (not affected by bypass_domains)
-- **bypass_domains configurable** — Removed hardcoded bypass_domains defaults; users configure in config.yaml
-
-### Improvements
-- **Build output** — Cross-compile output goes to `.tmp/` (gitignored)
-
-## v2.5.1 (2026-06-01)
-
-### Bug Fixes
-- **Updater variant match** — lite build now downloads lite asset, full downloads full (was always downloading full)
-- **Updater proxy retry** — if direct download fails, automatically retries via local SOCKS proxy (gateway connection)
-- **TUI server selection** — uses `systemctl restart` when running under systemd, prevents stale engine processes
-- **TUI gateway status** — properly detects running state via systemd + pgrep fallback
-
-## v2.5.0 (2026-06-01)
-
-### Features
-- **TUI paste support** — Fixed text input to accept pasted content (bracket paste / multi-character input). URIs and subscription URLs can now be pasted directly in TUI.
-- **TUI engine selector** — Toggle between sing-box and xray engines from Home tab. Shows current engine status.
-- **TUI auto start toggle** — Shows systemd enabled/disabled status, toggle with one click.
-- **TUI self-update** — Real-time progress bar download, confirm dialog (Yes/No with arrow keys), auto-restart into new version after update.
-- **TUI exit button** — Added Exit item to Home tab.
-- **TUI group delete** — Press `x` in Servers tab to delete a group (with confirmation).
-- **TUI bench sort** — Press `f` to toggle sort order (fastest first / slowest first). Failed links always at bottom.
-- **TUI update notification** — Yellow highlight on "Update Bypath" when update available, changelog link in footer.
-- **Subscription proxy support** — `FetchSubscription` now respects `ALL_PROXY`/`HTTPS_PROXY` environment variables with socks5 support.
-- **Self-update with download** — `bypath update` now downloads and installs the new binary with progress bar. Supports proxy via environment variables.
-
-### Bug Fixes
-- **install.sh pipe fix** — `read` prompts now use `</dev/tty` so `curl | bash` one-liner works interactively.
-- **sing-box 1.13 compatibility** — Fixed DNS server format (new `type`/`server`/`server_port` format), removed deprecated `independent_cache` and `dns.listen`, added `route.default_domain_resolver`, DNS inbound as separate listener.
-- **Geosite file check** — Rule sets only referenced when `.srs` file actually exists on disk, preventing sing-box crash.
-- **xray Reality config** — Fixed vless Reality generation for xray (`security: "reality"` + `realitySettings` with publicKey/shortId/fingerprint).
-- **xray socks5 outbound** — Added socks5/http protocol support to xray config generation.
-- **xray xhttp transport** — Added xhttp/splithttp transport support for xray bench and config.
-- **XHTTP subscriptions (real fix)** — Parser now keeps `mode`/`extra`/`x_padding_bytes`; xray emits full `xhttpSettings`; engine auto-prefers **xray** for `type=xhttp` (sing-box cannot run these). Fixes sudo/sudonetwork-style subs that work in v2rayN but failed on bypath.
-- **TUI status detection** — Gateway status now checks multiple PID file paths + `pgrep` fallback for systemd-started processes.
-- **TUI bench selection** — Fixed: selecting a link from sorted bench results now picks the correct server (not wrong index).
-- **Bench DNS config** — Added proper DNS section and `default_domain_resolver` to bench sing-box configs for 1.13 compatibility.
-- **Bench reality fields** — Bench now reads `reality_pbk`, `reality_sid`, `fingerprint` from profile for proper relay testing.
-
-### Improvements
-- **Bench always uses sing-box** — Speed test uses sing-box regardless of engine preference (better protocol compatibility).
-- **Bench timeout increased** — 20s total, 6s port wait, 8s curl connect for slow reality links.
-
-## v2.4.3 (2026-06-01)
-
-### Improvements
-- **Expanded test coverage** — Added comprehensive tests for `internal/config` (YAML parsing, defaults, edge cases) and `internal/tunnel/configgen` (all protocols, Reality, chains, SNI spoofing).
-- **Documentation migrated to wiki** — Moved `knowledge/` content (API, architecture, configuration, deployment) to `.wiki/` for GitHub Wiki publishing. Removed stale markdown docs from repo.
-- **README cleanup** — Streamlined README with links to wiki instead of inline docs.
-- **Gitignore updates** — Added `.kiro/` and cleaned up patterns.
-
-## v2.4.2 (2026-05-31)
-
-### Features
-- **Reality support** — Full VLESS Reality parsing with `public_key`, `short_id`, and `fingerprint` (uTLS). Both `buildOutbound()` and `singboxOutbounds()` now generate correct Reality TLS config.
-- **SSH tunnel protocol** — Native SSH dynamic port forwarding as a proxy protocol. Parse `ssh://` URIs, bench via `ssh -D`, no sing-box needed.
-- **Multi-hop chains** — `bypath chain add/remove/list` CLI commands. Chain config stored in YAML, tunnel orchestration via `internal/tunnel/chain.go`.
-- **CDN/HTTPS detection** — Bench now tests HTTPS connectivity per link. Links marked `[CDN]` or `[HTTPS✗]` in list output. `SelectBest()` prefers HTTPS-capable links.
-- **SNI spoofing config** — `sni_spoof` section in config for DPI bypass with fake Iranian SNI.
-- **Geosite domain whitelist** — Download and validate geosite `.srs` files per country. Integrated into gateway startup.
-- **Chain CLI** — `bypath chain add <name> <hop1> [hop2...] [--auto-start]`, `chain remove`, `chain list`.
-
-### Improvements
-- Bench results now show HTTPS column (✓/✗/—)
-- `select` command warns if chosen link is CDN-based
-- `buildOutbound()` handles SSH protocol gracefully (returns direct outbound)
-- Bench timeout increased to 20s, SSH bench uses `sshpass` for password auth
-- Profile `HTTPSCapable` field persisted after bench
-
-### Housekeeping
-- Removed `.kiro/` from git tracking (added to `.gitignore`)
-- Removed dead kiro spec files from repository
-
-## v2.3.0 (2026-05-29)
-
-### Features — TUI Redesign
-- **Tab-based UI** — Three tabs: Home, Servers, Subscriptions. Navigate with `tab`/`shift+tab`.
-- **Servers tab** — Browse all groups, switch with `0-9`, select server with `enter`, ping with `t`, bench group with `b`, create new group with `n`.
-- **Subscriptions tab** — View all subs, `enter` to update single sub, `r` to rename group, `d` to delete, `u` to update all.
-- **Speed Test improvements** — No longer auto-starts. Press `s` to start. Switch groups with `tab`. Press `r` to retest.
-- **Active link display** — Header shows current active server and connection status (running/stopped).
-- **Group management** — Create groups from TUI, rename groups, groups shown with numbered shortcuts.
-
-### Features — Proxy & Protocol
-- **SOCKS5 as outbound** — Add upstream SOCKS5 proxies: `bypath add 'socks5://host:port#name'`
-- **HTTP proxy as outbound** — Add upstream HTTP proxies: `bypath add 'http://user:pass@host:port#name'`
-- **HTTP proxy inbound** — Separate HTTP proxy port (default 8888) in addition to SOCKS5 on 2801. Configurable via `server.http_proxy_port` in config.
-- **Default group protection** — `sub add` without `-g` auto-creates a named group from URL domain. Default group reserved for manual links only.
-- **Engine selection** — Choose between sing-box and xray via `engines.preferred` in config.
-- **SNI Spoofing** — Replace real SNI with a fake Iranian domain to bypass DPI. Configure via `sni_spoof` in config.
-
-### Features — Security & Reliability
-- **API authentication** — Token-based auth via `Authorization: Bearer <token>` or `X-API-Key` header. Configure with `server.api_token` in config. Empty = no auth (backward compatible).
-- **PID file management** — Gateway writes PID to `bypath.pid`. `stop` command uses PID file instead of `pkill`. Prevents duplicate instances.
-- **Subscription removal** — `bypath sub remove <index>` CLI command + TUI support.
-
-### Fixes
-- **Race condition in TUI** — Update check now uses `tea.Cmd` instead of raw goroutine (was writing to model without synchronization).
-- **Gateway fallback group** — Fallback now searches the active link's group, not hardcoded "default".
-- **Skip info links** — Links with port<10 or address 0.0.0.0 are skipped in bench, fallback, and list.
-- **SNI comma-separated fix** — `configgen.go` now takes first SNI from comma-separated lists (matches bench behavior).
-- **TLS insecure for vless** — Added `insecure: true` to vless TLS config (required for CDN-based links with mismatched certificates).
-- **DNS circular dependency** — Removed `detour: direct` from DNS config that caused sing-box 1.13 startup failure. DNS now resolves without detour.
-- **Whitelist with proxy mode** — Route section with sniff+resolve via direct DNS enables geoip matching for SOCKS5 clients. IR sites go direct.
-- **Verify connection** — Changed from `ip-api.com` to `cp.cloudflare.com` with `socks5h://` (DNS through proxy). Added 2s delay after engine start.
-- **`sub update` without `-g`** — Now updates ALL groups with subscriptions, not just default.
-- **`list` without `-g`** — Shows all groups with their links, info links filtered out.
-- **`select -g <group>`** — Select by number within a specific group.
-
-### Config Changes
-```yaml
-server:
-  api_token: ""           # NEW: API authentication token
-  http_proxy_port: 8888   # NEW: Separate HTTP proxy port
-
-engines:
-  preferred: ""           # NEW: "sing-box" or "xray" (empty = auto)
-
-sni_spoof:                # NEW: SNI spoofing for DPI bypass
-  enabled: false
-  sni: "digikala.com"
-```
-
-## v2.2.0 (2026-05-29)
-
-### Features
-- **Proxy mode whitelist** — Iranian sites now go direct even when using SOCKS5 proxy (not just gateway mode). Uses sing-box sniff + resolve via clean DNS + geoip-ir rule_set.
-- **TUI update notification** — Main menu shows update banner when a new version is available.
-- **Docker support** — Full Dockerfile with sing-box + tun2socks pre-installed. `docker compose up` and go.
-- **Docker integration test** — E2E test that builds both lite and full from scratch, installs deps, adds subscription, fetches links, selects server, starts gateway.
-- **Auto-release on main** — Every push to main creates a dev release with binaries for all platforms.
-- **Full build for all platforms** — linux (amd64/arm64/arm/mipsle), windows, darwin (amd64/arm64).
-
-### Fixes
-- **sing-box 1.13 compatibility** — Removed deprecated inbound sniff fields, use route actions instead. Added env vars for deprecated DNS format. Fixed geoip rule_set to use local .srs files (avoids GitHub download at startup which fails in Iran).
-- **IPv6 vet warning** — Fixed `fmt.Sprintf("%s:%d")` to use `net.JoinHostPort` in bench.
-- **CI Go version** — Use `go-version-file: go.mod` instead of hardcoded version.
-- **`.gitignore` fix** — `build/` pattern was ignoring `internal/build/` package.
-- **tun2socks download URL** — Updated to v2.5.2 zip format.
-- **Version comparison** — Proper semver comparison instead of string compare.
-
-### Removed (dead code cleanup)
-- `internal/whitelist/fetcher.go` — Legacy CIDR fetcher, replaced by sing-box geoip rule_set.
-- `whitelist.Manager.Load()` — No longer needed with sing-box routing.
-- `gateway.getNextLink()` — Unused helper, fallback logic is inline.
-- `configgen.dnsRuleSetTags()` — Duplicate of inline logic.
-- `sortByDownload` constant — Bench download test not yet implemented.
-- Custom `contains()`/`containsHelper()` in tests — Replaced with `strings.Contains`.
-
-## v2.1.0 (2026-05-28)
-
-### Initial public release
-- Network gateway that transparently routes LAN traffic through encrypted tunnels.
-- Zero-config for clients (just set DNS/GW).
-- Country whitelist (IR traffic bypasses tunnel via sing-box geoip).
-- Multi-protocol support: VMess, VLESS, Trojan, Shadowsocks, WireGuard.
-- Subscription support (add URL, auto-fetch links).
-- Parallel speed test with auto-select best server.
-- Interactive TUI (bubbletea).
-- Auto-fallback if a link fails.
-- REST API on :8080.
-- CLI: run, stop, add, list, select, bench, sub, test, engines, update.
+- `go vet ./...` and `go test ./...` were green in local runs at `689759e`.
+  Public CI has not yet run at this commit. The guard lifecycle has unit and
+  fault-injection suites; its real-iptables tests skip unless run as root in a
+  disposable namespace with `BYPATH_GUARD_IPTABLES=1`, which the CI test job
+  does not do.
+- The ARMv7 Lite hardware acceptance was performed on `928d993`; the later
+  implementation commits (`f6a615f`, `689759e`) are CLI/test-only and were
+  verified by unit tests, including mutation tests that suppress the selection
+  write. `ef73acd` and this documentation correction change no executable code.
+  No hardware re-run of the final artifact is claimed here.
+
+### Known issues carried forward
+
+- IPv6 gateway egress is not validated; forwarded IPv6 is dropped in gateway
+  mode.
+- The country split is refused for Xray; OpenVPN links require an external
+  sing-box 1.14+ binary.
+- The proxy listener has no client authentication.
+- ARMv7 and mipsle builds are published but the installer refuses them; install
+  by hand after verifying `SHA256SUMS`.
+- Windows and macOS builds carry no installer and no support claim.
+- Release assets are SHA-256 verified but not cryptographically signed.
+- rc.3 deferred items R3-01 (direct resolver reachability under native TUN),
+  R3-02 (native-TUN health-check false status), R3-03 (stale-pidfile exit) and
+  R3-04 (doctor port-53 false FAIL) are not recorded as fixed in this candidate.
+
+### Release scope
+
+The 21 implementation commits since `v3.0.0-rc.3`: `9148411`, `8df1837`,
+`d9daec0`, `5a9143a`, `7d4928b`, `fd7d1f2`, `c26bb4b`, `989990f`, `939ad4f`,
+`e7d59cd`, `ed47dee`, `50e20fb`, `255570e`, `9654670`, `d175a19`, `bb11c37`,
+`2916c1e`, `697648d`, `928d993`, `f6a615f`, `689759e`.
+
+The documentation-only commits after `689759e` are not implementation changes;
+with them the branch holds 23 commits at this review.
+
+## v3.0.0-rc.3 — pre-release
+
+Connectivity corrections for rc.2, built on the rc.2 tree. `main` and the rc.1/rc.2 tags are
+unchanged. Release candidate; the public tag is created from the reviewed export.
+
+### WebSocket links over TLS
+
+- A `ws` link that advertises `alpn=h2` (as some subscription providers do) no
+  longer offers HTTP/2. A WebSocket upgrade is HTTP/1.1 (RFC 6455); when the
+  server negotiated h2 the upgrade was rejected and every tunnelled request
+  failed with EOF even though TCP, DNS and the certificate were fine. Both the
+  sing-box and the Xray generator now negotiate `http/1.1` only for WebSocket
+  transports, and leave other transports' ALPN untouched.
+- Reproduced in the emulated ARM64 lab against a lab subscription fixture:
+  `alpn=h2` ended in EOF,
+  `alpn=http/1.1` returned HTTP 204 in 1.9 s. Regression test added.
+
+### Selecting the connection shown by `bypath list`
+
+- `bypath list` prints the display name (flag emoji stripped, provider prefix
+  removed, truncated); `bypath select` compared only the raw remark, so an
+  operator could not select the name that was shown. `select` now accepts the
+  displayed name when it identifies exactly one link, keeps an exact raw match
+  preferred, and refuses an ambiguous name with a pointer to the list index.
+
+### Embedded engine and uTLS
+
+- Full builds now compile sing-box with `with_utls` (Makefile, CI matrix and
+  the embed-tag job), so links with a uTLS fingerprint (`fp=chrome`) start the
+  embedded engine instead of failing and falling back to a downloaded binary.
+- A new engine test starts a synthetic VLESS+TLS+ws outbound with a fingerprint
+  and fails when the build lacks the tag, so a release tag set that drops
+  `with_utls` breaks CI instead of degrading at runtime.
+- The CI build step passes multi-word tag sets to `go build` as a single
+  argument.
+
+### Country split routing (opt-in)
+
+- `routing.country_split` makes one country's published domain list and IP
+  ranges go direct while every unmatched destination keeps the proxy default.
+  Empty keeps the shipped proxy-only policy; the panel and the API toggle it.
+- The panel plan and the generated engine config come from the same ordered
+  rule list. Geo coverage is engine-aware (sing-box `.srs` rule sets, Xray
+  `.dat` categories); enabling a split provisions its assets first and refuses
+  an unusable one, and an applied change is snapshot-backed and rolled back if
+  the restart fails.
+- The runtime gateway now passes the split to its config generator. Previously
+  the panel planned the split while the engine kept proxying every destination.
+
+### Split DNS, engine gating and geo assets (review remediation)
+
+- The country split is refused for OpenVPN profiles (DNS stays inside the
+  tunnel) in addition to Xray. The legacy tun2socks data path is untested with
+  the split.
+
+- **Correction of the earlier DNS claim.** The split's DNS behaviour for LAN
+  clients comes from the gateway's own DNS forwarder, not from the engine's
+  `dns-direct` routing. That forwarder used to resolve every name through the
+  tunnel, so domestic names stopped resolving during a tunnel outage even
+  though the split sent their connections direct. The new `gateway.direct_dns`
+  is the trusted resolver for names the plan sends `direct`; proxied names never
+  use it, a failure returns SERVFAIL instead of falling back to another path,
+  and the panel warns when a split has no direct resolver (in that case domestic
+  names still resolve through the tunnel and fail during an outage).
+- **Xray refuses the country split.** Xray's DNS module cannot route a resolver
+  through the tunnel, so the previous `proxyTag` design was a no-op that would
+  have disclosed domestic lookups to the tunnel resolver and proxied lookups to
+  a local one. Generation and apply now refuse the split on xray with that
+  reason, and the panel plan marks the split entries as skipped. The xray DNS
+  section is rebuilt around the tunnel resolver (first, `skipFallback`,
+  `disableFallback`) with no plaintext fallback for proxied names.
+- **Plan-order DNS classification.** The engine's resolve steps and the DNS
+  section now walk the same ordered rule list as the route: a proxy exception
+  above a DIRECT class keeps its name off the direct resolver, and a DIRECT
+  default resolves unmatched names domestically. The legacy whitelist path is
+  covered too.
+- **Xray routing corrections.** A DIRECT/deny/named default is expressed as an
+  all-addresses rule evaluated in the second `IPIfNonMatch` pass, so it no
+  longer hides geoip rules; every suffix list gets a `domain:` label boundary so
+  a look-alike host cannot match as a keyword; the tunnel resolver is pinned in
+  front of user rules; and generation refuses a plan where an unusable proxy or
+  deny geo asset would fall through to a DIRECT default.
+- **Staged policy visibility.** After a reload that still needs a restart, the
+  routing screen now reports `restart_required` with the pending fields instead
+  of presenting the saved policy as live.
+- **Pinned Xray databases.** `geoip.dat` and `geosite.dat` are downloaded from
+  immutable v2fly release tags and must match the SHA-256 published with that
+  release, under a size cap; a mismatch is refused and leaves the existing
+  asset in place.
+
+### Release contract
+
+- The installer's default variant is the full build; `--variant lite` selects the
+  lite build explicitly. Architectures without a published full build are refused
+  with that instruction.
+- Release assets are named `bypath-<variant>-<os>-<arch>` and listed in `SHA256SUMS`
+  (the installer verifies against that file). Version tags and `release/**`
+  branches run validation and stage the assets as a workflow artifact; they do not
+  publish. Publication is a manual step.
+- Release binaries take their BuildDate from the source commit time, so the same
+  commit produces the same binary.
+- Deferred to RC4 as documented limitations: direct resolver reachability under
+  native TUN (R3-01), the native-TUN health-check false status (R3-02), the silent
+  stale-pidfile exit (R3-03), and the doctor port-53 false FAIL (R3-04).
+
+### Validation
+
+- rc.3 final lab (2026-11-15, candidate `6cca71a`, gateway native TUN, single
+  NIC, `country_split: ir`, health check enabled at 60 s): domestic HTTPS
+  (`www.irna.ir`) stayed 200 and proxied HTTPS (`example.com`) failed closed
+  while the tunnel server was blocked; the uplink carried no packet to the
+  proxied destination. Engine SIGKILL: both failed until a manual restart,
+  about 12 s to recovery. Legacy tun2socks with the split matched native TUN.
+  This is lab evidence, not a field test.
+- Known issues: the native-TUN health check can report `DEGRADED` /
+  `EXIT_IS_UPLINK` on a healthy gateway; a stale pidfile makes `run` exit
+  silently with status 1; `bypath doctor` reports port 53 as in use while the
+  daemon itself is running. Domestic sites are unavailable while the engine is
+  down (fail-closed); systemd `Restart=on-failure` restarts the service, which
+  was not measured in the lab.
+
+- Native ARM64 proxy acceptance by an external tester (Raspberry Pi / DietPi):
+  HTTP 204 through the SOCKS5 listener, embedded engine running in-process, no
+  missing-uTLS error. Gateway Mode was not exercised by that proxy acceptance.
+- External native ARM64 beta report (REPORTED, not re-run here): proxy
+  connectivity, web panel access and Gateway startup with 11 doctor checks
+  passed; Iranian and international IP-check sites returned the same public IP,
+  the symptom the split policy addresses.
+- AMD64 lab (TESTED, sing-box, strict DNS): an Iranian domain and an Iranian IP
+  went direct while `example.com` used the tunnel, and SOCKS egress differed
+  from direct egress; disabling the split through the authenticated API removed
+  the split rules and proxied the Iranian site; rollback restored both.
+- Emulated ARM64 lab checks for the ALPN change and the embedded-engine start.
+
+## v3.0.0-rc.2 — pre-release
+
+Reliability corrections for rc.1, with the public tree based on the rc.1
+release (`3518bef`). `main` and the `v3.0.0-rc.1` tag are unchanged.
+
+### Exit identity and activation
+
+- First-run activation and `doctor --egress` use the multi-oracle health-proof
+  architecture instead of one hardcoded `api.ipify.org` request. Every identity
+  service is probed with a bounded timeout, and an unreachable identity service
+  is reported as UNVERIFIED rather than as a dead tunnel.
+- Tunnel connectivity is proven separately by non-Cloudflare data-path
+  endpoints when no identity service answers. Gateway activation is allowed in
+  that case with an explicit UNVERIFIED warning.
+- Still fail closed: a tunnel with no passing data path is refused, and an exit
+  that equals the host's direct address (including one inconsistent oracle
+  answer that matches it) is refused.
+- Added tests for blocked oracles, inconsistent answers, a reachable tunnel and
+  an actually failed tunnel.
+
+### Service persistence
+
+- New `bypath setup --enable-service`: after a verified start, enable the unit
+  at boot and verify `systemctl is-enabled` reports `enabled`.
+- The interactive wizard offers the same choice only after a start that reached
+  `CONNECTED` and passed the exit-identity check. Installation alone still never
+  enables or starts the unit.
+- INSTALL.md and installer output document start vs. enable vs. gateway mode.
+
+### DNS and installer reliability
+
+- Native TUN no longer points `/etc/resolv.conf` at `127.0.0.1` when the gateway
+  DNS listener uses a nonstandard port (which made host DNS, and therefore an
+  installer rerun, fail). With the systemd-resolved stub, a bypath-managed
+  drop-in forwards host DNS to `127.0.0.1:<port>` and is removed on stop.
+  Without the stub, host DNS is left untouched and the limitation is logged.
+- `systemd-resolved` and `dnsmasq` are no longer stopped when the gateway uses a
+  nonstandard port and there is no conflict.
+- The wizard warns that DHCP and standard client DNS settings cannot express a
+  port when 5335 (or another nonstandard port) is used.
+- Uninstall and `--purge` remove `/run/bypath-control` along with the runtime
+  directory, so no control socket survives.
+
+### Host DNS crash recovery
+
+- The bypath resolver override now lives in `/run/systemd/resolved.conf.d` and
+  is swept by the unit's `ExecStartPre`/`ExecStopPost`
+  (`bypath host-dns restore`). A stop, a failed start, SIGKILL and a supervised
+  restart all return the host to its own upstream; a reboot clears the `/run`
+  file even if the daemon never got to clean up.
+- The hook removes only a file whose content is exactly what bypath writes,
+  never touches an administrator's snippet, and steps aside when the gateway
+  listener is still answering so it cannot race a healthy instance. A legacy
+  drop-in left in `/etc/systemd/resolved.conf.d` by an earlier build is removed
+  as well.
+- `systemd-resolved` is still never disabled; only its upstream is redirected
+  while the gateway runs, and the restart is skipped during shutdown.
+
+## v3.0.0-rc.1 — pre-release
+
+First public release candidate. Pre-release: not a stable release, not marked
+"latest", and not production-ready for untested platforms.
+
+### Installation and first run
+
+- New version-pinned installer (`install.sh`) with host preflight: OS,
+  architecture, systemd, TUN, iptables/nftables, existing DNS services, port
+  conflicts, memory, disk, existing installation, interfaces and default route.
+- Downloads `bypath-linux-<arch>` and verifies it against the release
+  `SHA256SUMS` before installing. Refuses `latest` and non-exact tags.
+- Atomic install to `/opt/bypath/bypath` with the previous binary kept for
+  rollback. The systemd unit is written but not enabled or started.
+- `--dry-run`, `--non-interactive`, `--uninstall` (keeps configuration),
+  `--purge`, and `--rollback` are supported. Re-running the installer is
+  idempotent.
+- The installer never stops a resolver, rewrites `/etc/resolv.conf`, changes
+  routes, DHCP, the default gateway or the firewall, or opens a LAN listener
+  without an explicit answer.
+
+### First-run wizard (`bypath setup`)
+
+- Ten-step guided configuration: LAN interface, trusted client subnets, gateway
+  or proxy-only mode, proxy port, proxy listener, DNS, connection import,
+  selection and verification, management panel, review before activation.
+- Fresh configuration contains no connection, no subscription, no provider, no
+  credential, no assumed location and no preconfigured production DNS server.
+  The default routing rule is `default → proxy`.
+- Gateway mode is staged with `gateway.enabled: false` until a connection has
+  been verified. An empty full-tunnel gateway is never started.
+- The management API defaults to `127.0.0.1`. A LAN proxy bind requires explicit
+  trusted client CIDRs and Bypath's own firewall allow-list.
+- `--dry-run` prints the exact configuration that would be written, with the
+  API token redacted.
+
+### `bypath doctor`
+
+- New read-only diagnostic report covering: installation and service state,
+  configuration validity, engine availability and compatibility, TUN and
+  native-TUN, routing and fail-closed DNS policy, DNS service conflicts, trusted
+  LAN and firewall state, management API and panel exposure, proxy listener
+  reachability, connection configuration, and (with `--egress`) measured tunnel
+  egress versus the direct exit address.
+- `--json` emits a structured report; `-v` prints detail for every check.
+  Credentials, tokens, raw subscription URLs and unredacted link URIs are never
+  printed.
+
+### Web onboarding and controls
+
+- Empty-state onboarding in the panel: import a source, review the
+  auto-created group, select the next-start connection, understand verification
+  and inconclusive results, and read which surface exposes what.
+- Panels distinguish the loopback management UI, the internal management API and
+  the unauthenticated proxy listener, including the port each one uses.
+- Supervised service restart and proxy listener changes with staged, removable
+  operations.
+
+### Engines
+
+- Release builds (`-tags full`) embed sing-box 1.14.4 and the Xray-core library 26.3.27 (`v1.260327.0`); a managed external Xray binary is pinned to 26.10.31.
+- Managed engine and tun2socks downloads are pinned by version and SHA-256 and
+  fail closed on an unlisted platform.
+- Native TUN is preferred when the engine supports it. A failure to establish
+  native TUN is reported instead of silently switching to a legacy datapath.
+- OpenVPN profile import validates the profile, inlines referenced certificate
+  and key files, confines file references to the profile directory, removes
+  credential files from the profile, and rejects directives that execute code
+  or change host state.
+
+### Routing
+
+- Rule-based routing supports `geoip:`, `geosite:`, `domain`,
+  `domain_suffix`, `ip_cidr` and `default` matchers.
+- Routing edits warn when a direct rule and a tunnel rule overlap, because the
+  overlap changes where the traffic exits. Warnings no longer assume a country
+  or a geographic location.
+- Legacy whitelist configuration still loads, with a deprecation notice.
+
+### Security and privacy
+
+- No provider account, profile, certificate, key, subscription address or
+  personal credential ships in the source tree, configuration defaults, tests,
+  fixtures, documentation or release assets.
+- Documentation and fixtures use documentation IP ranges (RFC 5737) and
+  `.example` domains.
+- The public source tree and history are independently audited; the release
+  branch does not inherit the private development history.
+
+### Known limitations
+
+- IPv6 gateway egress is not validated; forwarded IPv6 is dropped in gateway
+  mode.
+- Supported release targets are Linux amd64 and Linux arm64. arm64 validation by
+  the project was performed in an emulated environment; an external tester's
+  native proxy-mode acceptance of the earlier a20c705 candidate is REPORTED, not
+  re-run and not of this build.
+- Country routing needs external geo data from the v2fly release feeds, which
+  are not hash-pinned in this pre-release.
+- OpenVPN links require an external sing-box 1.14+ binary.
+- The proxy listener has no client authentication.

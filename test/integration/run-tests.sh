@@ -1,261 +1,119 @@
 #!/bin/bash
-# Integration tests for bypath — designed to never crash mid-run.
-# All commands are wrapped to catch errors gracefully.
+# Clean-container smoke test. Runs without a provider, a connection or network
+# access to any private service. Every check is read-only except for the
+# configuration written under /tmp by the wizard.
+set -u
 
 PASS=0
 FAIL=0
-TOTAL=0
 
-pass() {
-    PASS=$((PASS + 1))
-    TOTAL=$((TOTAL + 1))
-    echo "  ✅ PASS: $1"
-}
+pass() { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$1"; }
+fail() { FAIL=$((FAIL + 1)); printf '  FAIL  %s — %s\n' "$1" "$2"; }
 
-fail() {
-    FAIL=$((FAIL + 1))
-    TOTAL=$((TOTAL + 1))
-    echo "  ❌ FAIL: $1 — $2"
-}
-
-check_output() {
-    local desc="$1"
-    local expected="$2"
+expect_contains() { # label, needle, command...
+    local label="$1" needle="$2"
     shift 2
     local output
-    output=$("$@" 2>&1) || true
-    if echo "$output" | grep -qi "$expected"; then
-        pass "$desc"
+    output="$("$@" 2>&1)"
+    if printf '%s' "$output" | grep -qF -- "$needle"; then
+        pass "$label"
     else
-        fail "$desc" "expected '$expected', got: $(echo "$output" | head -3 | tr '\n' ' ')"
+        fail "$label" "'$needle' not found in: $(printf '%s' "$output" | head -n 3 | tr '\n' ' ')"
     fi
 }
 
-# Test subscription URL (real sub for e2e)
-SUB_URL="${TEST_SUB_URL:-https://ydsub.info/a5632b34940d962a33d263e3eb69262b3ed3da8defdf2b7962166a05dd2e07795c86a41305c44cf7d496166b2dd66259}"
+echo "== binaries =="
+expect_contains "lite build runs" "bypath" /opt/bypath/bypath version
+expect_contains "full build runs" "bypath" /opt/bypath/bypath-full version
 
-# Test VLESS link (for manual add test)
-TEST_VLESS="vless://uuid-test@example.com:443?type=ws&security=tls&sni=example.com&path=/vless#test-server"
-
-echo ""
-echo "╔══════════════════════════════════════════════╗"
-echo "║   Bypath Integration Tests                  ║"
-echo "║   Clean OS → Install → Configure → Run      ║"
-echo "╚══════════════════════════════════════════════╝"
-echo ""
-
-# ============================================================
-run_variant_test() {
-    local VARIANT="$1"
-    local BIN="$2"
-    local WORKDIR="/tmp/bypath-${VARIANT}-test"
-
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  ${VARIANT^^} BUILD — Full E2E"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-    # --- Full cleanup ---
-    rm -rf "$WORKDIR" /etc/bypath /var/log/bypath /tmp/bypath-*
-    mkdir -p "$WORKDIR/logs"
-    mkdir -p /etc/bypath/profiles /etc/bypath/geo /var/log/bypath /opt/bypath/engines
-
-    # Copy sing-box to engines dir
-    cp /usr/local/bin/sing-box /opt/bypath/engines/sing-box 2>/dev/null || true
-
-    # Write config (no whitelist — no geoip file needed)
-    cat > /etc/bypath/config.yaml << 'EOF'
-server:
-  api_port: 8080
-  dns_port: 5353
-  socks_port: 2801
-gateway:
-  enabled: true
-  interface: ""
-  dns_upstream:
-    - "1.1.1.1"
-    - "8.8.8.8"
-whitelist:
-  countries: []
-isolation:
-  enabled: false
-profiles:
-  directory: "/etc/bypath/profiles"
-  active_group: "default"
-engines:
-  directory: "/opt/bypath/engines"
-  prefer_system: true
-EOF
-
-    # --- 1. Binary check ---
-    if [ -x "$BIN" ]; then
-        pass "${VARIANT}: binary exists and executable"
-    else
-        fail "${VARIANT}: binary not found" "$BIN"
-        return
-    fi
-
-    # --- 2. Version & variant ---
-    check_output "${VARIANT}: version shows Bypath" "Bypath" "$BIN" version
-    check_output "${VARIANT}: correct variant" "$VARIANT" "$BIN" version
-
-    # --- 3. Help ---
-    check_output "${VARIANT}: help works" "Usage:" "$BIN" help
-
-    # --- 4. Engines detected ---
-    check_output "${VARIANT}: sing-box detected" "sing-box" "$BIN" version
-
-    # --- 5. Add subscription ---
-    OUTPUT=$("$BIN" sub add "$SUB_URL" 2>&1) || true
-    if echo "$OUTPUT" | grep -qi "added\|Subscription"; then
-        pass "${VARIANT}: sub add"
-    else
-        fail "${VARIANT}: sub add" "$(echo "$OUTPUT" | head -2 | tr '\n' ' ')"
-    fi
-
-    # --- 6. Update subscription (fetch links) ---
-    OUTPUT=$("$BIN" sub update 2>&1) || true
-    if echo "$OUTPUT" | grep -qi "Got.*links\|[0-9]* links"; then
-        LINK_COUNT=$(echo "$OUTPUT" | grep -oE '[0-9]+ links' | head -1 | grep -oE '[0-9]+')
-        pass "${VARIANT}: sub update (${LINK_COUNT:-?} links)"
-    else
-        # Sub update might fail in CI (network), still pass if sub was added
-        if [ -f /etc/bypath/profiles/*.json ] 2>/dev/null; then
-            pass "${VARIANT}: sub update (skipped — network issue in CI)"
-        else
-            fail "${VARIANT}: sub update" "$(echo "$OUTPUT" | head -2 | tr '\n' ' ')"
-        fi
-    fi
-
-    # --- 7. List links ---
-    OUTPUT=$("$BIN" list 2>&1) || true
-    if echo "$OUTPUT" | grep -qi "vless\|vmess\|trojan\|ss\|socks5\|links"; then
-        pass "${VARIANT}: list shows links"
-    else
-        fail "${VARIANT}: list" "$(echo "$OUTPUT" | head -3 | tr '\n' ' ')"
-    fi
-
-    # --- 8. Add manual vless link ---
-    OUTPUT=$("$BIN" add "$TEST_VLESS" 2>&1) || true
-    if echo "$OUTPUT" | grep -qi "Added"; then
-        pass "${VARIANT}: add vless link"
-    else
-        fail "${VARIANT}: add vless link" "$(echo "$OUTPUT" | head -2 | tr '\n' ' ')"
-    fi
-
-    # --- 9. Select a server ---
-    OUTPUT=$("$BIN" select 1 2>&1) || true
-    if echo "$OUTPUT" | grep -qi "Active link"; then
-        pass "${VARIANT}: select server"
-    else
-        # Try selecting from the subscription group
-        GROUPS=$("$BIN" list 2>&1 | grep -oE '━━ \S+' | awk '{print $2}') || true
-        SELECTED=false
-        for G in $GROUPS; do
-            OUTPUT=$("$BIN" select 1 -g "$G" 2>&1) || true
-            if echo "$OUTPUT" | grep -qi "Active link"; then
-                pass "${VARIANT}: select server (group: $G)"
-                SELECTED=true
-                break
-            fi
-        done
-        if [ "$SELECTED" = false ]; then
-            fail "${VARIANT}: select server" "$(echo "$OUTPUT" | head -2 | tr '\n' ' ')"
-        fi
-    fi
-
-    # --- 10. Run gateway (start engine, verify SOCKS port) ---
-    echo "  ⏳ Starting gateway..."
-    "$BIN" run > "$WORKDIR/logs/run.log" 2>&1 &
-    RUN_PID=$!
-
-    # Wait for engine to start (max 15s)
-    SOCKS_UP=false
-    for i in $(seq 1 15); do
-        if grep -q "running on :2801\|Gateway running\|Bypath running" "$WORKDIR/logs/run.log" /var/log/bypath/error.log 2>/dev/null; then
-            SOCKS_UP=true
-            break
-        fi
-        sleep 1
-    done
-
-    if [ "$SOCKS_UP" = true ]; then
-        pass "${VARIANT}: engine started (SOCKS5 :2801)"
-    else
-        # Check if it at least attempted to start
-        if grep -q "Starting engine\|starting\|Network:" "$WORKDIR/logs/run.log" /var/log/bypath/error.log 2>/dev/null; then
-            pass "${VARIANT}: engine attempted start (link unreachable in CI)"
-        else
-            LOG_TAIL=$(tail -5 "$WORKDIR/logs/run.log" 2>/dev/null; tail -5 /var/log/bypath/error.log 2>/dev/null)
-            fail "${VARIANT}: engine start" "$(echo "$LOG_TAIL" | tr '\n' ' ' | head -c 200)"
-        fi
-    fi
-
-    # --- 11. Test SOCKS5 connectivity ---
-    if [ "$SOCKS_UP" = true ]; then
-        CURL_OUT=$(curl -sf --connect-timeout 8 -x socks5h://127.0.0.1:2801 http://ip-api.com/json 2>&1) || true
-        if echo "$CURL_OUT" | grep -q "query"; then
-            EXIT_IP=$(echo "$CURL_OUT" | jq -r '.query' 2>/dev/null)
-            COUNTRY=$(echo "$CURL_OUT" | jq -r '.country' 2>/dev/null)
-            pass "${VARIANT}: tunnel connected (exit: ${EXIT_IP} / ${COUNTRY})"
-        else
-            pass "${VARIANT}: SOCKS5 port up (outbound unreachable in CI — expected)"
-        fi
-    fi
-
-    # --- 12. Stop ---
-    kill $RUN_PID 2>/dev/null || true
-    wait $RUN_PID 2>/dev/null || true
-    sleep 1
-    pass "${VARIANT}: clean shutdown"
-
-    # --- 13. Binary size ---
-    SIZE=$(stat -c%s "$BIN" 2>/dev/null || stat -f%z "$BIN" 2>/dev/null || echo 0)
-    SIZE_MB=$((SIZE / 1048576))
-    MAX_SIZE=30000000
-    [ "$VARIANT" = "full" ] && MAX_SIZE=60000000
-    if [ "$SIZE" -gt 0 ] && [ "$SIZE" -lt "$MAX_SIZE" ]; then
-        pass "${VARIANT}: binary size (${SIZE_MB}MB)"
-    else
-        fail "${VARIANT}: binary size" "${SIZE_MB}MB"
-    fi
-
-    echo ""
-}
-
-# ============================================================
-# RUNTIME DEPS
-# ============================================================
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  RUNTIME DEPENDENCIES"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-for bin in sing-box tun2socks iptables ip curl jq; do
-    if command -v "$bin" > /dev/null 2>&1; then
-        pass "dep: $bin"
-    else
-        fail "dep: $bin" "not in PATH"
-    fi
-done
-echo ""
-
-# ============================================================
-# RUN TESTS FOR BOTH VARIANTS
-# ============================================================
-run_variant_test "lite" "/usr/local/bin/bypath-lite"
-run_variant_test "full" "/usr/local/bin/bypath-full"
-
-# ============================================================
-# SUMMARY
-# ============================================================
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-printf "  RESULTS: %d passed, %d failed, %d total\n" "$PASS" "$FAIL" "$TOTAL"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-
-if [ "$FAIL" -gt 0 ]; then
-    echo "❌ SOME TESTS FAILED"
-    exit 1
+echo "== neutral first run =="
+CONFIG=/tmp/bypath-test/config.yaml
+mkdir -p /tmp/bypath-test
+if /opt/bypath/bypath-full setup --non-interactive --config "$CONFIG" \
+        --mode proxy --listen localhost --socks-port 2801 --web off >/tmp/setup.log 2>&1; then
+    pass "wizard writes a proxy-only configuration"
+else
+    fail "wizard writes a proxy-only configuration" "$(tail -n 3 /tmp/setup.log | tr '\n' ' ')"
 fi
 
-echo "✅ ALL TESTS PASSED"
+if [ -f "$CONFIG" ]; then
+    if grep -qiE 'airvpn|subscription|provider' "$CONFIG"; then
+        fail "configuration carries no provider or subscription" "unexpected provider field"
+    else
+        pass "configuration carries no provider or subscription"
+    fi
+    if grep -qE 'enabled: false' "$CONFIG"; then
+        pass "gateway is disabled by default"
+    else
+        fail "gateway is disabled by default" "gateway.enabled is not false"
+    fi
+else
+    fail "configuration exists" "$CONFIG was not written"
+fi
+
+echo "== doctor =="
+expect_contains "doctor reports proxy/listener state" "proxy" \
+    /opt/bypath/bypath-full doctor --config "$CONFIG" --json
+expect_contains "doctor names the config path" "$CONFIG" \
+    /opt/bypath/bypath-full doctor --config "$CONFIG" --json
+
+echo "== no service taken over =="
+if /opt/bypath/bypath-full status >/tmp/status.log 2>&1; then
+    fail "status without a daemon is not success" "status exited 0 with no daemon"
+else
+    pass "status without a daemon reports failure instead of pretending"
+fi
+
+echo "== setup --dry-run never installs packages =="
+# A recording apt-get: any invocation leaves a trace, so its absence proves the
+# dry run executed nothing even with package installation approved.
+cat >/usr/local/bin/apt-get <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>/tmp/apt-calls
 exit 0
+EOF
+chmod 0755 /usr/local/bin/apt-get
+rm -f /tmp/apt-calls
+DRY=/tmp/bypath-dry/config.yaml
+mkdir -p /tmp/bypath-dry
+/opt/bypath/bypath-full setup --non-interactive --dry-run --install-packages --config "$DRY" \
+    --mode gateway --interface eth0 >/tmp/dry.log 2>&1
+rc=$?
+if [ -e /tmp/apt-calls ]; then
+    fail "dry run with --install-packages runs no apt-get" "$(tr '\n' ' ' </tmp/apt-calls)"
+else
+    pass "dry run with --install-packages runs no apt-get"
+fi
+if [ -e "$DRY" ]; then fail "dry run writes no configuration" "$DRY exists"; else pass "dry run writes no configuration"; fi
+if [ "$rc" -ne 0 ] && grep -qF "a real run would execute" /tmp/dry.log; then
+    pass "dry run previews the approved install and exits non-zero"
+else
+    fail "dry run previews the approved install and exits non-zero" "rc=$rc $(tr '\n' ' ' </tmp/dry.log | cut -c1-300)"
+fi
+# With a connection the preview runs to the end and still refuses to claim success.
+/opt/bypath/bypath-full setup --non-interactive --dry-run --install-packages --config "$DRY" \
+    --mode gateway --interface eth0 --uri "socks5://192.0.2.10:1080#doc" >/tmp/dry.log 2>&1
+rc=$?
+if [ "$rc" -ne 0 ] && grep -qF "real run would stop at the gateway prerequisites" /tmp/dry.log \
+        && grep -qF "nothing was written, installed, imported or started" /tmp/dry.log \
+        && [ ! -e /tmp/apt-calls ] && [ ! -e "$DRY" ]; then
+    pass "full dry-run preview ends with the prerequisite verdict and changes nothing"
+else
+    fail "full dry-run preview ends with the prerequisite verdict and changes nothing" "rc=$rc $(tail -n 3 /tmp/dry.log | tr '\n' ' ')"
+fi
+/opt/bypath/bypath-full setup --non-interactive --install-packages --config "$DRY" \
+    --mode gateway --interface eth0 >/tmp/real.log 2>&1
+if grep -qF "install -y" /tmp/apt-calls 2>/dev/null; then
+    pass "control: the same command without --dry-run does reach apt-get"
+else
+    fail "control: the same command without --dry-run does reach apt-get" "$(tail -n 3 /tmp/real.log | tr '\n' ' ')"
+fi
+if [ -e "$DRY" ]; then fail "unsatisfied prerequisites write no configuration" "$DRY exists"; else pass "unsatisfied prerequisites write no configuration"; fi
+rm -f /usr/local/bin/apt-get /tmp/apt-calls
+
+# Installer checks replace /opt/bypath/bypath, so they run last.
+. /installer-tests.sh
+
+echo
+echo "passed: $PASS  failed: $FAIL"
+[ "$FAIL" -eq 0 ]

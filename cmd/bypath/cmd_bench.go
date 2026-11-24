@@ -3,403 +3,363 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"net"
-	"os"
-	"os/exec"
-	"path/filepath"
+	"io"
+	"sort"
 	"strings"
-	"sync"
-	"time"
 
+	"github.com/liberoute/bypath/internal/bench"
+	"github.com/liberoute/bypath/internal/config"
+	"github.com/liberoute/bypath/internal/paths"
 	"github.com/liberoute/bypath/internal/profile"
-	"github.com/liberoute/bypath/internal/tunnel"
 )
 
-func cmdBench(args []string) {
-	targetGroup := ""
-	autoSelect := false
-	singleIdx := 0
-	for i, arg := range args {
-		if (arg == "-g" || arg == "--group") && i+1 < len(args) {
-			targetGroup = args[i+1]
-		}
-		if arg == "--auto" {
-			autoSelect = true
-		}
-		if arg == "--single" && i+1 < len(args) {
-			singleIdx = parseIndex(args[i+1])
-		}
-	}
+const benchUsage = `Usage:
+  bypath bench [options]
 
-	mgr, err := profile.NewManager(profileDir(), "default")
-	if err != nil {
-		fmt.Printf("❌ %v\n", err)
-		os.Exit(1)
-	}
+Benchmark links and show latency, HTTPS support and the best link.
 
-	allGroups := mgr.ListGroups()
-	if len(allGroups) == 0 {
-		fmt.Println("❌ No groups found")
-		os.Exit(1)
-	}
+Options:
+  -g, --group NAME   Benchmark only this group
+  --single N         Test only row #N of 'bypath list -g GROUP' (no selection)
+  --auto             Select the best link automatically; still requires --yes,
+                     or a 'y' at an interactive prompt
+  --yes              Approve selecting the best link without prompting
+  -h, --help         Show this help and exit
 
-	var groupsToTest []string
-	if targetGroup != "" {
-		groupsToTest = []string{targetGroup}
-	} else {
-		groupsToTest = allGroups
-	}
+Selecting a link changes the next-start selection. Nothing is written unless
+--yes is given or you answer 'y' at an interactive terminal; a non-interactive
+run without --yes never approves a selection change.
+`
 
-	if singleIdx > 0 {
-		g, err := mgr.GetGroup(groupsToTest[0])
-		if err != nil || singleIdx > len(g.Links) {
-			fmt.Printf("❌ Link #%d not found in group '%s'\n", singleIdx, groupsToTest[0])
-			os.Exit(1)
-		}
-		link := g.Links[singleIdx-1]
-		fmt.Printf("  🔍 Testing [%s] %s → %s:%d\n\n", link.Protocol, link.Remark, link.Address, link.Port)
+// benchArgs is the fully validated form of 'bypath bench' arguments.
+type benchArgs struct {
+	group      string
+	single     int
+	autoSelect bool
+	yes        bool
+	help       bool
+}
 
-		addr := net.JoinHostPort(link.Address, fmt.Sprintf("%d", link.Port))
-		start := time.Now()
-		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-		if err != nil {
-			fmt.Printf("  ❌ Ping: timeout\n")
-		} else {
-			conn.Close()
-			fmt.Printf("  ✅ Ping: %dms\n", time.Since(start).Milliseconds())
-		}
-
-		latency, ok, _ := benchLinkOnPort(link, 19999)
-		if ok {
-			fmt.Printf("  ✅ Relay: %s\n", latency)
-		} else {
-			fmt.Printf("  ❌ Relay: failed\n")
-		}
-		return
-	}
-
-	type benchResult struct {
-		group   string
-		link    *profile.Link
-		latency string
-		status  string
-		ms      int
-		httpsOk bool
-	}
-
-	type groupRange struct {
-		name  string
-		start int
-		end   int
-	}
-	var allLinks []*profile.Link
-	var ranges []groupRange
-
-	for _, gname := range groupsToTest {
-		g, err := mgr.GetGroup(gname)
-		if err != nil {
-			continue
-		}
-		start := len(allLinks)
-		for _, l := range g.Links {
-			if l.Port >= 10 && l.Address != "" {
-				allLinks = append(allLinks, l)
+// parseBenchArgs is strict on purpose: an unknown option must never fall
+// through to a full benchmark run. It only parses; it performs no I/O.
+func parseBenchArgs(args []string) (benchArgs, error) {
+	var b benchArgs
+	for i := 0; i < len(args); i++ {
+		switch arg := args[i]; {
+		case arg == "-h" || arg == "--help":
+			b.help = true
+		case arg == "-g" || arg == "--group":
+			value, err := benchFlagValue(args, i, arg)
+			if err != nil {
+				return b, err
 			}
-		}
-		if len(allLinks) > start {
-			ranges = append(ranges, groupRange{gname, start, len(allLinks)})
-		}
-	}
-
-	if len(allLinks) == 0 {
-		fmt.Println("❌ No testable links found")
-		os.Exit(1)
-	}
-
-	totalGroups := len(ranges)
-	if totalGroups > 1 {
-		fmt.Printf("\n  🏁 Benchmarking %d links across %d groups (parallel)...\n", len(allLinks), totalGroups)
-	} else {
-		fmt.Printf("\n  🏁 Benchmarking %d links in group '%s' (parallel)...\n", len(allLinks), ranges[0].name)
-	}
-
-	results := make([]benchResult, len(allLinks))
-	var wg sync.WaitGroup
-
-	for _, gr := range ranges {
-		for i := gr.start; i < gr.end; i++ {
-			results[i].group = gr.name
-		}
-	}
-
-	for i, link := range allLinks {
-		wg.Add(1)
-		go func(idx int, l *profile.Link) {
-			defer wg.Done()
-			port := 19870 + idx
-			latency, ok, httpsOk := benchLinkOnPort(l, port)
-			if ok {
-				results[idx].link = l
-				results[idx].latency = latency
-				results[idx].status = "ok"
-				results[idx].ms = parseMs(latency)
-				results[idx].httpsOk = httpsOk
-			} else {
-				results[idx].link = l
-				results[idx].latency = "-"
-				results[idx].status = "fail"
-				results[idx].ms = 99999
+			i++
+			b.group = value
+		case arg == "--single":
+			value, err := benchFlagValue(args, i, arg)
+			if err != nil {
+				return b, err
 			}
-		}(i, link)
-	}
-
-	wg.Wait()
-
-	fmt.Println()
-	fmt.Printf("  %-3s %-8s %-4s %-22s %-6s %-8s %-5s %s\n", "#", "Proto", "Flag", "Server", "Port", "Latency", "HTTPS", "Status")
-	fmt.Printf("  %-3s %-8s %-4s %-22s %-6s %-8s %-5s %s\n", "---", "-----", "----", "------", "----", "-------", "-----", "------")
-
-	globalIdx := 1
-	for _, gr := range ranges {
-		if totalGroups > 1 {
-			fmt.Printf("\n  ━━ %s ━━\n", gr.name)
-		}
-		for i := gr.start; i < gr.end; i++ {
-			r := results[i]
-			flag := extractFlag(r.link.Remark)
-			server := r.link.Address
-			if len(server) > 20 {
-				server = server[:17] + "..."
+			i++
+			n := parseIndex(value)
+			if n <= 0 {
+				return b, fmt.Errorf("invalid link number %q for --single", value)
 			}
-			proto := shortProto(r.link.Protocol)
-			var httpsCol string
-			switch {
-			case r.status == "fail":
-				httpsCol = "—"
-			case r.httpsOk:
-				httpsCol = "✓"
-			default:
-				httpsCol = "✗"
-			}
-			if r.status == "ok" {
-				fmt.Printf("  %-3d %-8s %-4s %-22s %-6d %-8s %-5s ✅ OK\n", globalIdx, proto, flag, server, r.link.Port, r.latency, httpsCol)
-			} else {
-				fmt.Printf("  %-3d %-8s %-4s %-22s %-6d %-8s %-5s ❌ FAIL\n", globalIdx, proto, flag, server, r.link.Port, "timeout", httpsCol)
-			}
-			globalIdx++
-		}
-
-		for i := gr.start; i < gr.end; i++ {
-			r := results[i]
-			if r.status == "ok" && r.httpsOk {
-				r.link.HTTPSCapable = 1
-			} else if r.status == "ok" && !r.httpsOk {
-				r.link.HTTPSCapable = -1
-			}
-		}
-		mgr.SaveGroup(gr.name)
-	}
-
-	var benchResults []*profile.BenchResult
-	for i := range results {
-		benchResults = append(benchResults, &profile.BenchResult{
-			Link:    results[i].link,
-			Latency: time.Duration(results[i].ms) * time.Millisecond,
-			HTTPSOk: results[i].httpsOk,
-			Passed:  results[i].status == "ok",
-		})
-	}
-
-	sel := profile.SelectBest(benchResults)
-	if sel.Best == nil {
-		fmt.Println("\n  ❌ No working links found!")
-		return
-	}
-
-	bestDisplayIdx := 1
-	var bestLatencyStr, bestGroup string
-	displayIdx := 1
-	for _, gr := range ranges {
-		for i := gr.start; i < gr.end; i++ {
-			if results[i].link == sel.Best.Link {
-				bestDisplayIdx = displayIdx
-				bestLatencyStr = results[i].latency
-				bestGroup = gr.name
-			}
-			displayIdx++
+			b.single = n
+		case arg == "--auto":
+			b.autoSelect = true
+		case arg == "--yes":
+			b.yes = true
+		case strings.HasPrefix(arg, "-"):
+			return b, fmt.Errorf("unknown option %q", arg)
+		default:
+			return b, fmt.Errorf("unexpected argument %q", arg)
 		}
 	}
+	return b, nil
+}
 
-	if totalGroups > 1 {
-		fmt.Printf("\n  🏆 Best: #%d [%s] %s:%d (%s) — group '%s'\n",
-			bestDisplayIdx, sel.Best.Link.Protocol, sel.Best.Link.Address, sel.Best.Link.Port, bestLatencyStr, bestGroup)
-	} else {
-		fmt.Printf("\n  🏆 Best: #%d [%s] %s:%d (%s)\n",
-			bestDisplayIdx, sel.Best.Link.Protocol, sel.Best.Link.Address, sel.Best.Link.Port, bestLatencyStr)
+func benchFlagValue(args []string, i int, flag string) (string, error) {
+	if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+		return "", fmt.Errorf("%s requires a value", flag)
 	}
+	return args[i+1], nil
+}
 
-	if sel.NoHTTPS {
-		fmt.Println("  ⚠️  No HTTPS-capable links found — selected fastest HTTP link")
-	}
-	if len(sel.Skipped) > 0 {
-		fmt.Printf("  ℹ️  Skipped %d faster link(s) that lack HTTPS support\n", len(sel.Skipped))
-		for _, sk := range sel.Skipped {
-			fmt.Printf("      • %s:%d (%dms)\n", sk.Link.Address, sk.Link.Port, sk.Latency.Milliseconds())
-		}
-	}
+// benchDeps isolates the profile store and the network so argument rejection
+// and approval handling can be tested without sessions or persistent state.
+type benchDeps struct {
+	newManager func() (*profile.Manager, error)
+	options    func() bench.Options
+	runAll     func(context.Context, *profile.Manager, bench.Request, bench.Options) (bench.Report, error)
+	probe      func(context.Context, *profile.Link, bench.Options) bench.Probe
+}
 
-	if autoSelect {
-		mgr.SetActiveLink(sel.Best.Link)
-		fmt.Printf("  ✅ Auto-selected! Run 'bypath run' to start.\n")
-	} else {
-		fmt.Printf("\n  Auto-select this link? [Y/n]: ")
-		reader := bufio.NewReader(os.Stdin)
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(strings.ToLower(input))
-		if input == "" || input == "y" || input == "yes" {
-			mgr.SetActiveLink(sel.Best.Link)
-			fmt.Printf("  ✅ Selected! Run 'bypath run' to start.\n")
-		}
+func productionBenchDeps() benchDeps {
+	return benchDeps{
+		newManager: func() (*profile.Manager, error) {
+			return profile.NewManager(profileDir(), "default")
+		},
+		options: benchOptions,
+		runAll:  bench.Run,
+		probe:   bench.ProbeLink,
 	}
 }
 
-func benchLinkOnPort(link *profile.Link, port int) (latency string, ok bool, httpsOk bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+func cmdBench(args []string, stdin io.Reader, stdout io.Writer, interactive bool) int {
+	return runBench(args, stdin, stdout, interactive, productionBenchDeps())
+}
 
-	var cmd *exec.Cmd
-
-	if link.Protocol == "ssh" {
-		cmd = buildSSHBenchCmd(ctx, link, port)
-		if cmd == nil {
-			return "", false, false
-		}
-	} else {
-		configContent := fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":%d}],"outbounds":[%s,{"type":"direct","tag":"direct"}]}`, port, buildOutbound(link))
-
-		tmpFile := fmt.Sprintf(tmpDir()+"/bench-%d-%d.json", os.Getpid(), port)
-		os.MkdirAll(tmpDir(), 0755)
-		os.WriteFile(tmpFile, []byte(configContent), 0644)
-		defer os.Remove(tmpFile)
-
-		sbPath, err := exec.LookPath("sing-box")
-		if err != nil {
-			sbPath = filepath.Join(engineDir(), "sing-box")
-		}
-
-		cmd = exec.CommandContext(ctx, sbPath, "run", "-c", tmpFile)
+// runBench validates arguments before touching the profile store, then runs
+// the benchmark. A selection is written only after benchSelectionApproved.
+func runBench(args []string, stdin io.Reader, stdout io.Writer, interactive bool, deps benchDeps) int {
+	req, err := parseBenchArgs(args)
+	if err != nil {
+		fmt.Fprintf(stdout, "❌ %v\n\n", err)
+		fmt.Fprint(stdout, benchUsage)
+		return 1
+	}
+	if req.help {
+		fmt.Fprint(stdout, benchUsage)
+		return 0
+	}
+	if req.autoSelect && !req.yes && !interactive {
+		fmt.Fprintln(stdout, "❌ --auto needs --yes when stdin is not a terminal; nothing was benchmarked and the selection is unchanged")
+		return 1
 	}
 
-	cmd.Start()
-	defer func() {
-		if cmd.Process != nil {
-			cmd.Process.Kill()
-			cmd.Wait()
-		}
-	}()
+	mgr, err := deps.newManager()
+	if err != nil {
+		fmt.Fprintf(stdout, "❌ %v\n", err)
+		return 1
+	}
+	opts := deps.options()
 
-	deadline := time.Now().Add(4 * time.Second)
-	ready := false
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 300*time.Millisecond)
-		if err == nil {
-			conn.Close()
-			ready = true
+	if req.single > 0 {
+		return runBenchSingle(stdout, mgr, req.group, req.single, opts, deps.probe)
+	}
+	return runBenchAll(stdout, mgr, req, opts, stdin, interactive, deps.runAll)
+}
+
+// benchOptions mirrors the daemon's engine selection and SSH trust policy so a
+// CLI benchmark row is judged exactly like the connection the gateway starts.
+func benchOptions() bench.Options {
+	opts := bench.Options{
+		HostKeyPolicy: config.SSHHostKeyAcceptNew,
+		TmpDir:        tmpDir(),
+		EngineDir:     engineDir(),
+	}
+	cfg, err := config.Load(paths.Get().ConfigFile)
+	if err == nil {
+		opts.HostKeyPolicy = cfg.Server.SSHHostKey
+		opts.PreferredEngine = cfg.Engines.PreferredEngine
+		opts.EngineOrder = cfg.Engines.Fallback.Order
+		opts.FallbackEnabled = cfg.Engines.Fallback.Enabled
+	}
+	return opts
+}
+
+// runBenchSingle checks one link chosen by its 'bypath list' row number.
+func runBenchSingle(stdout io.Writer, mgr *profile.Manager, targetGroup string, singleIdx int, opts bench.Options, probe func(context.Context, *profile.Link, bench.Options) bench.Probe) int {
+	groups := mgr.ListGroups()
+	if len(groups) == 0 {
+		fmt.Fprintln(stdout, "❌ No groups found")
+		return 1
+	}
+	if targetGroup != "" {
+		groups = []string{targetGroup}
+	}
+
+	g, err := mgr.GetGroup(groups[0])
+	if err != nil {
+		fmt.Fprintf(stdout, "❌ Link #%d not found in group '%s'\n", singleIdx, groups[0])
+		return 1
+	}
+	// 'bypath list' numbers only routable links by remark, not by storage
+	// order; --single must pick the same row the operator saw.
+	var rows []bench.Row
+	for _, l := range g.Links {
+		if bench.Benchable(l) {
+			rows = append(rows, bench.Row{Remark: l.Remark})
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Remark < rows[j].Remark })
+	if singleIdx > len(rows) {
+		fmt.Fprintf(stdout, "❌ Link #%d not found in group '%s'\n", singleIdx, groups[0])
+		return 1
+	}
+
+	var link *profile.Link
+	want := rows[singleIdx-1].Remark
+	for _, l := range g.Links {
+		if l.Remark == want {
+			link = l
 			break
 		}
-		time.Sleep(300 * time.Millisecond)
 	}
-	if !ready {
-		return "", false, false
+	if link == nil {
+		fmt.Fprintf(stdout, "❌ Link #%d not found in group '%s'\n", singleIdx, groups[0])
+		return 1
 	}
+	fmt.Fprintf(stdout, "  🔍 Testing [%s] %s → %s:%d\n\n", link.Protocol, link.Remark, link.Address, link.Port)
 
-	start := time.Now()
-	// Use 1.1.1.1 by IP so bypass_domains (domain-based) never intercepts this request.
-	testCmd := exec.CommandContext(ctx, "curl", "-s", "-x", fmt.Sprintf("socks5h://127.0.0.1:%d", port),
-		"--connect-timeout", "6", "-o", "/dev/null", "-w", "%{http_code}", "https://1.1.1.1/cdn-cgi/trace")
-	out, err := testCmd.Output()
-	elapsed := time.Since(start)
-
-	if err != nil || strings.TrimSpace(string(out)) != "200" {
-		return "", false, false
+	p := probe(context.Background(), link, opts)
+	if p.PingOK {
+		fmt.Fprintf(stdout, "  ✅ Ping: %dms\n", p.Ping.Milliseconds())
+	} else {
+		fmt.Fprintln(stdout, "  ❌ Ping: timeout")
 	}
-
-	httpsOk = profile.TestHTTPS(ctx, port)
-
-	return fmt.Sprintf("%dms", elapsed.Milliseconds()), true, httpsOk
+	if p.Passed {
+		fmt.Fprintf(stdout, "  ✅ Relay: %dms\n", p.Latency.Milliseconds())
+	} else {
+		fmt.Fprintln(stdout, "  ❌ Relay: failed")
+	}
+	return 0
 }
 
-func buildSSHBenchCmd(ctx context.Context, link *profile.Link, port int) *exec.Cmd {
-	sshPath, err := exec.LookPath("ssh")
+func runBenchAll(stdout io.Writer, mgr *profile.Manager, req benchArgs, opts bench.Options, stdin io.Reader, interactive bool, run func(context.Context, *profile.Manager, bench.Request, bench.Options) (bench.Report, error)) int {
+	report, err := run(context.Background(), mgr, bench.Request{Group: req.group}, opts)
 	if err != nil {
-		return nil
-	}
-
-	sshPort := link.Port
-	if sshPort == 0 {
-		sshPort = 22
-	}
-
-	sshUser := link.SSHUser
-	if sshUser == "" {
-		sshUser = "root"
-	}
-
-	args := []string{
-		"-D", fmt.Sprintf("127.0.0.1:%d", port),
-		"-N",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "ServerAliveInterval=30",
-		"-o", "ServerAliveCountMax=3",
-	}
-
-	if link.SSHKeyPath != "" {
-		args = append(args, "-i", link.SSHKeyPath)
-	}
-
-	args = append(args, "-p", fmt.Sprintf("%d", sshPort))
-	args = append(args, fmt.Sprintf("%s@%s", sshUser, link.Address))
-
-	if link.SSHKeyPath == "" && link.SSHPassword != "" {
-		sshpassPath, err := exec.LookPath("sshpass")
-		if err != nil {
-			return nil
+		switch {
+		case errors.Is(err, bench.ErrNoGroups):
+			if req.group != "" {
+				fmt.Fprintf(stdout, "❌ Group '%s' not found\n", req.group)
+			} else {
+				fmt.Fprintln(stdout, "❌ No groups found")
+			}
+		case errors.Is(err, bench.ErrNoLinks):
+			fmt.Fprintln(stdout, "❌ No testable links found")
+		default:
+			fmt.Fprintf(stdout, "❌ %v\n", err)
 		}
-		finalArgs := append([]string{"-p", link.SSHPassword, sshPath}, args...)
-		return exec.CommandContext(ctx, sshpassPath, finalArgs...)
+		return 1
 	}
 
-	return exec.CommandContext(ctx, sshPath, args...)
-}
-
-func buildOutbound(link *profile.Link) string {
-	if link.Protocol == "ssh" {
-		return `{"type":"direct","tag":"proxy"}`
+	if len(report.Groups) > 1 {
+		fmt.Fprintf(stdout, "  🏁 Benchmarked %d links across %d groups\n", len(report.Rows), len(report.Groups))
+	} else {
+		group := req.group
+		if group == "" && len(report.Groups) == 1 {
+			group = report.Groups[0]
+		}
+		fmt.Fprintf(stdout, "  🏁 Benchmarked %d links in group '%s'\n", len(report.Rows), group)
 	}
 
-	cg := &tunnel.ConfigGenerator{}
-	ob := cg.BuildSingboxOutbound(link)
-	if ob == nil {
-		return `{"type":"direct","tag":"proxy"}`
-	}
-	ob["tag"] = "proxy"
+	printBenchTableTo(stdout, report)
 
-	b, err := json.Marshal(ob)
-	if err != nil {
-		return `{"type":"direct","tag":"proxy"}`
+	if report.Best == nil {
+		fmt.Fprintln(stdout, "\n  ❌ No working links found!")
+		return 0
 	}
-	return string(b)
-}
 
-func parseMs(s string) int {
-	n := 0
-	for _, ch := range s {
-		if ch >= '0' && ch <= '9' {
-			n = n*10 + int(ch-'0')
+	bestIdx := benchRowIndex(report.Rows, report.Best.Group, report.Best.Remark) + 1
+	bestLatency := fmt.Sprintf("%dms", report.Best.Latency)
+	if len(report.Groups) > 1 {
+		fmt.Fprintf(stdout, "\n  🏆 Best: #%d [%s] %s:%d (%s) — group '%s'\n",
+			bestIdx, report.Best.Protocol, report.Best.Address, report.Best.Port, bestLatency, report.Best.Group)
+	} else {
+		fmt.Fprintf(stdout, "\n  🏆 Best: #%d [%s] %s:%d (%s)\n",
+			bestIdx, report.Best.Protocol, report.Best.Address, report.Best.Port, bestLatency)
+	}
+
+	if report.NoHTTPS {
+		fmt.Fprintln(stdout, "  ⚠️  No HTTPS-capable links found — selected fastest HTTP link")
+	}
+	if len(report.Skipped) > 0 {
+		fmt.Fprintf(stdout, "  ℹ️  Skipped %d faster link(s) that lack HTTPS support\n", len(report.Skipped))
+		for _, sk := range report.Skipped {
+			fmt.Fprintf(stdout, "      • %s:%d (%dms)\n", sk.Address, sk.Port, sk.Latency)
 		}
 	}
-	return n
+
+	if !benchSelectionApproved(req, stdin, stdout, interactive) {
+		if !interactive {
+			fmt.Fprintln(stdout, "  ℹ️  Selection unchanged (non-interactive; pass --yes to select the best link).")
+		} else {
+			fmt.Fprintln(stdout, "  ℹ️  Selection unchanged.")
+		}
+		return 0
+	}
+
+	if err := bench.Activate(mgr, report.Best.Group, report.Best.Remark); err != nil {
+		fmt.Fprintf(stdout, "  ❌ %v\n", err)
+		return 1
+	}
+	fmt.Fprintln(stdout, "  ✅ Selected! Run 'bypath run' to start.")
+	return 0
+}
+
+// benchSelectionApproved reports whether the next-start selection may change.
+// Only an explicit --yes, or a 'y'/'yes' typed at an interactive terminal,
+// approves. EOF, an empty line and a closed stdin never do.
+func benchSelectionApproved(req benchArgs, stdin io.Reader, stdout io.Writer, interactive bool) bool {
+	if req.yes {
+		return true
+	}
+	if !interactive {
+		return false
+	}
+	fmt.Fprint(stdout, "\n  Auto-select this link? [y/N]: ")
+	line, _ := bufio.NewReader(stdin).ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true
+	}
+	return false
+}
+
+func printBenchTableTo(w io.Writer, report bench.Report) {
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "  %-3s %-8s %-4s %-22s %-6s %-8s %-5s %s\n", "#", "Proto", "Flag", "Server", "Port", "Latency", "HTTPS", "Status")
+	fmt.Fprintf(w, "  %-3s %-8s %-4s %-22s %-6s %-8s %-5s %s\n", "---", "-----", "----", "------", "------", "-------", "-----", "------")
+
+	multi := len(report.Groups) > 1
+	idx := 0
+	for _, group := range report.Groups {
+		printedHeader := false
+		for _, r := range report.Rows {
+			if r.Group != group {
+				continue
+			}
+			if multi && !printedHeader {
+				fmt.Fprintf(w, "\n  ━━ %s ━━\n", group)
+				printedHeader = true
+			}
+			printBenchRowTo(w, idx+1, r)
+			idx++
+		}
+	}
+}
+
+func printBenchRowTo(w io.Writer, idx int, r bench.Row) {
+	flag := extractFlag(r.Remark)
+	server := r.Address
+	if len(server) > 20 {
+		server = server[:17] + "..."
+	}
+	proto := shortProto(r.Protocol)
+	httpsCol := "✗"
+	if !r.Passed {
+		httpsCol = "—"
+	} else if r.HTTPS {
+		httpsCol = "✓"
+	}
+	latency := fmt.Sprintf("%dms", r.Latency)
+	status := "✅ OK"
+	if !r.Passed {
+		latency = "timeout"
+		status = "❌ FAIL"
+	}
+	fmt.Fprintf(w, "  %-3d %-8s %-4s %-22s %-6d %-8s %-5s %s\n", idx, proto, flag, server, r.Port, latency, httpsCol, status)
+}
+
+func benchRowIndex(rows []bench.Row, group, remark string) int {
+	for i, r := range rows {
+		if r.Group == group && r.Remark == remark {
+			return i
+		}
+	}
+	return 0
 }

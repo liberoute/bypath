@@ -4,10 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"testing"
 
-	"github.com/liberoute/bypath/internal/paths"
 	"github.com/liberoute/bypath/internal/profile"
 	"pgregory.net/rapid"
 )
@@ -88,10 +86,13 @@ var genLink = rapid.Custom(func(t *rapid.T) *profile.Link {
 	return link
 })
 
+// whitelistCountryPool feeds the country generator and the geo fixtures.
+var whitelistCountryPool = []string{"ir", "cn", "ru", "tr", "ae", "de", "fr", "us", "gb"}
+
 // genWhitelistCountries generates a non-empty list of unique country codes.
 var genWhitelistCountries = rapid.Custom(func(t *rapid.T) []string {
 	count := rapid.IntRange(1, 5).Draw(t, "countryCount")
-	pool := []string{"ir", "cn", "ru", "tr", "ae", "de", "fr", "us", "gb"}
+	pool := whitelistCountryPool
 	seen := make(map[string]bool)
 	countries := make([]string, 0, count)
 	for len(countries) < count {
@@ -312,6 +313,17 @@ func TestProperty_TUNInboundHasCorrectConstantFields(t *testing.T) {
 		if tunInbound["auto_route"] != true {
 			t.Fatalf("TUN auto_route: got %v, want true", tunInbound["auto_route"])
 		}
+		// Auto-route must be pinned to bypath's reserved table/rule index so the
+		// engine cannot create routing objects bypath has not recorded.
+		if got := fmt.Sprint(tunInbound["iproute2_table_index"]); got != fmt.Sprint(NativeRouteTable) {
+			t.Fatalf("TUN iproute2_table_index: got %v, want %d", tunInbound["iproute2_table_index"], NativeRouteTable)
+		}
+		if got := fmt.Sprint(tunInbound["iproute2_rule_index"]); got != fmt.Sprint(NativeRuleIndex) {
+			t.Fatalf("TUN iproute2_rule_index: got %v, want %d", tunInbound["iproute2_rule_index"], NativeRuleIndex)
+		}
+		if NativeRouteTable == 2022 {
+			t.Fatal("reserved route table must not collide with sing-box's historical default")
+		}
 	})
 }
 
@@ -422,21 +434,25 @@ func TestProperty_GatewayDNSHasTunnelAndDirectServers(t *testing.T) {
 func TestProperty_DNSRulesReferenceWhitelistCountries(t *testing.T) {
 	tmpDir := t.TempDir()
 
+	// Provision valid rule sets for the whole draw pool up front: the geo
+	// validity gate only accepts well-formed binary rule sets, and rapid draws
+	// the country list inside the loop.
+	for _, c := range whitelistCountryPool {
+		writeValidGeoRuleSet(t, "geosite", c)
+		writeValidGeoRuleSet(t, "geoip", c)
+	}
+
 	rapid.Check(t, func(t *rapid.T) {
 		link := genLink.Draw(t, "link")
 		countries := genWhitelistCountries.Draw(t, "countries")
-
-		// Create dummy geosite files so the file-existence check passes
-		geoDir := paths.Get().GeoDir
-		os.MkdirAll(geoDir, 0755)
-		for _, c := range countries {
-			os.WriteFile(filepath.Join(geoDir, fmt.Sprintf("geosite-%s.srs", c)), []byte("dummy"), 0644)
-		}
 
 		cg := NewConfigGenerator(tmpDir)
 		cg.GatewayMode = true
 		cg.DNSPort = 53
 		cg.WhitelistCountries = countries
+		// The gateway manager applies the same fallback: with no explicit
+		// geosite list, the whitelist countries double as geosite countries.
+		cg.GeositeCountries = countries
 
 		cfg := parseSingBoxConfig(t, cg, link)
 
@@ -497,14 +513,35 @@ func TestProperty_DNSRulesReferenceWhitelistCountries(t *testing.T) {
 				t.Fatalf("expected DNS rule_set to contain %q, but it was missing. Got: %v", tag, ruleSetArr)
 			}
 		}
+
+		// A DNS rule may only name a rule_set the route section defines:
+		// sing-box rejects the whole config when a reference cannot be loaded.
+		route, ok := cfg["route"].(map[string]interface{})
+		if !ok {
+			t.Fatal("expected a route section")
+		}
+		defined := map[string]bool{}
+		if defs, ok := route["rule_set"].([]interface{}); ok {
+			for _, defRaw := range defs {
+				def, _ := defRaw.(map[string]interface{})
+				if tag, _ := def["tag"].(string); tag != "" {
+					defined[tag] = true
+				}
+			}
+		}
+		for tag := range actualTags {
+			if !defined[tag] {
+				t.Fatalf("DNS rule references rule_set %q that the route section never defines", tag)
+			}
+		}
 	})
 }
 
-// Feature: singbox-tun-inbound, Property 6: DNS listen is present only in gateway mode
+// Feature: singbox-tun-inbound, Property 6: only gateway mode adds a TUN inbound
 //
-// For any valid Link struct, the generated DNS section SHALL include a listen address
-// and port when GatewayMode is enabled, and SHALL omit the listen configuration when
-// GatewayMode is disabled.
+// For any valid Link struct, gateway mode SHALL include a tun-in inbound and
+// SHALL NOT include any DNS inbound: bypath's own resolver owns port 53 for
+// every engine, so DNS behaviour must not depend on the engine.
 //
 // **Validates: Requirements 2.5, 2.6**
 func TestProperty_DNSListenPresentOnlyInGatewayMode(t *testing.T) {
@@ -523,7 +560,9 @@ func TestProperty_DNSListenPresentOnlyInGatewayMode(t *testing.T) {
 
 		cfg := parseSingBoxConfig(t, cg, link)
 
-		// Check inbounds for dns-in (sing-box 1.12+ uses separate inbound for DNS)
+		// bypath's own resolver owns port 53 in every gateway mode, so the
+		// engine config must never bind it. Only the tun inbound differentiates
+		// gateway from proxy-only mode.
 		inboundsRaw, hasInbounds := cfg["inbounds"]
 		if !hasInbounds {
 			t.Fatal("expected inbounds in config")
@@ -534,40 +573,28 @@ func TestProperty_DNSListenPresentOnlyInGatewayMode(t *testing.T) {
 		}
 
 		hasDNSInbound := false
-		var dnsInboundPort interface{}
+		hasTunInbound := false
 		for _, ibRaw := range inbounds {
 			ib, ok := ibRaw.(map[string]interface{})
 			if !ok {
 				continue
 			}
-			if ib["tag"] == "dns-in" {
+			if ib["tag"] == "dns-in" || ib["type"] == "direct" {
 				hasDNSInbound = true
-				dnsInboundPort = ib["listen_port"]
+			}
+			if ib["tag"] == "tun-in" {
+				hasTunInbound = true
 			}
 		}
 
-		if gatewayMode {
-			if !hasDNSInbound {
-				t.Fatal("expected dns-in inbound in gateway mode config")
-			}
-			portFloat, ok := dnsInboundPort.(float64)
-			if ok {
-				if int(portFloat) != dnsPort {
-					t.Fatalf("dns-in listen_port: got %v, want %d", portFloat, dnsPort)
-				}
-			} else {
-				portInt, ok := dnsInboundPort.(int)
-				if !ok {
-					t.Fatalf("dns-in listen_port is not a number, got %T: %v", dnsInboundPort, dnsInboundPort)
-				}
-				if portInt != dnsPort {
-					t.Fatalf("dns-in listen_port: got %d, want %d", portInt, dnsPort)
-				}
-			}
-		} else {
-			if hasDNSInbound {
-				t.Fatal("dns-in inbound should NOT be present in proxy-only mode")
-			}
+		if hasDNSInbound {
+			t.Fatal("engine config must not bind a DNS inbound: bypath owns port 53 for every engine")
+		}
+		if gatewayMode && !hasTunInbound {
+			t.Fatal("expected tun-in inbound in gateway mode config")
+		}
+		if !gatewayMode && hasTunInbound {
+			t.Fatal("tun-in inbound should NOT be present in proxy-only mode")
 		}
 	})
 }

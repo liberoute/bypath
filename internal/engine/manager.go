@@ -1,13 +1,15 @@
 package engine
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 
 	"github.com/liberoute/bypath/internal/config"
 )
@@ -18,12 +20,13 @@ type Engine struct {
 	Path    string // resolved path to binary
 	Version string
 	Source  string // "system" or "local" or "downloaded"
+	Digest  string // sha256 of the resolved binary, recorded for audit
 }
 
 // Manager handles engine detection, download, and lifecycle.
 type Manager struct {
-	config         config.EnginesConfig
-	engines        map[string]*Engine
+	config           config.EnginesConfig
+	engines          map[string]*Engine
 	SSHPassAvailable bool // whether sshpass binary is available (for password auth)
 }
 
@@ -51,6 +54,7 @@ func (m *Manager) Init() error {
 	}{
 		{"sing-box", []string{"sing-box", "sing-box.exe"}},
 		{"xray", []string{"xray", "xray.exe"}},
+		{"tun2socks", []string{"tun2socks", "tun2socks.exe"}},
 		{"wireguard-go", []string{"wireguard-go", "wireguard-go.exe", "wireguard.exe"}},
 		{"openvpn", []string{"openvpn", "openvpn.exe"}},
 	}
@@ -58,8 +62,15 @@ func (m *Manager) Init() error {
 	for _, eng := range supported {
 		resolved := m.resolve(eng.name, eng.binaries)
 		if resolved != nil {
+			if digest, err := fileSHA256(resolved.Path); err == nil {
+				resolved.Digest = digest
+			}
 			m.engines[eng.name] = resolved
-			log.Printf("  ✅ %s: %s (%s)", eng.name, resolved.Path, resolved.Source)
+			if resolved.Digest != "" {
+				log.Printf("  ✅ %s: %s (%s, sha256:%s)", eng.name, resolved.Path, resolved.Source, resolved.Digest)
+			} else {
+				log.Printf("  ✅ %s: %s (%s, digest unavailable)", eng.name, resolved.Path, resolved.Source)
+			}
 		} else {
 			log.Printf("  ⚠️  %s: not found (will download on demand)", eng.name)
 		}
@@ -102,7 +113,54 @@ func (m *Manager) Get(name string) (*Engine, error) {
 	return eng, nil
 }
 
+// EnsureManaged returns the bypath-managed copy of name, downloading the pinned
+// release when it is absent. Unlike Get it never returns a PATH binary: the
+// transparent data path must not depend on an operator-installed helper, and a
+// managed copy whose digest no longer matches the pinned release is replaced
+// instead of trusted.
+func (m *Manager) EnsureManaged(name string) (*Engine, error) {
+	if eng, ok := m.engines[name]; ok && eng.Source != "system" {
+		return eng, nil
+	}
+
+	if err := os.MkdirAll(m.config.Directory, 0755); err != nil {
+		return nil, fmt.Errorf("creating engines directory: %w", err)
+	}
+	binaryName := name
+	if runtime.GOOS == "windows" {
+		binaryName += ".exe"
+	}
+	localPath := filepath.Join(m.config.Directory, binaryName)
+	if info, err := os.Stat(localPath); err == nil && !info.IsDir() {
+		digest, _ := fileSHA256(localPath)
+		expected := ""
+		if artifact, aErr := ArtifactFor(name, runtime.GOOS, runtime.GOARCH); aErr == nil {
+			expected = artifact.SHA256
+		}
+		if expected == "" || digest == expected {
+			eng := &Engine{Name: name, Path: localPath, Source: "local", Digest: digest}
+			m.engines[name] = eng
+			return eng, nil
+		}
+		log.Printf("  ⚠️  Managed %s at %s does not match the pinned digest — reinstalling", name, localPath)
+	}
+
+	eng, err := m.download(name)
+	if err != nil {
+		return nil, err
+	}
+	m.engines[name] = eng
+	return eng, nil
+}
+
 // resolve tries to find an engine binary on the system or in the local directory.
+//
+// Selection policy: prefer_system=true checks PATH first, then the engines
+// directory, then PATH again; prefer_system=false checks the engines directory
+// first. Binaries found this way are operator-supplied: their identity is
+// recorded (path and SHA-256) but cannot be pinned to a release. Only binaries
+// downloaded by bypath are verified against pinned release digests. A version
+// string is never treated as proof of integrity.
 func (m *Manager) resolve(name string, binaries []string) *Engine {
 	// 1. Check system PATH (if prefer_system is true)
 	if m.config.PreferSystem {
@@ -133,93 +191,91 @@ func (m *Manager) resolve(name string, binaries []string) *Engine {
 	return nil
 }
 
-// download fetches the engine binary from its official release.
+// download fetches the engine binary from its official release and installs it
+// only after the pinned checksum and the platform-specific asset both match.
 func (m *Manager) download(name string) (*Engine, error) {
-	url, destName, err := m.getDownloadURL(name)
+	switch name {
+	case "wireguard-go", "openvpn":
+		return nil, fmt.Errorf("%s must be installed via the system package manager", name)
+	case "sing-box", "xray", "tun2socks":
+	default:
+		return nil, fmt.Errorf("unknown engine: %s", name)
+	}
+
+	artifact, err := ArtifactFor(name, runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		return nil, err
 	}
 
-	destPath := filepath.Join(m.config.Directory, destName)
+	binaryName := name
+	if runtime.GOOS == "windows" {
+		binaryName += ".exe"
+	}
 
-	log.Printf("  📦 Downloading %s from %s", name, url)
-	if err := downloadFile(url, destPath); err != nil {
+	log.Printf("  📦 Downloading %s %s (sha256:%s)", name, artifact.Name, artifact.SHA256)
+	download, err := os.CreateTemp(m.config.Directory, ".bypath-download-*")
+	if err != nil {
+		return nil, fmt.Errorf("creating download file: %w", err)
+	}
+	downloadPath := download.Name()
+	download.Close()
+	defer os.Remove(downloadPath)
+
+	if err := downloadVerified(artifact.URL, downloadPath, artifact.SHA256); err != nil {
 		return nil, fmt.Errorf("downloading %s: %w", name, err)
 	}
-
-	// For archives (.zip, .tar.gz), the actual binary was extracted to the engines
-	// directory. Find it by the engine name, not the archive filename.
-	binaryPath := destPath
-	if strings.HasSuffix(destName, ".zip") || strings.HasSuffix(destName, ".tar.gz") || strings.HasSuffix(destName, ".tgz") {
-		// Binary name is the engine name (e.g. "xray", "sing-box")
-		binaryName := name
-		if runtime.GOOS == "windows" {
-			binaryName += ".exe"
-		}
-		binaryPath = filepath.Join(m.config.Directory, binaryName)
-		// Clean up the archive file
-		os.Remove(destPath)
+	archiveBinary := artifact.Binary
+	if archiveBinary == "" {
+		archiveBinary = binaryName
+	}
+	if err := installArtifactAs(downloadPath, artifact.Name, m.config.Directory, binaryName, archiveBinary); err != nil {
+		return nil, fmt.Errorf("installing %s: %w", name, err)
 	}
 
-	// Make executable on Unix
-	if runtime.GOOS != "windows" {
-		os.Chmod(binaryPath, 0755)
+	binaryPath := filepath.Join(m.config.Directory, binaryName)
+	if err := os.Chmod(binaryPath, 0755); err != nil {
+		return nil, fmt.Errorf("making %s executable: %w", binaryPath, err)
 	}
-
-	// Verify the binary exists and is executable
 	if _, err := os.Stat(binaryPath); err != nil {
 		return nil, fmt.Errorf("binary not found after download/extract at %s: %w", binaryPath, err)
 	}
-
-	return &Engine{Name: name, Path: binaryPath, Source: "downloaded"}, nil
-}
-
-// getDownloadURL returns the download URL for an engine based on OS/Arch.
-func (m *Manager) getDownloadURL(name string) (url string, filename string, err error) {
-	goos := runtime.GOOS
-	goarch := runtime.GOARCH
-
-	switch name {
-	case "sing-box":
-		ver := "1.13.0"
-		arch := goarch
-		if goarch == "arm" {
-			arch = "armv7"
-		}
-		platform := fmt.Sprintf("%s-%s", goos, arch)
-		ext := ".tar.gz"
-		if goos == "windows" {
-			ext = ".zip"
-		}
-		filename = fmt.Sprintf("sing-box-%s-%s%s", ver, platform, ext)
-		url = fmt.Sprintf("https://github.com/SagerNet/sing-box/releases/download/v%s/%s", ver, filename)
-
-	case "xray":
-		ver := "25.1.1"
-		archMap := map[string]string{"amd64": "64", "arm64": "arm64-v8a", "arm": "arm32-v7a"}
-		arch := archMap[goarch]
-		if arch == "" {
-			arch = "64"
-		}
-		osName := "linux"
-		if goos == "windows" {
-			osName = "windows"
-		}
-		ext := ".zip"
-		filename = fmt.Sprintf("Xray-%s-%s%s", osName, arch, ext)
-		url = fmt.Sprintf("https://github.com/XTLS/Xray-core/releases/download/v%s/%s", ver, filename)
-
-	case "wireguard-go":
-		// wireguard-go doesn't have official releases with binaries
-		// We'll build from source or use system package
-		return "", "", fmt.Errorf("wireguard-go must be installed via system package manager")
-
-	case "openvpn":
-		return "", "", fmt.Errorf("openvpn must be installed via system package manager")
-
-	default:
-		return "", "", fmt.Errorf("unknown engine: %s", name)
+	digest, _ := fileSHA256(binaryPath)
+	if digest != "" {
+		log.Printf("  ✅ %s installed at %s (sha256:%s)", name, binaryPath, digest)
+	} else {
+		log.Printf("  ✅ %s installed at %s (digest unavailable)", name, binaryPath)
 	}
 
-	return url, filename, nil
+	return &Engine{Name: name, Path: binaryPath, Source: "downloaded", Digest: digest}, nil
 }
+
+// fileSHA256 hashes a binary for provenance logging. It is not a substitute for
+// a pinned release checksum, which is enforced in downloadVerified.
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// List returns every engine this manager has detected, in a stable order.
+func (m *Manager) List() []*Engine {
+	order := []string{"sing-box", "xray", "tun2socks", "wireguard-go", "openvpn", "ssh"}
+	out := make([]*Engine, 0, len(m.engines))
+	for _, name := range order {
+		if eng, ok := m.engines[name]; ok {
+			copyEng := *eng
+			out = append(out, &copyEng)
+		}
+	}
+	return out
+}
+
+// SSHPassAvailable reports whether password-based SSH auth is usable.
+func (m *Manager) HasSSHPass() bool { return m.SSHPassAvailable }

@@ -2,27 +2,51 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/gorilla/mux"
-	"github.com/liberoute/bypath/internal/build"
-	"github.com/liberoute/bypath/internal/config"
+	"github.com/liberoute/bypath/internal/app"
 	"github.com/liberoute/bypath/internal/metrics"
-	"github.com/liberoute/bypath/internal/paths"
 	"github.com/liberoute/bypath/internal/profile"
 )
 
 // --- Status ---
 
+// handleStatus keeps the legacy response shape while filling it from the
+// shared service, so it can never contradict /app/status.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	tunnelStatus := s.gateway.GetTunnelManager().GetStatus()
 	chainStatus := s.gateway.GetTunnelManager().GetChainStatus()
+	st, err := s.svc.Status(r.Context())
+	if err != nil {
+		appError(w, err)
+		return
+	}
 
 	status := map[string]interface{}{
-		"version":       build.Version,
-		"active_engine": s.gateway.GetActiveEngine(),
-		"tunnels":       tunnelStatus,
-		"chains":        chainStatus,
+		"version":                st.Version,
+		"variant":                st.Variant,
+		"active_engine":          st.Engine,
+		"state":                  st.State,
+		"active_link":            st.ActiveLink,
+		"protocol":               st.Protocol,
+		"restarts":               st.Restarts,
+		"tun_restarts":           st.TunRestarts,
+		"recovery_attempt":       st.Recovery,
+		"last_error":             st.LastError,
+		"last_health":            st.LastHealth,
+		"health_code":            st.HealthCode,
+		"health_detail":          st.HealthDetail,
+		"health_tunnel_answered": st.HealthTunnelAnswered,
+		"health_exit_ip":         st.HealthExitIP,
+		"health_uplink_samples":  st.HealthUplinkSamples,
+		"uptime_sec":             st.UptimeSec,
+		"gateway_mode":           st.GatewayMode,
+		"dns_mode":               st.DNSMode,
+		"profile_count":          st.ProfileCount,
+		"tunnels":                tunnelStatus,
+		"chains":                 chainStatus,
 	}
 
 	jsonResponse(w, http.StatusOK, status)
@@ -31,8 +55,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 // --- Profiles ---
 
 func (s *Server) handleListGroups(w http.ResponseWriter, r *http.Request) {
-	pm := s.gateway.GetProfileManager()
-	groups := pm.ListGroups()
+	groups := s.svc.Profiles().ListGroups()
 	jsonResponse(w, http.StatusOK, map[string]interface{}{"groups": groups})
 }
 
@@ -40,8 +63,7 @@ func (s *Server) handleGetGroup(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	name := vars["name"]
 
-	pm := s.gateway.GetProfileManager()
-	group, err := pm.GetGroup(name)
+	group, err := s.svc.Profiles().GetGroup(name)
 	if err != nil {
 		errorResponse(w, http.StatusNotFound, err.Error())
 		return
@@ -67,8 +89,12 @@ func (s *Server) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
 		req.Type = "basic"
 	}
 
-	pm := s.gateway.GetProfileManager()
+	pm := s.svc.Profiles()
 	if err := pm.CreateGroup(req.Name, req.Type); err != nil {
+		if errors.Is(err, profile.ErrInvalidGroupName) {
+			errorResponse(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		errorResponse(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -80,7 +106,7 @@ func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	name := vars["name"]
 
-	pm := s.gateway.GetProfileManager()
+	pm := s.svc.Profiles()
 	if err := pm.DeleteGroup(name); err != nil {
 		errorResponse(w, http.StatusNotFound, err.Error())
 		return
@@ -104,38 +130,31 @@ func (s *Server) handleAddLink(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, http.StatusBadRequest, "uri is required")
 		return
 	}
-	if req.Group == "" {
-		req.Group = "default"
+	if err := sanitizeURI(req.URI); err != nil {
+		appError(w, err)
+		return
 	}
 
-	// Parse the URI
-	link, err := profile.ParseURI(req.URI)
+	res, err := s.svc.ImportURI(r.Context(), req.Group, req.URI)
 	if err != nil {
-		errorResponse(w, http.StatusBadRequest, "invalid link URI: "+err.Error())
+		appError(w, err)
 		return
 	}
 
-	pm := s.gateway.GetProfileManager()
-	if err := pm.AddLink(req.Group, link); err != nil {
-		errorResponse(w, http.StatusInternalServerError, err.Error())
-		return
+	out := map[string]interface{}{"message": "link added", "group": res.Group}
+	if len(res.Created) > 0 {
+		out["remark"] = res.Created[0].Remark
+		out["protocol"] = res.Created[0].Protocol
 	}
-
-	jsonResponse(w, http.StatusCreated, map[string]interface{}{
-		"message":  "link added",
-		"remark":   link.Remark,
-		"protocol": link.Protocol,
-	})
+	jsonResponse(w, http.StatusCreated, out)
 }
 
 func (s *Server) handleDeleteLink(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
-	group := vars["group"]
-	remark := vars["remark"]
+	id := app.ConnectionID(vars["group"], vars["remark"])
 
-	pm := s.gateway.GetProfileManager()
-	if err := pm.RemoveLink(group, remark); err != nil {
-		errorResponse(w, http.StatusNotFound, err.Error())
+	if err := s.svc.DeleteConnection(r.Context(), id); err != nil {
+		appError(w, err)
 		return
 	}
 
@@ -150,19 +169,12 @@ func (s *Server) handleListTunnels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStartTunnel(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Name    string `json:"name"`
-		Profile string `json:"profile"`
-		Engine  string `json:"engine"`
-		Isolate bool   `json:"isolate"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		errorResponse(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	// TODO: Implement tunnel start via API
-	jsonResponse(w, http.StatusAccepted, map[string]string{"message": "tunnel start requested"})
+	// Starting an ad-hoc tunnel is intentionally unsupported: it would create a
+	// second state owner next to the managed profile link.
+	jsonResponse(w, http.StatusNotImplemented, map[string]string{
+		"code":    "not_implemented",
+		"message": "ad-hoc tunnels are not supported; select a connection instead",
+	})
 }
 
 func (s *Server) handleStopTunnel(w http.ResponseWriter, r *http.Request) {
@@ -188,8 +200,12 @@ func (s *Server) handleListChains(w http.ResponseWriter, r *http.Request) {
 // --- Engines ---
 
 func (s *Server) handleListEngines(w http.ResponseWriter, r *http.Request) {
-	// TODO: expose engine list from manager
-	jsonResponse(w, http.StatusOK, map[string]string{"message": "not yet implemented"})
+	engines, err := s.svc.Engines(r.Context())
+	if err != nil {
+		appError(w, err)
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]interface{}{"engines": engines})
 }
 
 // --- Subscriptions ---
@@ -198,29 +214,48 @@ func (s *Server) handleUpdateSubscription(w http.ResponseWriter, r *http.Request
 	vars := mux.Vars(r)
 	group := vars["group"]
 
-	pm := s.gateway.GetProfileManager()
-	count, err := pm.UpdateSubscriptions(group, s.config.Server.SOCKSPort)
+	subs, err := s.svc.ListSubscriptions(r.Context())
 	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, err.Error())
+		appError(w, err)
+		return
+	}
+	total := 0
+	var failures []string
+	for _, sub := range subs {
+		if sub.Group != group {
+			continue
+		}
+		updated, err := s.svc.RefreshSubscription(r.Context(), sub.Group, sub.URL, nil)
+		if err != nil {
+			failures = append(failures, sub.RedactedURL+": "+err.Error())
+			continue
+		}
+		total += updated.LinkCount
+	}
+	if len(failures) > 0 {
+		jsonResponse(w, http.StatusBadGateway, map[string]interface{}{
+			"code":     app.CodeUnavailable,
+			"message":  "some subscriptions could not be refreshed; existing links were kept",
+			"failures": failures,
+			"links":    total,
+		})
 		return
 	}
 
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
 		"message": "subscriptions updated",
-		"links":   count,
+		"links":   total,
 	})
 }
 
 // --- Config ---
 
 func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
-	cfgPath := paths.Get().ConfigFile
-	newCfg, err := config.Load(cfgPath)
+	needRestart, err := s.svc.ReloadConfig()
 	if err != nil {
-		errorResponse(w, http.StatusInternalServerError, "config reload failed: "+err.Error())
+		appError(w, err)
 		return
 	}
-	needRestart := s.gateway.Reload(newCfg)
 	metrics.ConfigReloads.Inc()
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
 		"message":          "config reloaded",

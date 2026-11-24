@@ -11,10 +11,22 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 )
+
+var subURLError = regexp.MustCompile(`https?://[^\s"']+`)
+
+// redactSubError removes URLs (which carry panel tokens) from network errors
+// before they reach a log line.
+func redactSubError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return subURLError.ReplaceAllString(err.Error(), "<redacted-url>")
+}
 
 // bypathDNSActive returns true when bypath has taken over /etc/resolv.conf
 // (pointing it to 127.0.0.1 = the local dns2socks). In that state the SOCKS
@@ -80,30 +92,49 @@ func envProxyURL() string {
 // Direct fetch often fails in IR (TLS timeout on panel ports like :2083);
 // run bypath on a working link first, then `sub update` through SOCKS.
 func FetchSubscription(subURL string, socksPort int) ([]*Link, error) {
+	return FetchSubscriptionContext(context.Background(), subURL, socksPort)
+}
+
+// FetchSubscriptionContext is FetchSubscription with caller-controlled
+// cancellation. The TUI and API use it for bounded, cancellable refreshes.
+func FetchSubscriptionContext(ctx context.Context, subURL string, socksPort int) ([]*Link, error) {
+	text, err := FetchSubscriptionTextContext(ctx, subURL, socksPort)
+	if err != nil {
+		return nil, err
+	}
+	return parseSubscriptionBody(text)
+}
+
+// FetchSubscriptionTextContext downloads a subscription without parsing it so
+// import previews can report per-line diagnostics for rejected entries.
+func FetchSubscriptionTextContext(ctx context.Context, subURL string, socksPort int) (string, error) {
 	subURL = normalizeSubURL(subURL)
 	if subURL == "" {
-		return nil, fmt.Errorf("empty subscription URL")
+		return "", fmt.Errorf("empty subscription URL")
 	}
 
 	var lastErr error
 	for _, attempt := range subFetchAttempts(socksPort) {
-		links, err := fetchSubscriptionOnce(subURL, attempt)
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		text, err := fetchSubscriptionTextOnce(ctx, subURL, attempt)
 		if err == nil {
 			if attempt.label != "direct" {
 				log.Printf("  ✅ Fetched via %s", attempt.label)
 			}
-			return links, nil
+			return text, nil
 		}
 		lastErr = err
-		log.Printf("  ⚠️  %s failed: %v", attempt.label, err)
+		log.Printf("  ⚠️  %s failed: %s", attempt.label, redactSubError(err))
 	}
-	return nil, fmt.Errorf("fetching subscription: %w", lastErr)
+	return "", fmt.Errorf("fetching subscription: %w", lastErr)
 }
 
 type subFetchAttempt struct {
-	label   string
-	proxy   string // socks5://... or http://... ; empty = direct
-	useDoH  bool   // pin dialer DNS to 8.8.8.8 when direct
+	label  string
+	proxy  string // socks5://... or http://... ; empty = direct
+	useDoH bool   // pin dialer DNS to 8.8.8.8 when direct
 }
 
 func subFetchAttempts(socksPort int) []subFetchAttempt {
@@ -129,7 +160,7 @@ func subFetchAttempts(socksPort int) []subFetchAttempt {
 	return out
 }
 
-func fetchSubscriptionOnce(subURL string, attempt subFetchAttempt) ([]*Link, error) {
+func fetchSubscriptionTextOnce(ctx context.Context, subURL string, attempt subFetchAttempt) (string, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSHandshakeTimeout = 15 * time.Second
 	transport.ResponseHeaderTimeout = 20 * time.Second
@@ -137,7 +168,7 @@ func fetchSubscriptionOnce(subURL string, attempt subFetchAttempt) ([]*Link, err
 	if attempt.proxy != "" {
 		u, err := url.Parse(attempt.proxy)
 		if err != nil {
-			return nil, fmt.Errorf("bad proxy URL: %w", err)
+			return "", fmt.Errorf("bad proxy URL: %w", err)
 		}
 		transport.Proxy = http.ProxyURL(u)
 	} else if attempt.useDoH {
@@ -159,29 +190,35 @@ func fetchSubscriptionOnce(subURL string, attempt subFetchAttempt) ([]*Link, err
 		Transport: transport,
 	}
 
-	req, err := http.NewRequest(http.MethodGet, subURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, subURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("invalid subscription URL: %w", err)
+		return "", fmt.Errorf("invalid subscription URL: %w", err)
 	}
 	req.Header.Set("User-Agent", "v2rayN/6.45")
 	req.Header.Set("Accept", "text/plain, */*")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return nil, fmt.Errorf("reading body: %w", err)
+		return "", fmt.Errorf("reading body: %w", err)
 	}
 
-	return parseSubscriptionBody(string(body))
+	return string(body), nil
+}
+
+// ParseSubscriptionContent parses a plain or base64 subscription dump. The TUI
+// file import and pasted content paths use the same parser as URL fetches.
+func ParseSubscriptionContent(content string) ([]*Link, error) {
+	return parseSubscriptionBody(content)
 }
 
 func parseSubscriptionBody(content string) ([]*Link, error) {
@@ -206,7 +243,8 @@ func parseSubscriptionBody(content string) ([]*Link, error) {
 		}
 		link, err := ParseURI(line)
 		if err != nil {
-			log.Printf("  ⚠️  Skipping unparseable link: %v", err)
+			// Never echo the line: subscription URIs carry tokens and UUIDs.
+			log.Printf("  ⚠️  Skipping an unparseable subscription line")
 			continue
 		}
 		links = append(links, link)
@@ -265,7 +303,7 @@ func (m *Manager) UpdateSubscriptions(groupName string, socksPort int) (int, err
 	var allLinks []*Link
 
 	for _, subURL := range g.Subscriptions {
-		log.Printf("  📡 Fetching: %s", truncate(subURL, 50))
+		log.Printf("  📡 Fetching: %s", RedactURI(subURL))
 		links, err := FetchSubscription(subURL, socksPort)
 		if err != nil {
 			log.Printf("  ⚠️  Failed: %v", err)
@@ -316,11 +354,11 @@ func (m *Manager) FindSubscription(subURL string) (groupName string, ok bool) {
 
 // AddSubscriptionResult describes what AddSubscription did.
 type AddSubscriptionResult struct {
-	Group    string
-	URL      string
-	Existed  bool   // true if URL was already present (no change)
-	Created  bool   // true if the target group was created in this call path (set by CLI)
-	Message  string
+	Group   string
+	URL     string
+	Existed bool // true if URL was already present (no change)
+	Created bool // true if the target group was created in this call path (set by CLI)
+	Message string
 }
 
 // AddSubscription adds a subscription URL to a group.

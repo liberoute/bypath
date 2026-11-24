@@ -1,6 +1,8 @@
 package profile
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -48,7 +50,7 @@ func TestAddAndRemoveLink(t *testing.T) {
 	link := &Link{
 		Remark:   "test-link",
 		Protocol: "vmess",
-		Address:  "1.2.3.4",
+		Address:  "192.0.2.4",
 		Port:     443,
 	}
 
@@ -86,15 +88,15 @@ func TestGetLink(t *testing.T) {
 	dir := t.TempDir()
 	mgr, _ := NewManager(dir, "default")
 
-	link := &Link{Remark: "findme", Protocol: "vless", Address: "5.6.7.8", Port: 443}
+	link := &Link{Remark: "findme", Protocol: "vless", Address: "203.0.113.8", Port: 443}
 	mgr.AddLink("default", link)
 
 	found, err := mgr.GetLink("findme")
 	if err != nil {
 		t.Fatalf("GetLink failed: %v", err)
 	}
-	if found.Address != "5.6.7.8" {
-		t.Errorf("expected 5.6.7.8, got %s", found.Address)
+	if found.Address != "203.0.113.8" {
+		t.Errorf("expected 203.0.113.8, got %s", found.Address)
 	}
 
 	// Not found
@@ -139,5 +141,26 @@ func TestPersistence(t *testing.T) {
 	}
 	if g.Links[0].Remark != "saved" {
 		t.Errorf("expected 'saved', got %s", g.Links[0].Remark)
+	}
+}
+
+func TestGroupNamesCannotEscapeDirectory(t *testing.T) {
+	dir := t.TempDir()
+	mgr, _ := NewManager(dir, "default")
+
+	for _, name := range []string{"../escape", "..", ".", ".active", "a/b", `a\b`, ""} {
+		if err := mgr.CreateGroup(name, "basic"); err == nil {
+			t.Fatalf("CreateGroup(%q) succeeded", name)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(dir), "escape.json")); err == nil {
+		t.Fatal("group file was written outside the profile directory")
+	}
+
+	if err := mgr.CreateGroup("valid-group", "basic"); err != nil {
+		t.Fatalf("valid name rejected: %v", err)
+	}
+	if err := mgr.RenameGroup("valid-group", "../escape"); err == nil {
+		t.Fatal("RenameGroup accepted a traversal name")
 	}
 }
