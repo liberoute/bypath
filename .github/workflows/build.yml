@@ -174,9 +174,9 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     needs: [build, integration]
-    # Version tags are published as GitHub Pre-releases by the explicit,
-    # manually verified release process; a tag push must not create a
-    # non-prerelease release. Only main pushes create the rolling dev build.
+    # Version tags stage assets for the explicit, manually verified release
+    # process; a tag push does not publish a release. Only main pushes create
+    # the rolling dev build.
     if: github.ref == 'refs/heads/main'
     permissions:
       contents: write

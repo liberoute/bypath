@@ -1,7 +1,7 @@
-# Installing Bypath v3.0.0-rc.4
+# Installing Bypath v3.0.0
 
 This document covers the supported installation procedure for the
-`v3.0.0-rc.4` pre-release, the non-interactive form, upgrades, rollback and
+`v3.0.0` release, the non-interactive form, upgrades, rollback and
 uninstall.
 
 ## Supported targets
@@ -22,7 +22,7 @@ the installer reports a missing tool instead of installing one.
 ## 1. Download and verify
 
 ```bash
-VERSION=v3.0.0-rc.4
+VERSION=v3.0.0
 mkdir bypath-install && cd bypath-install
 
 curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/install.sh"
@@ -35,8 +35,8 @@ sha256sum --check --ignore-missing SHA256SUMS
 The `--ignore-missing` flag lets you verify only the files you downloaded.
 A mismatch, a missing file, or a failed download is a stop condition.
 
-Never install from a `/releases/latest` URL: this pre-release is not marked
-"latest", and the installer is version-pinned by design.
+Use an exact version tag rather than a `/releases/latest` URL: the installer
+is version-pinned by design.
 
 ## 2. Preflight
 
@@ -201,7 +201,7 @@ again only if it was running.
 ```bash
 sudo bypath stop
 sudo iptables -S BYPATH_PROXY_IN        # must report no chain
-sudo ./install.sh --version v3.0.0-rc.4
+sudo ./install.sh --version v3.0.0
 sudo systemctl start bypath
 ```
 

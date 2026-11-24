@@ -10,8 +10,7 @@ server, no credentials and no routing policy based on where you live. You add
 your own connection (a proxy URI or a subscription URL you are entitled to use)
 during first-run setup.
 
-> **Pre-release:** `v3.0.0-rc.4`. This is a release candidate for testing. It is
-> not marked "latest" on GitHub and it is not a stable release. Read
+> **Release:** `v3.0.0`, promoted from the reviewed `v3.0.0-rc.4` baseline. Read
 > [RELEASE_NOTES.md](RELEASE_NOTES.md) and [SECURITY.md](SECURITY.md) before
 > exposing it to a network.
 
@@ -39,7 +38,7 @@ from the release you intend to install, verify them, then run the installer.
 Do not use a `/releases/latest` URL.
 
 ```bash
-VERSION=v3.0.0-rc.4
+VERSION=v3.0.0
 curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/install.sh"
 curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/SHA256SUMS"
 sha256sum --check --ignore-missing SHA256SUMS
@@ -236,7 +235,7 @@ Proxy-only mode needs only the binary and a reachable proxy endpoint.
 ```bash
 git clone https://github.com/liberoute/bypath.git
 cd bypath
-git checkout v3.0.0-rc.4
+git checkout v3.0.0
 make build          # host build, no embedded engines
 make build-full     # embedded sing-box + xray (matches release binaries)
 ```
@@ -254,7 +253,7 @@ support claim.
 - [CONFIGURATION.md](CONFIGURATION.md) — configuration reference.
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — diagnosis and common failures.
 - [SECURITY.md](SECURITY.md) — threat model, exposure rules and reporting.
-- [RELEASE_NOTES.md](RELEASE_NOTES.md) — what this pre-release contains and
+- [RELEASE_NOTES.md](RELEASE_NOTES.md) — what this release contains and
   what it does not.
 - [CHANGELOG.md](CHANGELOG.md) — changes in this release.
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) — embedded components and

@@ -1,8 +1,15 @@
 # Changelog
 
-This branch starts a new, independently constructed public history for Bypath.
-Earlier internal development history is not part of it. Entries below describe
-the public release candidate only.
+The v3 release series was developed in an independently constructed public history.
+The stable release joins that history to the existing public main branch.
+
+## v3.0.0 — stable
+
+Promotes the reviewed `v3.0.0-rc.4` source baseline (`55e42ead`) with
+release metadata, documentation and installer version updates. No runtime
+feature changes are introduced by the promotion. Existing platform and security
+limitations remain documented in [RELEASE_NOTES.md](RELEASE_NOTES.md).
+The RC4 tag and earlier releases remain unchanged.
 
 ## v3.0.0-rc.4 — pre-release
 

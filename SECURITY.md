@@ -3,9 +3,9 @@
 Bypath is a root network service. This document states what it protects, what
 it does not, and how to report a problem.
 
-## Scope of this pre-release
+## Scope of this release
 
-`v3.0.0-rc.4` is a release candidate. It has been exercised on fresh amd64
+`v3.0.0` is based on the reviewed RC4 source. RC4 was exercised on fresh amd64
 installations and an emulated arm64 environment, with the test matrix described
 in [RELEASE_NOTES.md](RELEASE_NOTES.md). It has not been through an external
 security audit. Treat it accordingly.
@@ -37,7 +37,7 @@ security audit. Treat it accordingly.
 - A compromised host, a compromised kernel, or an attacker with root.
 - Malware already running as the user who can read that user's traffic.
 - IPv6 forwarding: gateway mode drops forwarded IPv6 rather than leaking it,
-  but IPv6 correctness is not otherwise validated in this pre-release.
+  but IPv6 correctness is not otherwise validated in this release.
 - A malicious proxy server or subscription. Imported links are not audited.
 - Traffic that bypasses the gateway because a client ignores the DNS or gateway
   setting you gave it.

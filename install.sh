@@ -11,11 +11,11 @@
 # setup`, and only when no configuration exists yet.
 #
 # Usage (download and verify the pinned installer first; see INSTALL.md):
-#   sudo ./install.sh --version v3.0.0-rc.4                 # full build
-#   sudo ./install.sh --version v3.0.0-rc.4 --variant lite  # explicit lite build
+#   sudo ./install.sh --version v3.0.0                 # full build
+#   sudo ./install.sh --version v3.0.0 --variant lite  # explicit lite build
 #   sudo ./install.sh --dry-run
-#   sudo ./install.sh --version v3.0.0-rc.4 --non-interactive --mode proxy
-#   sudo ./install.sh --version v3.0.0-rc.4 --non-interactive --mode gateway \
+#   sudo ./install.sh --version v3.0.0 --non-interactive --mode proxy
+#   sudo ./install.sh --version v3.0.0 --non-interactive --mode gateway \
 #        --interface eth0 --install-packages   # approve apt for gateway packages
 #   sudo ./install.sh --uninstall            # keep configuration and data
 #   sudo ./install.sh --uninstall --purge    # also remove configuration and data
@@ -28,7 +28,7 @@ set -Eeuo pipefail
 
 # ─── Constants ───────────────────────────────────────────────
 REPO="liberoute/bypath"
-DEFAULT_VERSION="v3.0.0-rc.4"
+DEFAULT_VERSION="v3.0.0"
 # Release assets are named bypath-<variant>-linux-<arch> and listed in SHA256SUMS
 # (the release workflow produces exactly these names; see release-assets there).
 # The full build is the default. Architectures without a published full build
@@ -99,7 +99,7 @@ usage() {
     cat <<'EOF'
 Bypath installer — one pinned release, verified, no network changes.
 
-  --version VERSION        Release tag to install (default v3.0.0-rc.4)
+  --version VERSION        Release tag to install (default v3.0.0)
   --variant full|lite      Build to install (default full; lite is explicit)
   --dry-run                Report the host and the plan; change nothing
   --non-interactive        Never prompt; pass answers as flags
@@ -170,7 +170,7 @@ fi
 
 case "$VARIANT" in full|lite) ;; *) usage_die "--variant must be full or lite" ;; esac
 if [ "$VERSION" = "latest" ]; then
-    usage_die "this installer is pinned to one release; pass an exact tag such as v3.0.0-rc.4"
+    usage_die "this installer is pinned to one release; pass an exact tag such as v3.0.0"
 fi
 if ! printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
     usage_die "--version '$VERSION' is not a release tag"

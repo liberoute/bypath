@@ -154,7 +154,7 @@ block entirely.
 
 Country rules require geo data. For the embedded Xray engine, `geoip.dat` and
 `geosite.dat` are fetched from the v2fly release feeds when needed; they are not
-hash-pinned in this pre-release. A missing geo file fails its rule; it does not
+hash-pinned in this release. A missing geo file fails its rule; it does not
 silently match everything.
 
 ### One-country split (opt-in)
@@ -288,7 +288,7 @@ update:
 
 Self-update is disabled unless this points at a feed publishing the GitHub
 releases JSON shape (`tag_name`, `body`, `assets[].digest`). The feed must be
-HTTPS; plain HTTP is accepted only for a loopback test feed. This pre-release
+HTTPS; plain HTTP is accepted only for a loopback test feed. This release
 does not ship a default update feed.
 
 ## tests

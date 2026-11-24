@@ -1,11 +1,11 @@
-# Bypath v3.0.0-rc.4 — pre-release
+# Bypath v3.0.0 — stable release
 
-rc.4 is the fourth public release candidate of Bypath, a self-hosted network
-gateway and proxy manager. It is built on the rc.3 tree and adds benchmark
-approval correctness, crash-consistent proxy-guard ownership, and measurement
-and speed-reporting corrections. This is a **pre-release**: it is not marked
-"latest", it is not a stable release, and it makes no support claim beyond the
-targets below.
+This release promotes the reviewed `v3.0.0-rc.4` baseline of Bypath, a
+self-hosted network gateway and proxy manager. RC4 adds benchmark approval
+correctness, crash-consistent proxy-guard ownership, and measurement and
+speed-reporting corrections. Promotion changes release metadata and the
+installer version, not runtime features. Existing limitations and the tested
+platform scope below continue to apply.
 
 ## Behaviour change: benchmark selection needs approval
 
@@ -66,7 +66,7 @@ it was running.
 ```bash
 sudo bypath stop
 sudo iptables -S BYPATH_PROXY_IN        # must report no chain
-sudo ./install.sh --version v3.0.0-rc.4
+sudo ./install.sh --version v3.0.0
 sudo systemctl start bypath
 ```
 
@@ -82,7 +82,7 @@ it. See [INSTALL.md](INSTALL.md#upgrade) and
 ## Install
 
 ```bash
-VERSION=v3.0.0-rc.4
+VERSION=v3.0.0
 mkdir bypath-install && cd bypath-install
 curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/install.sh"
 curl -fsSLO "https://github.com/liberoute/bypath/releases/download/$VERSION/SHA256SUMS"
@@ -133,7 +133,7 @@ verified against `SHA256SUMS`; it is not cryptographically signed.
 
 Cross-compilation alone is not treated as evidence of native support.
 
-## What is in this candidate
+## What is in this release
 
 - **Installer and first run.** Host preflight (OS, arch, systemd, TUN,
   iptables/nftables, DNS services, port conflicts, memory, disk, existing
