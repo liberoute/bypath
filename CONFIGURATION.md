@@ -153,8 +153,8 @@ direct. When `routing.rules` is non-empty it replaces the legacy `whitelist`
 block entirely.
 
 Country rules require geo data. For the embedded Xray engine, `geoip.dat` and
-`geosite.dat` are fetched from the v2fly release feeds when needed; they are not
-hash-pinned in this release. A missing geo file fails its rule; it does not
+`geosite.dat` are fetched from pinned v2fly release tags when needed and verified against
+SHA-256 digests pinned in the source. A missing geo file fails its rule; it does not
 silently match everything.
 
 ### One-country split (opt-in)

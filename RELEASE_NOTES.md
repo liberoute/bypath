@@ -114,9 +114,11 @@ Full documentation: `README.md`, `QUICKSTART.md`, `INSTALL.md`,
 
 This release publishes 13 binaries (6 full, 7 lite; see the build matrix in `.github/workflows/build.yml`), plus `install.sh`, `THIRD_PARTY_NOTICES.md` and `SHA256SUMS`: 16 files in total.
 
-The binaries embed sing-box 1.14.4 and Xray-core library 26.3.27 (`v1.260327.0`), and the pinned
-tun2socks 2.5.2 helper. Licence: GPL-3.0-or-later, as a combined work with
-sing-box and tun2socks (GPL-3.0) and Xray-core (MPL-2.0). Sources for the
+The full binaries embed sing-box 1.14.4 and Xray-core library 26.3.27
+(`v1.260327.0`); lite binaries use external engines. The standard build matrix
+does not embed tun2socks; the managed helper is pinned to 2.5.2, and optional
+Linux embed builds are tested separately. Licence: GPL-3.0-or-later, with
+sing-box (GPL-3.0-or-later), optional tun2socks (GPL-3.0) and Xray-core (MPL-2.0). Sources for the
 pinned dependencies are listed in `THIRD_PARTY_NOTICES.md`. Every asset is
 verified against `SHA256SUMS`; it is not cryptographically signed.
 

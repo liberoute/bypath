@@ -10,7 +10,8 @@ server, no credentials and no routing policy based on where you live. You add
 your own connection (a proxy URI or a subscription URL you are entitled to use)
 during first-run setup.
 
-> **Release:** `v3.0.0`, promoted from the reviewed `v3.0.0-rc.4` baseline. Read
+> **Version 3:** `v3.0.0` is based on the reviewed `v3.0.0-rc.4` source. See
+> [Releases](https://github.com/liberoute/bypath/releases) for published builds. Read
 > [RELEASE_NOTES.md](RELEASE_NOTES.md) and [SECURITY.md](SECURITY.md) before
 > exposing it to a network.
 
@@ -26,10 +27,9 @@ starts an empty full-tunnel gateway: the gateway is only enabled after a
 connection has been imported, selected and verified.
 
 This release is tested natively on **Linux amd64**; **Linux arm64** is built and was exercised in an emulated environment plus an external proxy-mode acceptance report (see Limitations). Debian, Ubuntu
-and Debian-derived distributions are the intended targets. Other platforms and
-architectures are unbuilt or unverified; the installer refuses them unless you
-pass `--allow-unsupported`, and no support is claimed for them. Windows and
-macOS builds are not part of this release.
+and Debian-derived distributions are the intended targets. Other Linux architectures and distributions have limited or no validation;
+see the platform table in [RELEASE_NOTES.md](RELEASE_NOTES.md). Windows and
+macOS binaries are cross-built, with no installer or runtime support claim.
 
 ## Install
 
@@ -49,7 +49,7 @@ The installer:
 
 - detects the distribution, architecture, systemd, TUN, iptables/nftables,
   existing DNS services, port conflicts, memory, disk and any existing install;
-- downloads the matching `bypath-linux-<arch>` binary and verifies its SHA-256
+- downloads the matching `bypath-<variant>-linux-<arch>` binary and verifies its SHA-256
   against the release `SHA256SUMS` before installing;
 - installs to `/opt/bypath/bypath`, links `/usr/local/bin/bypath`, creates the
   `bypath` system group and writes a systemd unit **without enabling or
@@ -199,7 +199,7 @@ resolver if domestic names must keep resolving while the tunnel is down. See
 Bypath supports VMess, VLESS (including Reality, XHTTP and VLESS Encryption),
 Trojan, Shadowsocks, WireGuard, SSH, SOCKS5 and HTTP URI links, plus OpenVPN
 profile files. Which links an engine can serve depends on the engine. This
-release is built with both engines embedded:
+full release variant is built with both engines embedded:
 
 | Engine | Notes |
 |---|---|
@@ -207,8 +207,9 @@ release is built with both engines embedded:
 | Xray-core 26.3.27 (`v1.260327.0`) | Embedded library. Required for XHTTP and VLESS Encryption links. A managed external Xray binary, when downloaded, is pinned to 26.10.31 by version and SHA-256. Country rules need `geoip.dat`/`geosite.dat`, downloaded at runtime from pinned v2fly release tags and verified against the published SHA-256 with a size cap. The country split is not available on Xray. |
 
 Tun2socks is used only when a selected engine cannot provide a native TUN
-datapath. In a `full` build it is embedded; otherwise Bypath uses a
-checksum-pinned download or an existing binary on `PATH`. Bypath never silently
+datapath. Standard release builds use a checksum-pinned managed download or
+an existing binary on `PATH`. Optional `full embed_tun2socks` builds embed
+the helper for supported Linux architectures. Bypath never silently
 switches a native-TUN gateway to a legacy datapath; if native TUN fails, the
 startup fails and the reason is reported.
 
@@ -236,8 +237,9 @@ Proxy-only mode needs only the binary and a reachable proxy endpoint.
 git clone https://github.com/liberoute/bypath.git
 cd bypath
 git checkout v3.0.0
-make build          # host build, no embedded engines
-make build-full     # embedded sing-box + xray (matches release binaries)
+make lite           # Linux amd64, no embedded engines
+make full           # Linux amd64, embedded sing-box + Xray
+# For ARM64, use make lite-arm or make full-arm.
 ```
 
 Release binaries: full builds (`-tags full`) for linux amd64, arm64 and arm, and
@@ -254,6 +256,8 @@ support claim.
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — diagnosis and common failures.
 - [SECURITY.md](SECURITY.md) — threat model, exposure rules and reporting.
 - [CONTRIBUTING.md](CONTRIBUTING.md) — bug reports, development and pull requests.
+- [Release procedure](docs/RELEASING.md) — build verification and publication.
+- [Documentation index](docs/wiki/Home.md) — entry point for version 3 and legacy version 2.
 - [RELEASE_NOTES.md](RELEASE_NOTES.md) — what this release contains and
   what it does not.
 - [CHANGELOG.md](CHANGELOG.md) — changes in this release.
