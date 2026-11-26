@@ -131,7 +131,7 @@ jobs:
           for spec in 'bypath-full-linux-amd64 full' 'bypath-lite-linux-amd64 lite'; do
             read -r binary variant <<< "$spec"
             output=$("./$binary" version)
-            grep -Fq "Bypath ${RELEASE_TAG#v}-$BUILD_COMMIT" <<< "$output"
+            grep -Fq "Bypath ${RELEASE_TAG}-$BUILD_COMMIT" <<< "$output"
             grep -Fqx "  Commit:     $BUILD_COMMIT" <<< "$output"
             grep -Eq "^  Variant:[[:space:]]+$variant$" <<< "$output"
             grep -Eq '^  OS/Arch:[[:space:]]+linux/amd64$' <<< "$output"
