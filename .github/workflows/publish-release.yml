@@ -1,0 +1,202 @@
+name: Publish stable release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing version tag (for example v3.0.0)
+        required: true
+        type: string
+      build_run_id:
+        description: Successful tag-triggered Build & Release workflow run ID
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  publish:
+    name: Verify and publish existing artifacts
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+
+    steps:
+      - name: Validate inputs and exact successful build run
+        id: run
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid stable release tag: $RELEASE_TAG" >&2; exit 1; }
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]] || { echo "Build run ID must be numeric" >&2; exit 1; }
+          gh api "repos/$GH_REPO/actions/runs/$BUILD_RUN_ID" > run.json
+          jq -e --arg tag "$RELEASE_TAG" '
+            .name == "Build & Release" and
+            .path == ".github/workflows/build.yml" and
+            .event == "push" and
+            .head_branch == $tag and
+            .status == "completed" and
+            .conclusion == "success"
+          ' run.json >/dev/null
+          commit=$(jq -r .head_sha run.json)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "Build run has invalid commit SHA" >&2; exit 1; }
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          printf 'Verified successful tag build: %s at %s (run %s)\n' "$RELEASE_TAG" "$commit" "$BUILD_RUN_ID"
+
+      - name: Checkout the exact tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+
+      - name: Verify tag resolves to the build commit
+        env:
+          BUILD_COMMIT: ${{ steps.run.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_commit=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
+          [[ "$tag_commit" == "$BUILD_COMMIT" ]] || {
+            echo "Tag $RELEASE_TAG resolves to $tag_commit, but build run used $BUILD_COMMIT" >&2
+            exit 1
+          }
+
+      - name: Download release-assets from the verified workflow run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-assets
+          path: staged
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.build_run_id }}
+
+      - name: Verify release files, checksums, installer, and binary metadata
+        id: verify
+        env:
+          BUILD_COMMIT: ${{ steps.run.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd staged
+          expected=(
+            bypath-full-darwin-amd64
+            bypath-full-darwin-arm64
+            bypath-full-linux-amd64
+            bypath-full-linux-arm
+            bypath-full-linux-arm64
+            bypath-full-windows-amd64.exe
+            bypath-lite-darwin-amd64
+            bypath-lite-darwin-arm64
+            bypath-lite-linux-amd64
+            bypath-lite-linux-arm
+            bypath-lite-linux-arm64
+            bypath-lite-linux-mipsle
+            bypath-lite-windows-amd64.exe
+            install.sh
+            THIRD_PARTY_NOTICES.md
+            SHA256SUMS
+          )
+          [[ ${#expected[@]} -eq 16 ]]
+          for file in "${expected[@]}"; do
+            [[ -f "$file" ]] || { echo "Missing expected release file: $file" >&2; exit 1; }
+          done
+          # The staging workflow currently includes coverage.out beside the
+          # release files. It is permitted as the sole extra and is never published.
+          if find . -mindepth 1 -maxdepth 1 ! -type f -print -quit | grep -q .; then
+            echo "Unexpected directory in release artifact" >&2
+            exit 1
+          fi
+          mapfile -t actual < <(find . -maxdepth 1 -type f -printf '%f\n' | sort)
+          mapfile -t allowed < <(printf '%s\n' "${expected[@]}" | sort)
+          mapfile -t allowed_with_coverage < <(printf '%s\n' "${expected[@]}" coverage.out | sort)
+          if [[ "${actual[*]}" != "${allowed[*]}" && "${actual[*]}" != "${allowed_with_coverage[*]}" ]]; then
+            printf 'Unexpected artifact contents. Found:\n%s\n' "${actual[*]}" >&2
+            exit 1
+          fi
+          mapfile -t expected_checksums < <(printf '%s\n' "${expected[@]}" | grep -v '^SHA256SUMS$' | sort)
+          mapfile -t actual_checksums < <(sed -E 's/^[[:xdigit:]]{64} [ *]//' SHA256SUMS | sort)
+          [[ ${#actual_checksums[@]} -eq 15 && "${actual_checksums[*]}" == "${expected_checksums[*]}" ]] || {
+            echo "SHA256SUMS must contain exactly the 15 expected release files" >&2
+            exit 1
+          }
+          sha256sum --check SHA256SUMS
+          bash -n install.sh
+          chmod +x bypath-full-linux-amd64 bypath-lite-linux-amd64
+          for spec in 'bypath-full-linux-amd64 full' 'bypath-lite-linux-amd64 lite'; do
+            read -r binary variant <<< "$spec"
+            output=$("./$binary" version)
+            grep -Fq "Bypath ${RELEASE_TAG#v}-$BUILD_COMMIT" <<< "$output"
+            grep -Fqx "  Commit:     $BUILD_COMMIT" <<< "$output"
+            grep -Eq "^  Variant:[[:space:]]+$variant$" <<< "$output"
+            grep -Eq '^  OS/Arch:[[:space:]]+linux/amd64$' <<< "$output"
+          done
+          mkdir ../release-upload
+          for file in "${expected[@]}"; do cp -- "$file" ../release-upload/; done
+          echo "verified_files=16" >> "$GITHUB_OUTPUT"
+          echo "The 16 expected release files passed checksum, syntax, and version/commit metadata checks. coverage.out excluded."
+
+      - name: Confirm existing draft and add only missing verified assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json name,tagName,isDraft,isPrerelease,assets > release-before.json
+          jq -e --arg tag "$RELEASE_TAG" '.tagName == $tag and .isDraft == true and .isPrerelease == false' release-before.json >/dev/null
+          while IFS= read -r file; do
+            [[ -n "$file" ]] || continue
+            existing=$(jq -c --arg name "$file" '[.assets[] | select(.name == $name)] | .[0] // empty' release-before.json)
+            local_size=$(stat -c '%s' "release-upload/$file")
+            local_digest="sha256:$(sha256sum "release-upload/$file" | cut -d ' ' -f 1)"
+            if [[ -n "$existing" ]]; then
+              remote_size=$(jq -r .size <<< "$existing")
+              remote_digest=$(jq -r '.digest // ""' <<< "$existing")
+              [[ "$remote_size" == "$local_size" && "$remote_digest" == "$local_digest" ]] || {
+                echo "Existing draft asset differs from the verified artifact: $file; refusing to replace it" >&2
+                exit 1
+              }
+              echo "Already present and verified: $file"
+            else
+              gh release upload "$RELEASE_TAG" "release-upload/$file" --repo "$GH_REPO"
+            fi
+          done < <(find release-upload -maxdepth 1 -type f -printf '%f\n' | sort)
+
+      - name: Verify exact remote asset set and publish latest stable release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json name,tagName,isDraft,isPrerelease,assets > release-final.json
+          jq -e --arg tag "$RELEASE_TAG" '
+            .tagName == $tag and .isDraft == true and .isPrerelease == false and
+            ([.assets[].name] | sort) == [
+              "SHA256SUMS", "THIRD_PARTY_NOTICES.md", "bypath-full-darwin-amd64",
+              "bypath-full-darwin-arm64", "bypath-full-linux-amd64", "bypath-full-linux-arm",
+              "bypath-full-linux-arm64", "bypath-full-windows-amd64.exe", "bypath-lite-darwin-amd64",
+              "bypath-lite-darwin-arm64", "bypath-lite-linux-amd64", "bypath-lite-linux-arm",
+              "bypath-lite-linux-arm64", "bypath-lite-linux-mipsle", "bypath-lite-windows-amd64.exe",
+              "install.sh"
+            ]
+          ' release-final.json >/dev/null
+          while IFS= read -r file; do
+            [[ -n "$file" ]] || continue
+            expected_size=$(stat -c '%s' "release-upload/$file")
+            expected_digest="sha256:$(sha256sum "release-upload/$file" | cut -d ' ' -f 1)"
+            jq -e --arg name "$file" --arg digest "$expected_digest" --argjson size "$expected_size" \
+              '.assets[] | select(.name == $name and .digest == $digest and .size == $size)' release-final.json >/dev/null
+          done < <(find release-upload -maxdepth 1 -type f -printf '%f\n' | sort)
+          gh release edit "$RELEASE_TAG" --repo "$GH_REPO" \
+            --title "Bypath $RELEASE_TAG" \
+            --notes-file RELEASE_NOTES.md \
+            --draft=false --prerelease=false --latest
+          gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json name,tagName,isDraft,isPrerelease,url,assets
+          {
+            echo '## Stable release publication'
+            echo "Published **$RELEASE_TAG** from commit **${{ steps.run.outputs.commit }}**."
+            echo "Build workflow run: [${BUILD_RUN_ID}](https://github.com/$GH_REPO/actions/runs/$BUILD_RUN_ID)."
+            echo 'Verified and published exactly 16 release assets; `coverage.out` was excluded.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
